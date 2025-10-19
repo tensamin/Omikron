@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "*", features = ["full"] }
-tokio-tungstenite = "*"
+tokio-tungstenite = { version = "*" }
 tokio-util = { version = "*", features = ["full"] }
 hyper = { version = "*", features = ["full"] }
 futures-util = "*"
@@ -41,3 +41,4 @@ dashmap = "*"
 warp = { version = "*" }
 chrono = "*"
 tokio-stream = "*"
+loom = "0.7.2"

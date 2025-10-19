@@ -1,10 +1,7 @@
 use futures::SinkExt;
-use http::header::AUTHORIZATION;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Weak},
-};
-use tokio::sync::{Mutex, RwLock};
+use std::sync::{Arc, Weak};
+use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
@@ -23,17 +20,17 @@ use crate::{
 /// ClientConnection represents a WebSocket connection from a client device
 pub struct ClientConnection {
     /// WebSocket session
-    session: Arc<Mutex<WebSocketStream<tokio::net::TcpStream>>>,
+    pub session: Arc<Mutex<WebSocketStream<tokio::net::TcpStream>>>,
     /// User ID associated with this client
-    user_id: Arc<RwLock<Option<Uuid>>>,
+    pub user_id: Arc<RwLock<Option<Uuid>>>,
     /// Whether this connection has been identified/authenticated
-    identified: Arc<RwLock<bool>>,
+    pub identified: Arc<RwLock<bool>>,
     /// Ping latency tracking
-    ping: Arc<RwLock<i64>>,
+    pub ping: Arc<RwLock<i64>>,
     /// Weak reference to RhoConnection to avoid circular references
-    rho_connection: Arc<RwLock<Option<Weak<RhoConnection>>>>,
+    pub rho_connection: Arc<RwLock<Option<Weak<RhoConnection>>>>,
     /// List of user IDs this client is interested in receiving updates about
-    interested_users: Arc<RwLock<Vec<Uuid>>>,
+    pub interested_users: Arc<RwLock<Vec<Uuid>>>,
 }
 
 impl ClientConnection {
@@ -97,7 +94,7 @@ impl ClientConnection {
     }
 
     /// Handle incoming message from client
-    pub async fn handle_message(self: Arc<Self>, message: String) {
+    pub async fn handle_message(self: Arc<Self>, message: Utf8Bytes) {
         let cv = CommunicationValue::from_json(&message);
 
         // Handle identification
@@ -145,23 +142,16 @@ impl ClientConnection {
             Some(id_str) => match Uuid::parse_str(&id_str.to_string()) {
                 Ok(id) => id,
                 Err(_) => {
-                    self.send_error_response(&cv.get_id(), CommunicationType::error)
-                        .await;
+                    self.send_error_response(
+                        &cv.get_id(),
+                        CommunicationType::error_invalid_user_id,
+                    )
+                    .await;
                     return;
                 }
             },
             None => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
-                    .await;
-                return;
-            }
-        };
-
-        // Find RhoConnection for this user
-        let rho_connection = match rho_manager::get_rho_con_for_user(user_id).await {
-            Some(rho) => rho,
-            None => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
+                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_user_id)
                     .await;
                 return;
             }
@@ -169,19 +159,35 @@ impl ClientConnection {
 
         // Validate private key
         if let Some(private_key_hash) = cv.get_data(DataTypes::private_key_hash) {
+            println!("private_key_hash: {}", private_key_hash);
             let is_valid =
                 auth_connector::is_private_key_valid(user_id, &private_key_hash.to_string()).await;
 
             if !is_valid {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
-                    .await;
+                println!("Invalid private key");
+                self.send_error_response(
+                    &cv.get_id(),
+                    CommunicationType::error_invalid_private_key,
+                )
+                .await;
                 return;
             }
         } else {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
+            println!("Missing private key");
+            self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_private_key)
                 .await;
             return;
         }
+
+        // Find RhoConnection for this user
+        let rho_connection = match rho_manager::get_rho_con_for_user(user_id).await {
+            Some(rho) => rho,
+            None => {
+                self.send_error_response(&cv.get_id(), CommunicationType::error_no_iota)
+                    .await;
+                return;
+            }
+        };
 
         // Set identification data
         {
@@ -193,14 +199,11 @@ impl ClientConnection {
             *identified_guard = true;
         }
 
-        // Set up RhoConnection reference
         self.set_rho_connection(Arc::downgrade(&rho_connection))
             .await;
 
-        // Add this client to the RhoConnection
         rho_connection.add_client_connection(Arc::from(sarc)).await;
 
-        // Send success response
         let response = CommunicationValue::new(CommunicationType::identification_response)
             .with_id(cv.get_id());
         self.send_message(&response).await;
@@ -242,14 +245,15 @@ impl ClientConnection {
                         rho_conn.get_iota_id().await,
                         user_id,
                         user_status,
-                    );
+                    )
+                    .await;
                 }
             }
         }
     }
 
     /// Handle call invite
-    async fn handle_call_invite(&self, mut cv: CommunicationValue) {
+    async fn handle_call_invite(&self, cv: CommunicationValue) {
         let receiver_id = match cv.get_data(DataTypes::receiver_id) {
             Some(id_str) => match Uuid::parse_str(&id_str.to_string()) {
                 Ok(id) => id,
@@ -468,48 +472,5 @@ impl std::fmt::Debug for ClientConnection {
             .field("identified", &"[async]")
             .field("ping", &"[async]")
             .finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::sync::Mutex;
-
-    #[tokio::test]
-    async fn test_client_connection_creation() {
-        // Mock session - in real implementation this would be a proper WebSocket stream
-        let mock_session = tokio_tungstenite::WebSocketStream::from_raw_socket(
-            tokio::net::TcpStream::connect("127.0.0.1:0")
-                .await
-                .unwrap_or_else(|_| {
-                    // This is just for testing, create a dummy stream
-                    panic!("Cannot create test stream")
-                }),
-            tokio_tungstenite::tungstenite::protocol::Role::Client,
-            None,
-        )
-        .await;
-
-        // This test would fail in practice due to the mock stream
-        // but shows the intended API
-        // let client_conn = ClientConnection::new(mock_session);
-
-        // assert!(!client_conn.is_identified().await);
-        // assert_eq!(client_conn.get_ping().await, -1);
-        // assert!(client_conn.get_user_id().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_interested_users() {
-        // This would also need a proper mock setup
-        // but shows the intended functionality
-
-        // let client_conn = ClientConnection::new(mock_session);
-        // let user_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
-
-        // client_conn.set_interested_users(user_ids.clone()).await;
-        //
-        // // Test would verify that the interested users are stored correctly
     }
 }

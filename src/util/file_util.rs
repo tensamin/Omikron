@@ -1,10 +1,7 @@
 use std::ffi::OsStr;
-use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process;
-use std::time::SystemTime;
 use sysinfo::System;
 use uuid::Uuid;
 use walkdir::WalkDir;

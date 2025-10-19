@@ -7,14 +7,17 @@ use uuid::Uuid;
 
 use super::rho_connection::RhoConnection;
 
-// Static storage for RhoConnections, keyed by Iota ID
 pub static RHO_CONNECTIONS: LazyLock<Arc<RwLock<HashMap<Uuid, Arc<RhoConnection>>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
 
-/// Get a RhoConnection for a specific user ID
 pub async fn get_rho_con_for_user(user_id: Uuid) -> Option<Arc<RhoConnection>> {
     let connections = RHO_CONNECTIONS.read().await;
+    println!("Checking user ID: {:?}", user_id);
     for rho_connection in connections.values() {
+        println!(
+            "Comparing user IDs: {:?}",
+            rho_connection.get_user_ids().to_vec()
+        );
         if rho_connection.get_user_ids().contains(&user_id) {
             return Some(Arc::clone(rho_connection));
         }
@@ -22,7 +25,6 @@ pub async fn get_rho_con_for_user(user_id: Uuid) -> Option<Arc<RhoConnection>> {
     None
 }
 
-/// Check if an Iota ID exists in the connections
 pub async fn contains_iota(iota_id: Uuid) -> bool {
     let connections = RHO_CONNECTIONS.read().await;
     connections.contains_key(&iota_id)

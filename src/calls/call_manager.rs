@@ -1,19 +1,15 @@
 use crate::calls::call_group::CallGroup;
-use crate::data::communication::{CommunicationType, CommunicationValue, DataTypes};
-use futures::{SinkExt, StreamExt};
-use json::JsonValue;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use futures::lock::Mutex;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::mpsc::UnboundedSender;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
-use warp::Filter;
 
 pub type Tx = UnboundedSender<Utf8Bytes>;
 
-#[derive(Debug)]
 pub struct CallManagerState {
-    pub call_groups: HashMap<Uuid, Arc<CallGroup>>,
+    pub call_groups: HashMap<Uuid, Arc<Mutex<CallGroup>>>,
 }
 
 impl CallManagerState {
@@ -23,18 +19,27 @@ impl CallManagerState {
         }
     }
 
-    pub fn get_or_create_group(&mut self, call_id: Uuid, secret: &str) -> Arc<CallGroup> {
+    pub fn get_or_create_group(&mut self, call_id: Uuid, secret: &str) -> Arc<Mutex<CallGroup>> {
         let g = self.call_groups.get_mut(&call_id);
         if let Some(group) = g {
             group.clone()
         } else {
-            let cg = Arc::new(CallGroup::new(call_id, secret.to_string()));
+            let cg = Arc::new(Mutex::new(CallGroup::new(call_id)));
             self.call_groups.insert(call_id, cg);
             self.call_groups.get(&call_id).unwrap().clone()
         }
     }
 
-    pub fn remove_inactive(&mut self) {
-        self.call_groups.retain(|_k, v| v.callers.len() > 0);
+    pub async fn remove_inactive(&mut self) {
+        let mut rem = Vec::new();
+        for cg in self.call_groups.keys() {
+            let group = self.call_groups.get(cg).unwrap().lock().await;
+            if group.callers.is_empty() {
+                rem.push(cg.clone());
+            }
+        }
+        for cg in rem {
+            self.call_groups.remove(&cg);
+        }
     }
 }

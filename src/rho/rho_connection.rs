@@ -1,5 +1,5 @@
-use std::collections::{self, HashMap};
-use std::sync::{Arc, Weak};
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -26,27 +26,23 @@ impl RhoConnection {
         };
 
         // Notify OmegaConnection about the new Iota
-        OmegaConnection::connect_iota(rho_connection.get_iota_id().await, user_ids);
+        OmegaConnection::connect_iota(rho_connection.get_iota_id().await, user_ids).await;
 
         rho_connection
     }
 
-    /// Get the Iota ID
     pub async fn get_iota_id(&self) -> Uuid {
         self.iota_connection.get_iota_id().await
     }
 
-    /// Get the user IDs associated with this Rho connection
     pub fn get_user_ids(&self) -> &Vec<Uuid> {
         &self.user_ids
     }
 
-    /// Get reference to the IotaConnection
     pub fn get_iota_connection(&self) -> &Arc<IotaConnection> {
         &self.iota_connection
     }
 
-    /// Get all client connections
     pub async fn get_client_connections(&self) -> Vec<Arc<ClientConnection>> {
         let connections = self.client_connections.read().await;
         connections.clone()
@@ -69,7 +65,6 @@ impl RhoConnection {
 
     /// Add a client connection
     pub async fn add_client_connection(&self, connection: Arc<ClientConnection>) {
-        // Notify Iota about new client
         let notification = CommunicationValue::new(CommunicationType::client_connected)
             .add_data_str(
                 DataTypes::user_id,
@@ -82,18 +77,17 @@ impl RhoConnection {
 
         self.iota_connection.send_message(notification).await;
 
-        // Add to our list
         {
             let mut connections = self.client_connections.write().await;
             connections.push(Arc::clone(&connection));
         }
 
-        // Notify OmegaConnection
         OmegaConnection::client_changed(
             self.get_iota_id().await,
             connection.get_user_id().await.unwrap_or(Uuid::nil()),
             UserStatus::online,
-        );
+        )
+        .await;
     }
 
     /// Remove a client connection
@@ -109,7 +103,6 @@ impl RhoConnection {
                 })
             });
 
-            // Push the new connection
             connections.push(Arc::clone(&connection));
         }
 
@@ -118,7 +111,8 @@ impl RhoConnection {
             self.get_iota_id().await,
             connection.get_user_id().await.unwrap_or(Uuid::nil()),
             UserStatus::user_offline,
-        );
+        )
+        .await;
     }
 
     /// Close the Iota connection and all associated client connections
@@ -133,7 +127,7 @@ impl RhoConnection {
         rho_manager::remove_rho(self.get_iota_id().await).await;
 
         // Notify OmegaConnection
-        OmegaConnection::close_iota(self.get_iota_id().await);
+        OmegaConnection::close_iota(self.get_iota_id().await).await;
     }
 
     /// Send message from Iota to specific client by user ID
@@ -218,34 +212,5 @@ impl RhoConnection {
     pub async fn client_count(&self) -> usize {
         let connections = self.client_connections.read().await;
         connections.len()
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::sync::Mutex;
-
-    #[tokio::test]
-    async fn test_rho_connection_creation() {
-        let iota_id = Uuid::new_v4();
-        let user_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
-
-        // Mock session
-        // Create a mock WebSocket stream (this would fail in practice but shows the API)
-        // In real implementation, this would be a proper WebSocketStream
-        let mock_stream =
-            std::ptr::null_mut() as *mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
-        let mock_stream = unsafe { std::ptr::read(mock_stream) };
-        let iota_conn = IotaConnection::new_with_ids(
-            iota_id,
-            user_ids.clone(),
-            Arc::new(tokio::sync::Mutex::new(mock_stream)),
-        );
-
-        let rho_conn = RhoConnection::new(iota_conn, user_ids.clone()).await;
-
-        assert_eq!(rho_conn.get_iota_id().await, iota_id);
-        assert_eq!(rho_conn.get_user_ids(), &user_ids);
-        assert_eq!(rho_conn.client_count().await, 0);
     }
 }

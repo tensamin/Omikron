@@ -1,13 +1,9 @@
 use crate::data::communication::{CommunicationType, CommunicationValue, DataTypes};
 use crate::util::config_util::CONFIG;
-use hex;
-use json::JsonValue;
-use reqwest::header::CONTENT_TYPE;
 use reqwest::{Client, Response};
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
+
 #[derive(Debug, Clone)]
 pub struct AuthUser {
     pub created_at: i64,
@@ -30,12 +26,12 @@ fn client() -> Client {
 }
 
 pub async fn get_user(user_id: Uuid) -> Option<AuthUser> {
-    let url = format!("https://auth.tensamin.methanium.net/api/get/{}/", user_id);
+    let url = format!("https://auth.tensamin.methanium.net/api/get/{}", user_id);
     let client = client();
     let res = client.get(&url).send().await.ok()?;
     let json = res.text().await.ok()?;
 
-    let mut cv = CommunicationValue::from_json(&json);
+    let cv = CommunicationValue::from_json(&json);
     if cv.comm_type != CommunicationType::success {
         return None;
     }
@@ -77,10 +73,7 @@ pub async fn get_iota_id(user_id: Uuid) -> Option<Uuid> {
     let client = client();
     let res = client
         .get(&url)
-        .header(
-            "Authorization",
-            CONFIG.read().unwrap().omikron_id.to_string(),
-        )
+        .header("Authorization", CONFIG.lock().await.omikron_id.to_string())
         .header("Content-Type", "application/json")
         .send()
         .await
@@ -89,7 +82,7 @@ pub async fn get_iota_id(user_id: Uuid) -> Option<Uuid> {
     let json = res.text().await.ok()?;
     let json = json.replace("iota_uuid", "iota_id");
 
-    let mut cv = CommunicationValue::from_json(&json);
+    let cv = CommunicationValue::from_json(&json);
     if cv.comm_type != CommunicationType::success {
         return None;
     }
@@ -99,17 +92,15 @@ pub async fn get_iota_id(user_id: Uuid) -> Option<Uuid> {
 }
 pub async fn is_private_key_valid(user_id: Uuid, pk_hash: &str) -> bool {
     let url = format!(
-        "https://auth.tensamin.methanium.net/api/get/private-key-hash/{}",
+        "https://auth.tensamin.methanium.net/api/get/private-key-hash/{}/",
         user_id
     );
 
     let client = client();
+    println!("Auth: {}", CONFIG.lock().await.omikron_id);
     let res = client
         .get(&url)
-        .header(
-            "Authorization",
-            CONFIG.read().unwrap().omikron_id.to_string(),
-        )
+        .header("Authorization", CONFIG.lock().await.omikron_id.to_string())
         .header("PrivateKeyHash", pk_hash)
         .header("Accept", "application/json")
         .send()
@@ -123,7 +114,8 @@ pub async fn is_private_key_valid(user_id: Uuid, pk_hash: &str) -> bool {
         return false;
     };
 
-    let mut cv = CommunicationValue::from_json(&body);
+    let cv = CommunicationValue::from_json(&body);
+    println!("Auth: {}", &body);
     if cv.comm_type != CommunicationType::success {
         return false;
     }
@@ -135,7 +127,7 @@ pub async fn is_private_key_valid(user_id: Uuid, pk_hash: &str) -> bool {
 }
 pub async fn get_public_key(user_id: Uuid) -> Option<String> {
     let url = format!(
-        "https://auth.tensamin.methanium.net/api/{}/public-key/",
+        "https://auth.tensamin.methanium.net/api/{}/public-key",
         user_id
     );
 
@@ -158,12 +150,12 @@ pub async fn get_public_key(user_id: Uuid) -> Option<String> {
 }
 
 pub async fn get_register() -> Option<Uuid> {
-    let url = "https://auth.tensamin.methanium.net/api/register/init/".to_string();
+    let url = "https://auth.tensamin.methanium.net/api/register/init".to_string();
     let client = client();
     let res = client.get(&url).send().await.ok()?;
     let json = res.text().await.ok()?;
 
-    let mut cv = CommunicationValue::from_json(&json);
+    let cv = CommunicationValue::from_json(&json);
     Uuid::parse_str(&*cv.get_data(DataTypes::user_id).unwrap().to_string()).ok()
 }
 

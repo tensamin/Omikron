@@ -1,5 +1,5 @@
 use futures::SinkExt;
-use json::{JsonValue, number::Number};
+use json::JsonValue;
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
@@ -13,21 +13,18 @@ use super::{rho_connection::RhoConnection, rho_manager};
 use crate::{
     auth::auth_connector,
     // calls::call_manager::CallManager,
-    data::{
-        communication::{CommunicationType, CommunicationValue, DataTypes},
-        user::User,
-    },
+    data::communication::{CommunicationType, CommunicationValue, DataTypes},
     omega::omega_connection::OmegaConnection,
 };
 
 /// IotaConnection represents a WebSocket connection from an Iota device
 pub struct IotaConnection {
-    session: Arc<Mutex<WebSocketStream<tokio::net::TcpStream>>>,
-    iota_id: Arc<RwLock<Uuid>>,
-    user_ids: Arc<RwLock<Vec<Uuid>>>,
-    identified: Arc<RwLock<bool>>,
-    ping: Arc<RwLock<i64>>,
-    rho_connection: Arc<RwLock<Option<Weak<RhoConnection>>>>,
+    pub session: Arc<Mutex<WebSocketStream<tokio::net::TcpStream>>>,
+    pub iota_id: Arc<RwLock<Uuid>>,
+    pub user_ids: Arc<RwLock<Vec<Uuid>>>,
+    pub identified: Arc<RwLock<bool>>,
+    pub ping: Arc<RwLock<i64>>,
+    pub rho_connection: Arc<RwLock<Option<Weak<RhoConnection>>>>,
 }
 
 impl IotaConnection {
@@ -38,22 +35,6 @@ impl IotaConnection {
             iota_id: Arc::new(RwLock::new(Uuid::nil())),
             user_ids: Arc::new(RwLock::new(Vec::new())),
             identified: Arc::new(RwLock::new(false)),
-            ping: Arc::new(RwLock::new(0)),
-            rho_connection: Arc::new(RwLock::new(None)),
-        })
-    }
-
-    /// Create with known IDs (for testing)
-    pub fn new_with_ids(
-        iota_id: Uuid,
-        user_ids: Vec<Uuid>,
-        session: Arc<Mutex<WebSocketStream<tokio::net::TcpStream>>>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            session,
-            iota_id: Arc::new(RwLock::new(iota_id)),
-            user_ids: Arc::new(RwLock::new(user_ids)),
-            identified: Arc::new(RwLock::new(true)),
             ping: Arc::new(RwLock::new(0)),
             rho_connection: Arc::new(RwLock::new(None)),
         })
@@ -98,18 +79,24 @@ impl IotaConnection {
     /// Send a message to the Iota
     pub async fn send_message_str(&self, message: &str) {
         let mut session = self.session.lock().await;
-        let _ = session
+        if let Err(e) = session
             .send(Message::Text(Utf8Bytes::from(message.to_string())))
-            .await;
+            .await
+        {
+            eprintln!("Failed to send WebSocket message: {:?}", e);
+        }
     }
 
     /// Send a CommunicationValue to the Iota
     pub async fn send_message(&self, cv: CommunicationValue) {
+        if !cv.is_type(CommunicationType::pong) {
+            println!("{}", cv.to_json().to_string());
+        }
         self.send_message_str(&cv.to_json().to_string()).await;
     }
 
     /// Handle incoming message from Iota
-    pub async fn handle_message(self: Arc<Self>, message: String) {
+    pub async fn handle_message(self: Arc<Self>, message: Utf8Bytes) {
         let cv = CommunicationValue::from_json(&message);
 
         // Handle identification
@@ -149,7 +136,7 @@ impl IotaConnection {
     }
 
     /// Handle identification message
-    async fn handle_identification(self: Arc<Self>, mut cv: CommunicationValue) {
+    async fn handle_identification(self: Arc<Self>, cv: CommunicationValue) {
         // Parse Iota ID
         let iota_id = match cv.get_data(DataTypes::iota_id) {
             Some(id_str) => match Uuid::parse_str(&id_str.to_string()) {
@@ -166,16 +153,17 @@ impl IotaConnection {
         };
 
         // Parse user IDs
-        let mut validated_user_ids = Vec::new();
+        let mut validated_user_ids: Vec<Uuid> = Vec::new();
         if let Some(user_ids_str) = cv.get_data(DataTypes::user_ids) {
             for id_str in user_ids_str.to_string().split(',') {
                 if id_str.is_empty() {
                     continue;
                 }
                 if let Ok(user_id) = Uuid::parse_str(id_str.trim()) {
-                    let auth_iota_id = auth_connector::get_iota_id(user_id).await.unwrap();
-                    if auth_iota_id == iota_id {
-                        validated_user_ids.push(user_id);
+                    if let Some(auth_iota_id) = auth_connector::get_iota_id(user_id).await {
+                        if auth_iota_id == iota_id {
+                            validated_user_ids.push(user_id);
+                        }
                     }
                 }
             }
@@ -214,16 +202,20 @@ impl IotaConnection {
         rho_manager::add_rho(rho_connection).await;
 
         // Send response
+        let mut str = String::new();
+        for id in &validated_user_ids {
+            str.push_str(&format!(",{}", id));
+        }
         let response = CommunicationValue::new(CommunicationType::identification_response)
             .with_id(cv.get_id())
+            .add_data_str(DataTypes::accepted_ids, str)
             .add_data_str(DataTypes::accepted, validated_user_ids.len().to_string());
 
         self.send_message(response).await;
     }
 
     /// Handle ping message
-    async fn handle_ping(&self, mut cv: CommunicationValue) {
-        // Update our ping if provided
+    async fn handle_ping(&self, cv: CommunicationValue) {
         if let Some(last_ping) = cv.get_data(DataTypes::last_ping) {
             if let Ok(ping_val) = last_ping.to_string().parse::<i64>() {
                 let mut ping_guard = self.ping.write().await;
@@ -231,14 +223,12 @@ impl IotaConnection {
             }
         }
 
-        // Collect client pings
         let client_pings = if let Some(rho_conn) = self.get_rho_connection().await {
             rho_conn.get_client_pings().await
         } else {
             HashMap::new()
         };
 
-        // Send pong response
         let pings = client_pings
             .into_iter()
             .map(|(k, v)| (k, JsonValue::String(v.to_string())))
@@ -252,18 +242,15 @@ impl IotaConnection {
     /// Handle message forwarding to other Iotas
     async fn handle_forward_message(&self, cv: CommunicationValue) {
         let receiver_id = cv.get_receiver();
-        // Validate sender if present
         let sender_id = cv.get_sender();
         if !self.get_user_ids().await.contains(&sender_id) {
             self.send_error_response(&cv.get_id()).await;
             return;
         }
 
-        // Find target RhoConnection
         if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id).await {
             target_rho.message_to_iota(cv).await;
         } else {
-            // Send error if target not found
             let error = CommunicationValue::new(CommunicationType::error)
                 .with_id(cv.get_id())
                 .with_sender(cv.get_sender());
@@ -298,7 +285,7 @@ impl IotaConnection {
         }
 
         // Notify OmegaConnection about user states
-        OmegaConnection::user_states(receiver_id, interested_ids.clone());
+        OmegaConnection::user_states(receiver_id, interested_ids.clone()).await;
 
         // Set interested users in RhoConnection
         if let Some(rho_conn) = self.get_rho_connection().await {
@@ -318,13 +305,11 @@ impl IotaConnection {
         }
     }
 
-    /// Send error response
     async fn send_error_response(&self, message_id: &Uuid) {
         let error = CommunicationValue::new(CommunicationType::error).with_id(*message_id);
         self.send_message(error).await;
     }
 
-    /// Handle connection close
     pub async fn handle_close(&self) {
         if self.is_identified().await {
             if let Some(rho_conn) = self.get_rho_connection().await {

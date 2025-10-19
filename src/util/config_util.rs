@@ -1,13 +1,9 @@
 use crate::util::file_util::load_file;
-use json::JsonValue;
+use futures::lock::Mutex;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
 use uuid::Uuid;
-const CONFIG_PATH: &str = "";
-const CONFIG_FILENAME: &str = "config.json";
 
-// Define the Config structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub omega_server: String,
@@ -19,13 +15,12 @@ pub struct Config {
     pub port: u16,
 }
 
-// Provide default values (similar to Java static defaults)
 impl Default for Config {
     fn default() -> Self {
         Self {
             omega_server: "omega.tensamin.methanium.net".into(),
             auth_server: "auth.tensamin.methanium.net".into(),
-            omikron_id: Uuid::parse_str("a9e92dd6-08a6-4765-abf1-9fa39d0a99f9").unwrap(),
+            omikron_id: Uuid::parse_str("a9e92dd6-08a6-4765-abf1-9fa39d0a99f9").unwrap_or_default(),
             keep_people_stored_for: 90,
             max_data: 1000 * 1000 * 1000 * 8,
             ip: "0.0.0.0".into(),
@@ -34,21 +29,22 @@ impl Default for Config {
     }
 }
 
-// Global instance with thread-safe read/write access
-pub static CONFIG: Lazy<RwLock<Config>> = Lazy::new(|| {
-    let config = Config::load().unwrap_or_default();
-    RwLock::new(config)
-});
+pub static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(Config::load()));
 
 impl Config {
-    pub fn load() -> Option<Self> {
-        let content = load_file(CONFIG_PATH, CONFIG_FILENAME);
+    pub fn load() -> Self {
+        let content = load_file("", "config.json");
         if content.trim().is_empty() {
-            return None;
+            return Config::default();
         }
 
-        let json = json::parse(&content).ok()?;
-        Some(Self {
+        let json = json::parse(&content).unwrap();
+        println!("{:?}", json);
+        println!(
+            "{:?}",
+            Uuid::parse_str(json["omikron_id"].as_str().unwrap_or_default()).unwrap_or_default()
+        );
+        Self {
             omega_server: json["omega_server"].as_str().unwrap_or_default().into(),
             auth_server: json["auth_server"].as_str().unwrap_or_default().into(),
             omikron_id: Uuid::parse_str(json["omikron_id"].as_str().unwrap_or_default())
@@ -58,6 +54,6 @@ impl Config {
             max_data: json["max_data"].as_u64().unwrap_or_default(),
             ip: json["ip"].as_str().unwrap_or_default().into(),
             port: json["port"].as_u64().unwrap_or_default() as u16,
-        })
+        }
     }
 }

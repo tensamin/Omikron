@@ -1,9 +1,6 @@
-use axum::Json;
 use json::number::Number;
-use json::{Array, JsonValue, object, parse, stringify};
-use std::any::Any;
+use json::{Array, JsonValue, object, parse};
 use std::collections::HashMap;
-use std::env::VarsOs;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -11,6 +8,7 @@ use uuid::Uuid;
 #[derive(Eq, Hash, PartialEq, Clone, Debug)]
 pub enum DataTypes {
     error_type,
+    accepted_ids,
     uuid,
     chat_partner_id,
     iota_id,
@@ -157,6 +155,9 @@ impl DataTypes {
 #[derive(PartialEq, Clone, Debug)]
 pub enum CommunicationType {
     error,
+    error_invalid_user_id,
+    error_no_iota,
+    error_invalid_private_key,
     success,
     message,
     message_send,
@@ -366,9 +367,9 @@ impl CommunicationValue {
     pub fn ack_message(message_id: Uuid, sender: Uuid) -> CommunicationValue {
         let mut cv = CommunicationValue::new(CommunicationType::message).with_id(message_id);
 
-        if let s = sender {
-            cv = cv.add_data(DataTypes::send_time, JsonValue::String(s.to_string()));
-        }
+        let s = sender;
+        cv = cv.add_data(DataTypes::send_time, JsonValue::String(s.to_string()));
+
         cv
     }
     pub fn forward_to_other_iota(original: &mut CommunicationValue) -> CommunicationValue {

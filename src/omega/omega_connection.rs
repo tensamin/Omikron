@@ -1,25 +1,21 @@
 use std::sync::Arc;
 use std::time::Duration;
-use std::{collections::HashMap, net::TcpStream};
 
 use crate::{
     data::{
         communication::DataTypes,
         user::{User, UserStatus},
     },
-    rho::{self, rho_manager},
+    rho::rho_manager,
     util::config_util::CONFIG,
 };
-use axum::Json;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use json::JsonValue;
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async, tungstenite::protocol::Message,
-};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
@@ -43,33 +39,26 @@ impl OmegaConnection {
         self.connect_internal(0).await;
     }
     async fn connect_internal(&self, mut retry: usize) {
-        let uri = "wss://tensamin.methanium.net/ws/omega/";
-
         loop {
-            if retry > 20 {
+            if retry > 5 {
                 eprintln!("Max retry attempts reached, giving up.");
                 return;
             }
 
-            match connect_async(uri).await {
-                Ok((ws_stream, _)) => {
-                    let mut guard = Some(ws_stream);
-
-                    // Send IDENTIFICATION
+            match connect_async("wss://tensamin.methanium.net/ws/omega").await {
+                Ok((_, _)) => {
+                    retry = 0;
                     let identify_msg = CommunicationValue::new(CommunicationType::identification)
                         .add_data(
                             DataTypes::uuid,
-                            JsonValue::String(CONFIG.read().unwrap().omikron_id.to_string()),
+                            JsonValue::String(CONFIG.lock().await.omikron_id.to_string()),
                         );
                     self.send_message(&identify_msg).await;
 
-                    // Spawn reader loop
                     let ws_stream_clone = self.ws_stream.clone();
                     tokio::spawn(async move {
                         OmegaConnection::read_loop(ws_stream_clone).await;
                     });
-
-                    break; // success, exit the loop
                 }
                 Err(e) => {
                     eprintln!("WebSocket connection failed (attempt {}): {}", retry, e);
@@ -92,7 +81,7 @@ impl OmegaConnection {
 
             match ws.next().await {
                 Some(Ok(Message::Text(msg))) => {
-                    let mut cv = CommunicationValue::from_json(&msg);
+                    let cv = CommunicationValue::from_json(&msg);
                     let msg_id = cv.get_id();
 
                     // Handle waiting tasks
@@ -122,26 +111,19 @@ impl OmegaConnection {
 
                         let user = User::new(iota_id, user_id, status);
                         for rho_con in rho_manager::get_all_connections().await {
-                            rho_con.are_they_interested(&user);
+                            rho_con.are_they_interested(&user).await;
                         }
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => {
-                    OmegaConnection::reconnect();
                     break;
                 }
                 Some(Err(_)) => {
-                    OmegaConnection::reconnect();
                     break;
                 }
                 _ => {}
             }
         }
-    }
-
-    async fn reconnect() {
-        let conn = OmegaConnection::new();
-        conn.connect().await;
     }
 
     pub async fn send_message(&self, cv: &CommunicationValue) {
@@ -192,7 +174,7 @@ impl OmegaConnection {
         WAITING_TASKS.insert(
             msg_id,
             Box::new(move |response: CommunicationValue| {
-                Box::pin(async move |response2: CommunicationValue| {
+                let _ = Box::pin(async move |_: CommunicationValue| {
                     let rho = rho_manager::get_rho_con_for_user(user_id).await;
                     if let Some(rho) = rho {
                         for client in rho.get_client_connections_for_user(user_id).await {
