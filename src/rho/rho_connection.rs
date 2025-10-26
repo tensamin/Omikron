@@ -1,14 +1,16 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use uuid::Uuid;
-
 use super::{client_connection::ClientConnection, iota_connection::IotaConnection, rho_manager};
 use crate::data::{
     communication::{CommunicationType, CommunicationValue, DataTypes},
     user::UserStatus,
 };
 use crate::omega::omega_connection::OmegaConnection;
+use crate::util::print::PrintType;
+use crate::util::print::line;
+use crate::util::print::line_err;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use uuid::Uuid;
 
 pub struct RhoConnection {
     iota_connection: Arc<IotaConnection>,
@@ -130,20 +132,8 @@ impl RhoConnection {
         OmegaConnection::close_iota(self.get_iota_id().await).await;
     }
 
-    /// Send message from Iota to specific client by user ID
-    pub async fn message_iota_to_client_by_user(&self, user_id: Uuid, message: &str) {
-        let connections = self.client_connections.read().await;
-        for connection in connections.iter() {
-            if let Some(conn_user_id) = connection.get_user_id().await {
-                if conn_user_id == user_id {
-                    connection.send_message_str(message).await;
-                }
-            }
-        }
-    }
-
     /// Send message from Iota to specific client
-    pub async fn message_iota_to_client(&self, cv: CommunicationValue) {
+    pub async fn message_to_client(&self, cv: CommunicationValue) {
         if let Some(receiver_id) = Some(cv.get_receiver()) {
             let connections = self.client_connections.read().await;
             for connection in connections.iter() {

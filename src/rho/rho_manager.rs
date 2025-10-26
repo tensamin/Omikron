@@ -1,3 +1,7 @@
+use super::rho_connection::RhoConnection;
+use crate::util::print::PrintType;
+use crate::util::print::line;
+use crate::util::print::line_err;
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock},
@@ -5,18 +9,22 @@ use std::{
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use super::rho_connection::RhoConnection;
-
 pub static RHO_CONNECTIONS: LazyLock<Arc<RwLock<HashMap<Uuid, Arc<RhoConnection>>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 pub async fn get_rho_con_for_user(user_id: Uuid) -> Option<Arc<RhoConnection>> {
     let connections = RHO_CONNECTIONS.read().await;
-    println!("Checking user ID: {:?}", user_id);
+    line(
+        PrintType::ClientIn,
+        &format!("Checking user ID: {:?}", user_id),
+    );
     for rho_connection in connections.values() {
-        println!(
-            "Comparing user IDs: {:?}",
-            rho_connection.get_user_ids().to_vec()
+        line(
+            PrintType::ClientIn,
+            &format!(
+                "Comparing user IDs: {:?}",
+                rho_connection.get_user_ids().to_vec()
+            ),
         );
         if rho_connection.get_user_ids().contains(&user_id) {
             return Some(Arc::clone(rho_connection));

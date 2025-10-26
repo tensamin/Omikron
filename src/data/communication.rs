@@ -214,7 +214,7 @@ impl CommunicationType {
             "messageotheriota" => CommunicationType::message_other_iota,
             "messagechunk" => CommunicationType::message_chunk,
             "messagesget" => CommunicationType::messages_get,
-            "message_send" => CommunicationType::message_send,
+            "messagesend" => CommunicationType::message_send,
             "changeconfirm" => CommunicationType::change_confirm,
             "confirmreceive" => CommunicationType::confirm_receive,
             "confirmread" => CommunicationType::confirm_read,

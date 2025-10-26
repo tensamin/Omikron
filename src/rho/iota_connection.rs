@@ -1,3 +1,8 @@
+use crate::util::print::PrintType;
+use crate::util::print::line;
+use crate::util::print::line_err;
+use ansi_term::Color;
+use futures::FutureExt;
 use futures::SinkExt;
 use json::JsonValue;
 use std::{
@@ -83,14 +88,17 @@ impl IotaConnection {
             .send(Message::Text(Utf8Bytes::from(message.to_string())))
             .await
         {
-            eprintln!("Failed to send WebSocket message: {:?}", e);
+            line_err(
+                PrintType::IotaOut,
+                &format!("Failed to send WebSocket message: {:?}", e),
+            );
         }
     }
 
     /// Send a CommunicationValue to the Iota
     pub async fn send_message(&self, cv: CommunicationValue) {
         if !cv.is_type(CommunicationType::pong) {
-            println!("{}", cv.to_json().to_string());
+            line(PrintType::IotaOut, &cv.to_json().to_string());
         }
         self.send_message_str(&cv.to_json().to_string()).await;
     }
@@ -114,7 +122,7 @@ impl IotaConnection {
             self.handle_ping(cv).await;
             return;
         }
-
+        line(PrintType::IotaIn, &cv.to_json().to_string());
         // Handle forwarding to other Iotas or clients
         let receiver_id = cv.get_receiver();
         if !self.get_user_ids().await.contains(&receiver_id)
@@ -164,6 +172,8 @@ impl IotaConnection {
                         if auth_iota_id == iota_id {
                             validated_user_ids.push(user_id);
                         }
+                    } else {
+                        line(PrintType::IotaIn, "User ID not found");
                     }
                 }
             }

@@ -1,9 +1,11 @@
 use crate::util::file_util::load_file;
+use crate::util::print::PrintType;
+use crate::util::print::line;
+use crate::util::print::line_err;
 use futures::lock::Mutex;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub omega_server: String,
@@ -39,11 +41,8 @@ impl Config {
         }
 
         let json = json::parse(&content).unwrap();
-        println!("{:?}", json);
-        println!(
-            "{:?}",
-            Uuid::parse_str(json["omikron_id"].as_str().unwrap_or_default()).unwrap_or_default()
-        );
+        line(PrintType::ClientIn, &format!("{:?}", json));
+        line(PrintType::ClientIn, &format!("{:?}", json["omikron_id"]));
         Self {
             omega_server: json["omega_server"].as_str().unwrap_or_default().into(),
             auth_server: json["auth_server"].as_str().unwrap_or_default().into(),

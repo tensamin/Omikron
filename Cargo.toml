@@ -42,3 +42,4 @@ warp = { version = "*" }
 chrono = "*"
 tokio-stream = "*"
 loom = "0.7.2"
+ansi_term = "*"

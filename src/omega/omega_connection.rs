@@ -1,6 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::data::communication::{CommunicationType, CommunicationValue};
+use crate::util::print::PrintType;
+use crate::util::print::line;
+use crate::util::print::line_err;
 use crate::{
     data::{
         communication::DataTypes,
@@ -18,8 +22,6 @@ use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
-
-use crate::data::communication::{CommunicationType, CommunicationValue};
 
 static WAITING_TASKS: Lazy<DashMap<Uuid, Box<dyn Fn(CommunicationValue) -> bool + Send + Sync>>> =
     Lazy::new(DashMap::new);
@@ -41,7 +43,10 @@ impl OmegaConnection {
     async fn connect_internal(&self, mut retry: usize) {
         loop {
             if retry > 5 {
-                eprintln!("Max retry attempts reached, giving up.");
+                line_err(
+                    PrintType::OmegaIn,
+                    &"Max retry attempts reached, giving up.",
+                );
                 return;
             }
 
@@ -61,7 +66,10 @@ impl OmegaConnection {
                     });
                 }
                 Err(e) => {
-                    eprintln!("WebSocket connection failed (attempt {}): {}", retry, e);
+                    line_err(
+                        PrintType::OmegaIn,
+                        &format!("WebSocket connection failed (attempt {}): {}", retry, e),
+                    );
                     retry += 1;
                     sleep(Duration::from_secs(2)).await;
                     continue;

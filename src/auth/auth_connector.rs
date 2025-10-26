@@ -97,7 +97,6 @@ pub async fn is_private_key_valid(user_id: Uuid, pk_hash: &str) -> bool {
     );
 
     let client = client();
-    println!("Auth: {}", CONFIG.lock().await.omikron_id);
     let res = client
         .get(&url)
         .header("Authorization", CONFIG.lock().await.omikron_id.to_string())
@@ -115,7 +114,6 @@ pub async fn is_private_key_valid(user_id: Uuid, pk_hash: &str) -> bool {
     };
 
     let cv = CommunicationValue::from_json(&body);
-    println!("Auth: {}", &body);
     if cv.comm_type != CommunicationType::success {
         return false;
     }

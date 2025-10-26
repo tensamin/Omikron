@@ -7,6 +7,9 @@ use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
 use super::{rho_connection::RhoConnection, rho_manager};
+use crate::util::print::PrintType;
+use crate::util::print::line;
+use crate::util::print::line_err;
 use crate::{
     auth::auth_connector,
     // calls::call_manager::CallManager,
@@ -84,12 +87,18 @@ impl ClientConnection {
             .send(Message::Text(Utf8Bytes::from(message.to_string())))
             .await
         {
-            eprintln!("Failed to send message to client: {}", e);
+            line_err(
+                PrintType::ClientOut,
+                &format!("Failed to send message to client: {}", e),
+            );
         }
     }
 
     /// Send a CommunicationValue to the client
     pub async fn send_message(&self, cv: &CommunicationValue) {
+        if !cv.is_type(CommunicationType::pong) {
+            line(PrintType::ClientOut, &cv.to_json().to_string());
+        }
         self.send_message_str(&cv.to_json().to_string()).await;
     }
 
@@ -112,7 +121,7 @@ impl ClientConnection {
             self.handle_ping(cv).await;
             return;
         }
-
+        line(PrintType::ClientIn, &cv.to_json().to_string());
         // Handle client status changes
         if cv.is_type(CommunicationType::client_changed) {
             self.handle_client_changed(cv).await;
@@ -132,7 +141,9 @@ impl ClientConnection {
         }
 
         // Forward other messages to Iota
-        self.forward_to_iota(cv).await;
+        tokio::spawn(async move {
+            self.forward_to_iota(cv).await;
+        });
     }
 
     /// Handle identification message
@@ -173,7 +184,7 @@ impl ClientConnection {
                 return;
             }
         } else {
-            println!("Missing private key");
+            line(PrintType::ClientIn, "Missing private key");
             self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_private_key)
                 .await;
             return;
