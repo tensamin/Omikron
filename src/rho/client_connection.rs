@@ -341,7 +341,7 @@ impl ClientConnection {
             .add_data_str(DataTypes::sender_id, sender_id.to_string())
             .add_data_str(DataTypes::call_secret, call_secret.unwrap());
 
-        target_rho.message_iota_to_client(distribute).await;
+        target_rho.message_to_client(distribute).await;
 
         // Handle call group invitation logic here
         // This would require implementing CallGroup::Caller and related functionality

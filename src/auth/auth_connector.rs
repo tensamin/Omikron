@@ -26,7 +26,7 @@ fn client() -> Client {
 }
 
 pub async fn get_user(user_id: Uuid) -> Option<AuthUser> {
-    let url = format!("https://auth.tensamin.methanium.net/api/get/{}", user_id);
+    let url = format!("https://auth.tensamin.net/api/get/{}", user_id);
     let client = client();
     let res = client.get(&url).send().await.ok()?;
     let json = res.text().await.ok()?;
@@ -65,10 +65,7 @@ pub async fn get_user(user_id: Uuid) -> Option<AuthUser> {
 }
 
 pub async fn get_iota_id(user_id: Uuid) -> Option<Uuid> {
-    let url = format!(
-        "https://auth.tensamin.methanium.net/api/get/iota-id/{}",
-        user_id
-    );
+    let url = format!("https://auth.tensamin.net/api/get/iota-id/{}", user_id);
 
     let client = client();
     let res = client
@@ -92,7 +89,7 @@ pub async fn get_iota_id(user_id: Uuid) -> Option<Uuid> {
 }
 pub async fn is_private_key_valid(user_id: Uuid, pk_hash: &str) -> bool {
     let url = format!(
-        "https://auth.tensamin.methanium.net/api/get/private-key-hash/{}/",
+        "https://auth.tensamin.net/api/get/private-key-hash/{}/",
         user_id
     );
 
@@ -124,10 +121,7 @@ pub async fn is_private_key_valid(user_id: Uuid, pk_hash: &str) -> bool {
     }
 }
 pub async fn get_public_key(user_id: Uuid) -> Option<String> {
-    let url = format!(
-        "https://auth.tensamin.methanium.net/api/{}/public-key",
-        user_id
-    );
+    let url = format!("https://auth.tensamin.net/api/{}/public-key", user_id);
 
     let client = client();
     let res = client
@@ -148,7 +142,7 @@ pub async fn get_public_key(user_id: Uuid) -> Option<String> {
 }
 
 pub async fn get_register() -> Option<Uuid> {
-    let url = "https://auth.tensamin.methanium.net/api/register/init".to_string();
+    let url = "https://auth.tensamin.net/api/register/init".to_string();
     let client = client();
     let res = client.get(&url).send().await.ok()?;
     let json = res.text().await.ok()?;

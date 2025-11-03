@@ -254,14 +254,16 @@ impl IotaConnection {
         let receiver_id = cv.get_receiver();
         let sender_id = cv.get_sender();
         if !self.get_user_ids().await.contains(&sender_id) {
-            self.send_error_response(&cv.get_id()).await;
+            self.send_message(CommunicationValue::new(
+                CommunicationType::error_invalid_user_id,
+            ));
             return;
         }
 
         if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id).await {
             target_rho.message_to_iota(cv).await;
         } else {
-            let error = CommunicationValue::new(CommunicationType::error)
+            let error = CommunicationValue::new(CommunicationType::error_no_iota)
                 .with_id(cv.get_id())
                 .with_sender(cv.get_sender());
             self.send_message(error).await;
@@ -311,7 +313,7 @@ impl IotaConnection {
         if let Some(rho_conn) = self.get_rho_connection().await {
             let updated_cv = cv.with_sender(self.get_iota_id().await);
             let receiver_id = updated_cv.get_receiver();
-            rho_conn.message_iota_to_client(updated_cv).await;
+            rho_conn.message_to_client(updated_cv).await;
         }
     }
 
