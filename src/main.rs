@@ -5,8 +5,6 @@ mod omega;
 mod rho;
 mod util;
 
-use ansi_term::Color;
-use crossterm::style::PrintStyledContent;
 use futures::StreamExt;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -21,13 +19,14 @@ use crate::{
     util::print::line_err,
     util::print::print_start_message,
 };
-#[tokio::main]
 
+#[tokio::main(flavor = "multi_thread", worker_threads = 32)]
+#[allow(unused_must_uscae, dead_code)]
 async fn main() {
     print_start_message();
-
-    OmegaConnection::new().connect().await;
-
+    tokio::spawn(async move {
+        OmegaConnection::new().connect().await;
+    });
     let listener = TcpListener::bind("0.0.0.0:959").await.unwrap();
     line(
         PrintType::OmegaIn,
@@ -64,8 +63,9 @@ async fn main() {
                     match msg_result {
                         Some(Ok(msg)) => {
                             if msg.is_text() {
-                                let text = msg.into_text().unwrap();
-                                client_conn.clone().handle_message(text).await;
+                                let text = msg.into_text();
+                                let cc = client_conn.clone();
+                                cc.handle_message(text.unwrap()).await;
                             } else if msg.is_close() {
                                 line(PrintType::ClientIn, "Client disconnected");
                                 client_conn.handle_close().await;
@@ -97,7 +97,8 @@ async fn main() {
                         Some(Ok(msg)) => {
                             if msg.is_text() {
                                 let text = msg.into_text().unwrap();
-                                iota_conn.clone().handle_message(text).await;
+                                let ic = iota_conn.clone();
+                                ic.handle_message(text).await;
                             } else if msg.is_close() {
                                 line(PrintType::IotaIn, "Iota disconnected");
                                 iota_conn.handle_close().await;
