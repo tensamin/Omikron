@@ -2,6 +2,10 @@ use crate::util::print::PrintType;
 use crate::util::print::line;
 use crate::util::print::line_err;
 use ansi_term::Color;
+use async_tungstenite::WebSocketReceiver;
+use async_tungstenite::WebSocketSender;
+use async_tungstenite::tungstenite::protocol::WebSocketConfig;
+use async_tungstenite::{WebSocketStream, tungstenite::Message};
 use futures::FutureExt;
 use futures::SinkExt;
 use json::JsonValue;
@@ -10,7 +14,7 @@ use std::{
     sync::{Arc, Weak},
 };
 use tokio::sync::{Mutex, RwLock};
-use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+use tokio_util::compat::Compat;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
@@ -22,9 +26,9 @@ use crate::{
     omega::omega_connection::OmegaConnection,
 };
 
-/// IotaConnection represents a WebSocket connection from an Iota device
 pub struct IotaConnection {
-    pub session: Arc<Mutex<WebSocketStream<tokio::net::TcpStream>>>,
+    pub sender: Arc<RwLock<WebSocketSender<Compat<tokio::net::TcpStream>>>>,
+    pub receiver: Arc<RwLock<WebSocketReceiver<Compat<tokio::net::TcpStream>>>>,
     pub iota_id: Arc<RwLock<Uuid>>,
     pub user_ids: Arc<RwLock<Vec<Uuid>>>,
     pub identified: Arc<RwLock<bool>>,
@@ -34,9 +38,13 @@ pub struct IotaConnection {
 
 impl IotaConnection {
     /// Create a new IotaConnection
-    pub fn new(session: WebSocketStream<tokio::net::TcpStream>) -> Arc<Self> {
+    pub fn new(
+        sender: WebSocketSender<Compat<tokio::net::TcpStream>>,
+        receiver: WebSocketReceiver<Compat<tokio::net::TcpStream>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            session: Arc::new(Mutex::new(session)),
+            sender: Arc::new(RwLock::new(sender)),
+            receiver: Arc::new(RwLock::new(receiver)),
             iota_id: Arc::new(RwLock::new(Uuid::nil())),
             user_ids: Arc::new(RwLock::new(Vec::new())),
             identified: Arc::new(RwLock::new(false)),
@@ -83,7 +91,7 @@ impl IotaConnection {
 
     /// Send a message to the Iota
     pub async fn send_message_str(&self, message: &str) {
-        let mut session = self.session.lock().await;
+        let mut session = self.sender.write().await;
         if let Err(e) = session
             .send(Message::Text(Utf8Bytes::from(message.to_string())))
             .await
@@ -256,7 +264,8 @@ impl IotaConnection {
         if !self.get_user_ids().await.contains(&sender_id) {
             self.send_message(CommunicationValue::new(
                 CommunicationType::error_invalid_user_id,
-            ));
+            ))
+            .await;
             return;
         }
 

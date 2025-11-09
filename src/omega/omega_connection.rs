@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use crate::data::communication::{CommunicationType, CommunicationValue};
 use crate::util::print::PrintType;
-use crate::util::print::line;
 use crate::util::print::line_err;
 use crate::{
     data::{
@@ -13,21 +12,23 @@ use crate::{
     rho::rho_manager,
     util::config_util::CONFIG,
 };
+use async_tungstenite::tungstenite::protocol::Message;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use json::JsonValue;
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use tungstenite::Utf8Bytes;
+use tokio_util::compat::Compat;
+use tungstenite::{Utf8Bytes, connect};
 use uuid::Uuid;
 
 static WAITING_TASKS: Lazy<DashMap<Uuid, Box<dyn Fn(CommunicationValue) -> bool + Send + Sync>>> =
     Lazy::new(DashMap::new);
 
 pub struct OmegaConnection {
-    ws_stream: Arc<Mutex<Option<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>>>>,
+    ws_stream:
+        Arc<Mutex<Option<async_tungstenite::WebSocketStream<Compat<tokio::net::TcpStream>>>>>,
 }
 
 impl OmegaConnection {
@@ -50,7 +51,7 @@ impl OmegaConnection {
                 return;
             }
 
-            match connect_async("wss://tensamin.methanium.net/ws/omega").await {
+            match connect("wss://tensamin.methanium.net/ws/omega") {
                 Ok((_, _)) => {
                     retry = 0;
                     let identify_msg = CommunicationValue::new(CommunicationType::identification)
@@ -79,7 +80,9 @@ impl OmegaConnection {
     }
 
     async fn read_loop(
-        ws_stream: Arc<Mutex<Option<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>>>>,
+        ws_stream: Arc<
+            Mutex<Option<async_tungstenite::WebSocketStream<Compat<tokio::net::TcpStream>>>>,
+        >,
     ) {
         loop {
             let mut lock = ws_stream.lock().await;

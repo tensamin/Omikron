@@ -1,184 +1,249 @@
-use std::sync::Arc;
-
-use crate::{
-    calls::{call_manager::CallManagerState, caller::Caller},
-    data::communication::{CommunicationType, CommunicationValue, DataTypes},
+use async_tungstenite::{
+    WebSocketReceiver, WebSocketSender, WebSocketStream, tungstenite::Message,
 };
-use futures::{SinkExt, StreamExt, lock::Mutex};
-use json::JsonValue;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::mpsc::unbounded_channel;
+use futures::SinkExt;
+use std::sync::Arc;
+use tokio::sync::{
+    Mutex, RwLock,
+    mpsc::{UnboundedSender, unbounded_channel},
+};
+use tokio_util::compat::Compat;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
-pub async fn handle_connection(
-    raw_stream: tokio::net::TcpStream,
-    state: Arc<Mutex<CallManagerState>>,
-) {
-    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
-        .await
-        .expect("Error during the websocket handshake");
+use crate::{
+    calls::call_manager,
+    data::communication::{CommunicationType, CommunicationValue, DataTypes},
+    util::print::{PrintType, line, line_err},
+};
+use json::JsonValue;
 
-    let (outgoing, mut incoming) = ws_stream.split();
-
-    // We create a channel so other parts can send to this client
-    pub type Tx = UnboundedSender<Utf8Bytes>;
-    let (tx, mut rx): (UnboundedSender<_>, _) = unbounded_channel();
-
-    // Spawn a task to forward from rx → outgoing
-    let mut outgoing_clone = outgoing;
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let _ = outgoing_clone
-                .send(tokio_tungstenite::tungstenite::Message::Text(msg))
-                .await;
-        }
-    });
-
-    // Each connection will track its user_id, call_group, etc.
-    let mut maybe_user_id: Option<Uuid> = None;
-    let mut maybe_call_id: Option<Uuid> = None;
-
-    while let Some(msg) = incoming.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(_) => break,
-        };
-        if let tokio_tungstenite::tungstenite::Message::Text(s) = msg {
-            // parse CommunicationValue
-            let cv = CommunicationValue::from_json(&s);
-            match cv.comm_type {
-                CommunicationType::identification => {
-                    // extract fields
-                    let user_str = cv.get_data(DataTypes::user_id).unwrap().as_str().unwrap();
-                    let call_str = cv.get_data(DataTypes::call_id).unwrap().as_str().unwrap();
-                    let _secret_sha = cv
-                        .get_data(DataTypes::call_secret_sha)
-                        .unwrap()
-                        .as_str()
-                        .unwrap();
-
-                    let user_id = Uuid::parse_str(user_str).ok();
-                    let call_id = Uuid::parse_str(call_str).ok();
-                    if let (Some(uid), Some(cid)) = (user_id, call_id) {
-                        maybe_user_id = Some(uid);
-                        maybe_call_id = Some(cid);
-                        // Add to call group
-                        let group = state.lock().await.get_or_create_group(cid, &_secret_sha);
-                        group.lock().await.add_member(uid, tx.clone());
-                        // Response: identification_response plus states
-                        let mut response =
-                            CommunicationValue::new(CommunicationType::identification_response)
-                                .with_id(cv.get_id().clone());
-                        // build user states
-                        let mut users = JsonValue::new_object();
-                        for c in group.lock().await.callers.values() {
-                            let mut user_info = JsonValue::new_object();
-                            let _ = user_info.insert("state", JsonValue::from("muted".to_string()));
-                            let _ = user_info.insert("streaming", JsonValue::from(false));
-                            let _ =
-                                users.insert(&c.user_id.to_string(), JsonValue::from(user_info));
-                        }
-                        response = response.add_data(DataTypes::about, JsonValue::from(users));
-                        // send back
-                        let _ = tx.send(Utf8Bytes::from(response.to_json().to_string()));
-                    }
-                }
-
-                CommunicationType::ping => {
-                    // optionally parse LAST_PING
-                    // reply with PONG with same message_id
-                    let resp = CommunicationValue::new(CommunicationType::pong)
-                        .with_id(cv.get_id().clone());
-                    let _ = tx.send(Utf8Bytes::from(resp.to_json().to_string()));
-                }
-
-                CommunicationType::client_changed => {
-                    match (maybe_user_id, cv.get_data(DataTypes::call_state)) {
-                        (Some(uid), Some(JsonValue::String(state_str))) => {
-                            if let Some(cid) = maybe_call_id {
-                                {
-                                    let mut st = state.lock().await;
-                                    let mut group =
-                                        st.call_groups.get_mut(&cid).unwrap().lock().await;
-                                    let caller = group.caller_state_mut(&uid).unwrap();
-                                    caller_state_change(caller, &state_str);
-
-                                    let mut bc = cv.clone();
-                                    bc = bc.add_data(
-                                        DataTypes::sender_id,
-                                        JsonValue::String(uid.to_string()),
-                                    );
-                                    group.broadcast(&bc.to_json().to_string());
-                                }
-                            }
-                        }
-                        _ => (),
-                    }
-                }
-
-                CommunicationType::start_stream | CommunicationType::end_stream => {
-                    if let Some(uid) = maybe_user_id {
-                        if let Some(cid) = maybe_call_id {
-                            let mut st = state.lock().await;
-                            let mut group = st.call_groups.get_mut(&cid).unwrap().lock().await;
-                            if let Some(caller) = group.caller_state_mut(&uid) {
-                                let streaming = cv.comm_type == CommunicationType::start_stream;
-                                // set streaming
-                                // caller.streaming = streaming; // if you store streaming
-                            }
-                            let mut bc = cv.clone();
-                            bc = bc
-                                .add_data(DataTypes::sender_id, JsonValue::String(uid.to_string()));
-                            group.broadcast(&bc.to_json().to_string());
-                        }
-                    }
-                }
-
-                CommunicationType::webrtc_sdp
-                | CommunicationType::webrtc_ice
-                | CommunicationType::watch_stream => {
-                    if let Some(uid) = maybe_user_id {
-                        if let Some(JsonValue::String(receiver_str)) =
-                            cv.get_data(DataTypes::receiver_id)
-                        {
-                            if let Ok(receiver_id) = Uuid::parse_str(&receiver_str) {
-                                if let Some(cid) = maybe_call_id {
-                                    let st = state.lock().await;
-                                    if let Some(group) = st.call_groups.get(&cid) {
-                                        let mut bc = cv.clone();
-                                        bc = bc.add_data(
-                                            DataTypes::sender_id,
-                                            JsonValue::String(uid.to_string()),
-                                        );
-                                        group
-                                            .lock()
-                                            .await
-                                            .send_to(&receiver_id, &bc.to_json().to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                _ => {
-                    // other types you may handle
-                }
-            }
-        }
-    }
-
-    // on close / disconnection:
-    if let (Some(uid), Some(cid)) = (maybe_user_id, maybe_call_id) {
-        let mut st = state.lock().await;
-        if let Some(group) = st.call_groups.get_mut(&cid) {
-            group.lock().await.remove_member(uid);
-        }
-        st.remove_inactive().await;
-    }
+pub struct CallConnection {
+    pub sender: Arc<RwLock<WebSocketSender<Compat<tokio::net::TcpStream>>>>,
+    pub receiver: Arc<RwLock<WebSocketReceiver<Compat<tokio::net::TcpStream>>>>,
+    pub tx: UnboundedSender<Utf8Bytes>,
+    pub user_id: Arc<RwLock<Option<Uuid>>>,
+    pub call_id: Arc<RwLock<Option<Uuid>>>,
 }
 
-fn caller_state_change(_caller: &mut Caller, _state_str: &str) {
-    // parse and set your enum, e.g. match _state_str { "active" => ..., etc. }
+impl CallConnection {
+    pub async fn new(
+        sender: WebSocketSender<Compat<tokio::net::TcpStream>>,
+        receiver: WebSocketReceiver<Compat<tokio::net::TcpStream>>,
+    ) -> Arc<Self> {
+        let (tx, mut rx) = unbounded_channel::<Utf8Bytes>();
+
+        let conn = Arc::new(Self {
+            sender: Arc::new(RwLock::new(sender)),
+            receiver: Arc::new(RwLock::new(receiver)),
+            tx,
+            user_id: Arc::new(RwLock::new(None)),
+            call_id: Arc::new(RwLock::new(None)),
+        });
+
+        // Spawn sender task to forward tx → session
+        let sender_clone = Arc::clone(&conn.sender);
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let mut sess = sender_clone.write().await;
+                let _ = sess.send(Message::Text(msg)).await;
+            }
+        });
+
+        conn
+    }
+
+    /// Handle a single incoming message
+    pub async fn handle_message(self: Arc<Self>, msg: Utf8Bytes) {
+        let mut cv = CommunicationValue::from_json(&msg);
+        if let Some(sender) = *self.user_id.read().await {
+            cv = cv.with_sender(sender);
+        }
+        if !cv.is_type(CommunicationType::identification) && !cv.is_type(CommunicationType::ping) {
+            line(PrintType::CallIn, &cv.to_json().to_string());
+        }
+
+        match cv.comm_type {
+            CommunicationType::identification => self.handle_identification(cv).await,
+            CommunicationType::ping => self.handle_ping(cv).await,
+            CommunicationType::client_changed => self.handle_client_changed(cv).await,
+            CommunicationType::start_stream | CommunicationType::end_stream => {
+                self.handle_stream_toggle(cv).await
+            }
+            CommunicationType::webrtc_sdp
+            | CommunicationType::webrtc_ice
+            | CommunicationType::watch_stream => self.handle_direct_relay(cv).await,
+            _ => {}
+        }
+    }
+
+    async fn handle_identification(&self, cv: CommunicationValue) {
+        let user_str = cv
+            .get_data(DataTypes::user_id)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let call_str = cv
+            .get_data(DataTypes::call_id)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let secret_sha = cv
+            .get_data(DataTypes::call_secret_sha)
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let (Ok(uid), Ok(cid)) = (Uuid::parse_str(user_str), Uuid::parse_str(call_str)) else {
+            return;
+        };
+
+        {
+            *self.user_id.write().await = Some(uid);
+            *self.call_id.write().await = Some(cid);
+        }
+
+        let group = call_manager::get_or_create_group(cid, secret_sha).await;
+        {
+            group.lock().await.add_member(uid, self.tx.clone());
+        }
+
+        // Build broadcast
+        let broadcast = CommunicationValue::new(CommunicationType::client_connected)
+            .with_id(cv.get_id().clone())
+            .add_data_str(DataTypes::user_id, uid.to_string())
+            .add_data_str(DataTypes::call_state, "muted".to_string());
+        {
+            group
+                .lock()
+                .await
+                .broadcast(&broadcast.to_json().to_string());
+        }
+        // Build response
+        let mut response = CommunicationValue::new(CommunicationType::identification_response)
+            .with_id(cv.get_id().clone());
+
+        let mut users = JsonValue::new_object();
+        {
+            for caller in group.lock().await.callers.values() {
+                let mut user_info = JsonValue::new_object();
+                let _ = user_info.insert("state", JsonValue::from("muted"));
+                let _ = user_info.insert("streaming", JsonValue::from(false));
+                let _ = users.insert(&caller.user_id.to_string(), user_info);
+            }
+        }
+
+        response = response.add_data(DataTypes::about, users);
+        self.send_message(&response).await;
+    }
+
+    async fn handle_ping(&self, cv: CommunicationValue) {
+        let resp = CommunicationValue::new(CommunicationType::pong).with_id(cv.get_id().clone());
+        self.send_message(&resp).await;
+    }
+
+    async fn handle_client_changed(&self, cv: CommunicationValue) {
+        let uid = match *self.user_id.read().await {
+            Some(id) => id,
+            None => return,
+        };
+
+        let cid = match *self.call_id.read().await {
+            Some(id) => id,
+            None => return,
+        };
+
+        if let Some(JsonValue::String(_state_str)) = cv.get_data(DataTypes::call_state) {
+            let Some(group_lock) = call_manager::get_group(cid).await else {
+                return;
+            };
+            let mut group = group_lock.lock().await;
+            if let Some(_caller) = group.caller_state_mut(&uid) {
+                // caller_state_change(caller, &state_str);
+            }
+
+            let mut bc = cv.clone();
+            bc = bc.add_data(DataTypes::sender_id, JsonValue::String(uid.to_string()));
+            group.broadcast(&bc.to_json().to_string());
+        }
+    }
+
+    async fn handle_stream_toggle(&self, cv: CommunicationValue) {
+        let uid = match *self.user_id.read().await {
+            Some(id) => id,
+            None => return,
+        };
+
+        let cid = match *self.call_id.read().await {
+            Some(id) => id,
+            None => return,
+        };
+
+        if let Some(group_lock) = call_manager::get_group(cid).await {
+            let group = group_lock.lock().await;
+            let _streaming = cv.comm_type == CommunicationType::start_stream;
+            let mut bc = cv.clone();
+            bc = bc.add_data(DataTypes::sender_id, JsonValue::String(uid.to_string()));
+            group.broadcast(&bc.to_json().to_string());
+        }
+    }
+
+    async fn handle_direct_relay(&self, cv: CommunicationValue) {
+        let uid = match *self.user_id.read().await {
+            Some(id) => id,
+            None => return,
+        };
+        let cid = match *self.call_id.read().await {
+            Some(id) => id,
+            None => return,
+        };
+        if let Some(JsonValue::String(receiver_str)) = cv.get_data(DataTypes::receiver_id) {
+            if let Ok(receiver_id) = Uuid::parse_str(&receiver_str) {
+                if let Some(group) = call_manager::get_group(cid).await {
+                    let mut bc = cv.clone();
+                    bc = bc.add_data(DataTypes::sender_id, JsonValue::String(uid.to_string()));
+                    group
+                        .lock()
+                        .await
+                        .send_to(&receiver_id, &bc.to_json().to_string());
+                    line(
+                        PrintType::CallOut,
+                        &format!("Forwarded WebRTC message to receiver: {}", receiver_str),
+                    );
+                } else {
+                    line_err(PrintType::CallOut, "Failed to find the group for the call.");
+                }
+            } else {
+                line_err(PrintType::CallOut, "Invalid receiver_id in WebRTC message.");
+            }
+        } else {
+            line_err(PrintType::CallOut, "Missing receiver_id in WebRTC message.");
+        }
+    }
+    pub async fn send_message(&self, cv: &CommunicationValue) {
+        if !cv.is_type(CommunicationType::pong) {
+            line(PrintType::CallOut, &cv.to_json().to_string());
+        }
+        let mut session = self.sender.write().await;
+        if let Err(e) = session
+            .send(Message::Text(Utf8Bytes::from(cv.to_json().to_string())))
+            .await
+        {
+            line_err(
+                PrintType::CallOut,
+                &format!("Failed to send message to client: {}", e),
+            );
+        }
+    }
+
+    pub async fn close(&self) {
+        let (uid, cid) = { (*self.user_id.read().await, *self.call_id.read().await) };
+        if let (Some(uid), Some(cid)) = (uid, cid) {
+            if let Some(group) = call_manager::get_group(cid).await {
+                group.lock().await.remove_member(uid);
+            }
+            call_manager::remove_inactive().await;
+        }
+
+        let mut session = self.sender.write().await;
+        let _ = session.close(None).await;
+    }
+    pub async fn handle_close(&self) {}
 }

@@ -5,29 +5,29 @@ mod omega;
 mod rho;
 mod util;
 
-use ansi_term::Color;
-use crossterm::style::PrintStyledContent;
+use async_tungstenite::accept_hdr_async;
 use futures::StreamExt;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::net::TcpListener;
-use tokio_tungstenite::accept_hdr_async;
-use tungstenite::handshake::server::{Request, Response};
+use tokio_util::compat::TokioAsyncReadCompatExt;
+use tungstenite::{
+    Message, Utf8Bytes,
+    handshake::server::{Request, Response},
+};
 
 use crate::{
+    calls::call_connection::CallConnection,
     omega::omega_connection::OmegaConnection,
     rho::{client_connection::ClientConnection, iota_connection::IotaConnection},
-    util::print::PrintType,
-    util::print::line,
-    util::print::line_err,
-    util::print::print_start_message,
+    util::print::{PrintType, line, line_err, print_start_message},
 };
 #[tokio::main]
 
 async fn main() {
     print_start_message();
-
-    OmegaConnection::new().connect().await;
-
+    tokio::spawn(async move {
+        OmegaConnection::new().connect().await;
+    });
     let listener = TcpListener::bind("0.0.0.0:959").await.unwrap();
     line(
         PrintType::OmegaIn,
@@ -37,11 +37,12 @@ async fn main() {
     while let Ok((stream, _)) = listener.accept().await {
         tokio::spawn(async move {
             let mut path: String = "/".to_string();
+
             let callback = |req: &Request, response: Response| {
-                path = format!("{}", &req.uri().path());
+                path = req.uri().path().to_string(); // Extract URI path
                 Ok(response)
             };
-            let ws_stream = match accept_hdr_async(stream, callback).await {
+            let ws_stream = match accept_hdr_async(stream.compat(), callback).await {
                 Ok(ws) => ws,
                 Err(e) => {
                     line_err(
@@ -51,13 +52,14 @@ async fn main() {
                     return;
                 }
             };
+            let (sender, receiver) = ws_stream.split();
             if path == "/ws/client/" {
                 line(PrintType::ClientIn, "New Client connection");
                 let client_conn: Arc<ClientConnection> =
-                    Arc::from(ClientConnection::new(ws_stream));
+                    Arc::from(ClientConnection::new(sender, receiver));
                 loop {
                     let msg_result = {
-                        let mut session_lock = client_conn.session.lock().await;
+                        let mut session_lock = client_conn.receiver.write().await;
                         session_lock.next().await
                     };
 
@@ -86,10 +88,11 @@ async fn main() {
                 }
             } else if path == "/ws/iota/" {
                 line(PrintType::IotaIn, "New Iota connection");
-                let iota_conn: Arc<IotaConnection> = Arc::from(IotaConnection::new(ws_stream));
+                let iota_conn: Arc<IotaConnection> =
+                    Arc::from(IotaConnection::new(sender, receiver));
                 loop {
                     let msg_result = {
-                        let mut session_lock = iota_conn.session.lock().await;
+                        let mut session_lock = iota_conn.receiver.write().await;
                         session_lock.next().await
                     };
 
@@ -113,6 +116,39 @@ async fn main() {
                             // Stream ended
                             line(PrintType::IotaIn, "Iota stream ended");
                             iota_conn.handle_close().await;
+                            return;
+                        }
+                    }
+                }
+            } else if path == "/ws/call/" {
+                line(PrintType::CallIn, "New Call connection");
+                let call_conn: Arc<CallConnection> =
+                    Arc::from(CallConnection::new(sender, receiver).await);
+                loop {
+                    let msg_result = {
+                        let mut session_lock = call_conn.receiver.write().await;
+                        session_lock.next().await
+                    };
+
+                    match msg_result {
+                        Some(Ok(msg)) => {
+                            if msg.is_text() {
+                                let text = msg.into_text().unwrap();
+                                call_conn.clone().handle_message(text).await;
+                            } else if msg.is_close() {
+                                line(PrintType::CallIn, "Call disconnected");
+                                call_conn.handle_close().await;
+                                return;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            line_err(PrintType::CallIn, &format!("WebSocket error: {}", e));
+                            call_conn.handle_close().await;
+                            return;
+                        }
+                        None => {
+                            line(PrintType::CallIn, "Call stream ended");
+                            call_conn.handle_close().await;
                             return;
                         }
                     }

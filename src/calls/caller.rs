@@ -2,7 +2,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Caller {
     pub user_id: Uuid,
     pub tx: UnboundedSender<Utf8Bytes>,

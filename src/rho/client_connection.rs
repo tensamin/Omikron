@@ -1,8 +1,10 @@
+use async_tungstenite::{WebSocketReceiver, WebSocketSender};
+use async_tungstenite::{WebSocketStream, tungstenite::Message};
 use futures::SinkExt;
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
-use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+use tokio_util::compat::Compat;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
@@ -23,7 +25,8 @@ use crate::{
 /// ClientConnection represents a WebSocket connection from a client device
 pub struct ClientConnection {
     /// WebSocket session
-    pub session: Arc<Mutex<WebSocketStream<tokio::net::TcpStream>>>,
+    pub sender: Arc<RwLock<WebSocketSender<Compat<tokio::net::TcpStream>>>>,
+    pub receiver: Arc<RwLock<WebSocketReceiver<Compat<tokio::net::TcpStream>>>>,
     /// User ID associated with this client
     pub user_id: Arc<RwLock<Option<Uuid>>>,
     /// Whether this connection has been identified/authenticated
@@ -38,9 +41,13 @@ pub struct ClientConnection {
 
 impl ClientConnection {
     /// Create a new ClientConnection
-    pub fn new(session: WebSocketStream<tokio::net::TcpStream>) -> Arc<Self> {
+    pub fn new(
+        sender: WebSocketSender<Compat<tokio::net::TcpStream>>,
+        receiver: WebSocketReceiver<Compat<tokio::net::TcpStream>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            session: Arc::new(Mutex::new(session)),
+            sender: Arc::new(RwLock::new(sender)),
+            receiver: Arc::new(RwLock::new(receiver)),
             user_id: Arc::new(RwLock::new(None)),
             identified: Arc::new(RwLock::new(false)),
             ping: Arc::new(RwLock::new(-1)),
@@ -82,7 +89,7 @@ impl ClientConnection {
 
     /// Send a string message to the client
     pub async fn send_message_str(&self, message: &str) {
-        let mut session = self.session.lock().await;
+        let mut session = self.sender.write().await;
         if let Err(e) = session
             .send(Message::Text(Utf8Bytes::from(message.to_string())))
             .await
@@ -423,7 +430,7 @@ impl ClientConnection {
 
     /// Close the connection
     pub async fn close(&self) {
-        let mut session = self.session.lock().await;
+        let mut session = self.sender.write().await;
         let _ = session.close(None).await;
     }
 
@@ -466,7 +473,8 @@ impl ClientConnection {
 impl Clone for ClientConnection {
     fn clone(&self) -> Self {
         Self {
-            session: Arc::clone(&self.session),
+            sender: Arc::clone(&self.sender),
+            receiver: Arc::clone(&self.receiver),
             user_id: Arc::clone(&self.user_id),
             identified: Arc::clone(&self.identified),
             ping: Arc::clone(&self.ping),

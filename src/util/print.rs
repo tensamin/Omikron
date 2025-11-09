@@ -4,7 +4,9 @@ pub fn print_start_message() {
     println!("{}", Color::Yellow.paint("> Iota inbound"));
     println!("{}", Color::Purple.paint("< Iota outbound"));
     println!("{}", Color::Green.paint("> Client inbound"));
-    println!("{}", Color::Blue.paint("> Client outbound"));
+    println!("{}", Color::Blue.paint("< Client outbound"));
+    println!("{}", Color::Red.paint("> Call inbound"));
+    println!("{}", Color::Red.paint("< Call outbound"));
     println!("{}", Color::Cyan.paint("> Omega inbound"));
     println!("{}", Color::Cyan.paint("< Omega outbound"));
     println!("{}", Color::White.paint("General info"));
@@ -17,6 +19,8 @@ pub enum PrintType {
     OmegaOut,
     ClientIn,
     ClientOut,
+    CallIn,
+    CallOut,
     General,
 }
 pub fn line(key: PrintType, message: &str) {
@@ -38,6 +42,12 @@ pub fn line(key: PrintType, message: &str) {
         }
         PrintType::ClientOut => {
             println!("{}{}", Color::Blue.paint("<"), Color::Blue.paint(message))
+        }
+        PrintType::CallIn => {
+            println!("{}{}", Color::Red.paint(">"), Color::Red.paint(message))
+        }
+        PrintType::CallOut => {
+            println!("{}{}", Color::Red.paint("<"), Color::Red.paint(message))
         }
         PrintType::General => println!("{}", Color::White.paint(message)),
     }
@@ -65,6 +75,10 @@ pub fn line_err(key: PrintType, message: &str) {
         ),
         PrintType::ClientOut => {
             println!("{}{}", Color::Blue.paint("<<"), Color::Blue.paint(message))
+        }
+        PrintType::CallIn => println!("{}{}", Color::Red.paint(">>"), Color::Red.paint(message)),
+        PrintType::CallOut => {
+            println!("{}{}", Color::Red.paint("<<"), Color::Red.paint(message))
         }
         PrintType::General => println!("{}", Color::Red.paint(message)),
     }

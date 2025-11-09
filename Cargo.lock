@@ -7,6 +7,7 @@ name = "Omikron"
 version = "0.1.0"
 dependencies = [
  "ansi_term",
+ "async-tungstenite",
  "axum",
  "base64",
  "bytes",
@@ -34,7 +35,6 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tokio-stream",
- "tokio-tungstenite 0.28.0",
  "tokio-util",
  "tokio_websocket_server",
  "tracing",
@@ -87,6 +87,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d52a9bb7ec0cf484c551830a7ce27bd20d67eac647e1befb56b0be4ee39a55d2"
 dependencies = [
  "winapi",
+]
+
+[[package]]
+name = "async-tungstenite"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6f89c129ab749940f95509d84950c62092c8b4bc6e386ddb162229037a6ec91"
+dependencies = [
+ "atomic-waker",
+ "futures-core",
+ "futures-io",
+ "futures-task",
+ "futures-util",
+ "log",
+ "pin-project-lite",
+ "tungstenite 0.28.0",
 ]
 
 [[package]]
@@ -2225,18 +2241,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-tungstenite"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
-dependencies = [
- "futures-util",
- "log",
- "tokio",
- "tungstenite 0.28.0",
-]
-
-[[package]]
 name = "tokio-util"
 version = "0.7.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2265,7 +2269,7 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-rustls",
- "tokio-tungstenite 0.26.2",
+ "tokio-tungstenite",
  "tracing",
  "uuid",
 ]
