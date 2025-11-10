@@ -1,10 +1,7 @@
 use crate::util::file_util::load_file;
-use crate::util::print::PrintType;
-use crate::util::print::line;
-use crate::util::print::line_err;
-use futures::lock::Mutex;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -20,9 +17,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            omega_server: "omega.tensamin.methanium.net".into(),
-            auth_server: "auth.tensamin.methanium.net".into(),
-            omikron_id: Uuid::parse_str("a9e92dd6-08a6-4765-abf1-9fa39d0a99f9").unwrap_or_default(),
+            omega_server: "omega.tensamin.net".into(),
+            auth_server: "auth.tensamin.net".into(),
+            omikron_id: Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap_or_default(),
             keep_people_stored_for: 90,
             max_data: 1000 * 1000 * 1000 * 8,
             ip: "0.0.0.0".into(),
@@ -31,7 +28,7 @@ impl Default for Config {
     }
 }
 
-pub static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(Config::load()));
+pub static CONFIG: Lazy<RwLock<Config>> = Lazy::new(|| RwLock::new(Config::load()));
 
 impl Config {
     pub fn load() -> Self {
@@ -41,18 +38,21 @@ impl Config {
         }
 
         let json = json::parse(&content).unwrap();
-        line(PrintType::ClientIn, &format!("{:?}", json));
-        line(PrintType::ClientIn, &format!("{:?}", json["omikron_id"]));
         Self {
-            omega_server: json["omega_server"].as_str().unwrap_or_default().into(),
-            auth_server: json["auth_server"].as_str().unwrap_or_default().into(),
+            omega_server: json["omega_server"]
+                .as_str()
+                .unwrap_or("omega.tensamin.net")
+                .into(),
+            auth_server: json["auth_server"]
+                .as_str()
+                .unwrap_or("auth.tensamin.net")
+                .into(),
             omikron_id: Uuid::parse_str(json["omikron_id"].as_str().unwrap_or_default())
                 .unwrap_or_default(),
-            keep_people_stored_for: json["keep_people_stored_for"].as_i64().unwrap_or_default()
-                as i32,
-            max_data: json["max_data"].as_u64().unwrap_or_default(),
-            ip: json["ip"].as_str().unwrap_or_default().into(),
-            port: json["port"].as_u64().unwrap_or_default() as u16,
+            keep_people_stored_for: json["keep_people_stored_for"].as_i64().unwrap_or(90) as i32,
+            max_data: json["max_data"].as_u64().unwrap_or(8000000000),
+            ip: json["ip"].as_str().unwrap_or("0.0.0.0").into(),
+            port: json["port"].as_u64().unwrap_or(959) as u16,
         }
     }
 }

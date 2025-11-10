@@ -57,7 +57,7 @@ impl OmegaConnection {
                     let identify_msg = CommunicationValue::new(CommunicationType::identification)
                         .add_data(
                             DataTypes::uuid,
-                            JsonValue::String(CONFIG.lock().await.omikron_id.to_string()),
+                            JsonValue::String(CONFIG.read().await.omikron_id.to_string()),
                         );
                     self.send_message(&identify_msg).await;
 

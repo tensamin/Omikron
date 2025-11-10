@@ -59,7 +59,7 @@ impl CallConnection {
         if let Some(sender) = *self.user_id.read().await {
             cv = cv.with_sender(sender);
         }
-        if !cv.is_type(CommunicationType::identification) && !cv.is_type(CommunicationType::ping) {
+        if !cv.is_type(CommunicationType::ping) {
             line(PrintType::CallIn, &cv.to_json().to_string());
         }
 
@@ -101,10 +101,6 @@ impl CallConnection {
         }
 
         let group = call_manager::get_or_create_group(cid, secret_sha).await;
-        {
-            group.lock().await.add_member(uid, self.tx.clone());
-        }
-
         // Build broadcast
         let broadcast = CommunicationValue::new(CommunicationType::client_connected)
             .with_id(cv.get_id().clone())
@@ -116,6 +112,12 @@ impl CallConnection {
                 .await
                 .broadcast(&broadcast.to_json().to_string());
         }
+
+        // Add member to group
+        {
+            group.lock().await.add_member(uid, self.tx.clone());
+        }
+
         // Build response
         let mut response = CommunicationValue::new(CommunicationType::identification_response)
             .with_id(cv.get_id().clone());
@@ -129,7 +131,6 @@ impl CallConnection {
                 let _ = users.insert(&caller.user_id.to_string(), user_info);
             }
         }
-
         response = response.add_data(DataTypes::about, users);
         self.send_message(&response).await;
     }
@@ -237,6 +238,12 @@ impl CallConnection {
         let (uid, cid) = { (*self.user_id.read().await, *self.call_id.read().await) };
         if let (Some(uid), Some(cid)) = (uid, cid) {
             if let Some(group) = call_manager::get_group(cid).await {
+                group.lock().await.broadcast(
+                    &CommunicationValue::new(CommunicationType::client_disconnected)
+                        .add_data_str(DataTypes::user_id, uid.to_string())
+                        .to_json()
+                        .to_string(),
+                );
                 group.lock().await.remove_member(uid);
             }
             call_manager::remove_inactive().await;
@@ -245,5 +252,7 @@ impl CallConnection {
         let mut session = self.sender.write().await;
         let _ = session.close(None).await;
     }
-    pub async fn handle_close(&self) {}
+    pub async fn handle_close(&self) {
+        self.close().await;
+    }
 }

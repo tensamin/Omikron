@@ -19,19 +19,22 @@ use crate::{
     calls::call_connection::CallConnection,
     omega::omega_connection::OmegaConnection,
     rho::{client_connection::ClientConnection, iota_connection::IotaConnection},
+    util::config_util::CONFIG,
     util::print::{PrintType, line, line_err, print_start_message},
 };
-#[tokio::main]
 
+#[tokio::main]
 async fn main() {
     print_start_message();
+
     tokio::spawn(async move {
         OmegaConnection::new().connect().await;
     });
-    let listener = TcpListener::bind("0.0.0.0:959").await.unwrap();
+    let address = format!("{}:{}", &CONFIG.read().await.ip, &CONFIG.read().await.port);
+    let listener = TcpListener::bind(&address).await.unwrap();
     line(
-        PrintType::OmegaIn,
-        "WebSocket server listening on 0.0.0.0:959",
+        PrintType::General,
+        &format!("WebSocket server listening on {}", &address),
     );
 
     while let Ok((stream, _)) = listener.accept().await {

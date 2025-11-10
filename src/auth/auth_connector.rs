@@ -70,7 +70,7 @@ pub async fn get_iota_id(user_id: Uuid) -> Option<Uuid> {
     let client = client();
     let res = client
         .get(&url)
-        .header("Authorization", CONFIG.lock().await.omikron_id.to_string())
+        .header("Authorization", CONFIG.read().await.omikron_id.to_string())
         .header("Content-Type", "application/json")
         .send()
         .await
@@ -96,7 +96,7 @@ pub async fn is_private_key_valid(user_id: Uuid, pk_hash: &str) -> bool {
     let client = client();
     let res = client
         .get(&url)
-        .header("Authorization", CONFIG.lock().await.omikron_id.to_string())
+        .header("Authorization", CONFIG.read().await.omikron_id.to_string())
         .header("PrivateKeyHash", pk_hash)
         .header("Accept", "application/json")
         .send()
