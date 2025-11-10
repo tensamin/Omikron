@@ -5,7 +5,10 @@ mod omega;
 mod rho;
 mod util;
 
+<<<<<<< HEAD
 use async_tungstenite::accept_hdr_async;
+=======
+>>>>>>> db419d3b4775949255dd2a89fbd782d15c02293e
 use futures::StreamExt;
 use std::{sync::Arc, time::Duration};
 use tokio::net::TcpListener;
@@ -23,6 +26,7 @@ use crate::{
     util::print::{PrintType, line, line_err, print_start_message},
 };
 
+<<<<<<< HEAD
 #[tokio::main]
 async fn main() {
     print_start_message();
@@ -32,6 +36,16 @@ async fn main() {
     });
     let address = format!("{}:{}", &CONFIG.read().await.ip, &CONFIG.read().await.port);
     let listener = TcpListener::bind(&address).await.unwrap();
+=======
+#[tokio::main(flavor = "multi_thread", worker_threads = 32)]
+#[allow(unused_must_uscae, dead_code)]
+async fn main() {
+    print_start_message();
+    tokio::spawn(async move {
+        OmegaConnection::new().connect().await;
+    });
+    let listener = TcpListener::bind("0.0.0.0:959").await.unwrap();
+>>>>>>> db419d3b4775949255dd2a89fbd782d15c02293e
     line(
         PrintType::General,
         &format!("WebSocket server listening on {}", &address),
