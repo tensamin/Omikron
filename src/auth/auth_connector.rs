@@ -132,7 +132,7 @@ pub async fn get_public_key(user_id: Uuid) -> Option<String> {
         .ok()?;
 
     let body = res.text().await.ok()?;
-    let mut cv = CommunicationValue::from_json(&body);
+    let cv = CommunicationValue::from_json(&body);
 
     if cv.comm_type != CommunicationType::message_send {
         return None;

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::data::communication::{CommunicationType, CommunicationValue};
 use crate::util::print::PrintType;
-use crate::util::print::line_err;
+use crate::util::print::{line, line_err};
 use crate::{
     data::{
         communication::DataTypes,
@@ -14,10 +14,9 @@ use crate::{
 };
 use async_tungstenite::tungstenite::protocol::Message;
 use dashmap::DashMap;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use json::JsonValue;
 use once_cell::sync::Lazy;
-use tokio::io::unix::AsyncFd;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tokio_util::compat::Compat;
@@ -141,6 +140,7 @@ impl OmegaConnection {
     pub async fn send_message(&self, cv: &CommunicationValue) {
         let mut guard = self.ws_stream.lock().await;
         if let Some(ws) = guard.as_mut() {
+            line(PrintType::OmegaOut, &cv.to_json().to_string());
             let _ = ws
                 .send(Message::Text(Utf8Bytes::from(cv.to_json().to_string())))
                 .await;

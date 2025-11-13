@@ -4,11 +4,7 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::sync::mpsc::UnboundedSender;
-use tungstenite::Utf8Bytes;
 use uuid::Uuid;
-
-pub type Tx = UnboundedSender<Utf8Bytes>;
 
 pub static CALL_GROUPS: Lazy<RwLock<Mutex<HashMap<Uuid, Arc<Mutex<CallGroup>>>>>> =
     Lazy::new(|| RwLock::new(Mutex::new(HashMap::new())));
@@ -22,14 +18,18 @@ pub async fn get_group(call_id: Uuid) -> Option<Arc<Mutex<CallGroup>>> {
         .get_mut(&call_id)
         .cloned()
 }
-pub async fn get_or_create_group(call_id: Uuid, secret: &str) -> Arc<Mutex<CallGroup>> {
+pub async fn get_or_create_group(call_id: Uuid, secret: &str) -> Option<Arc<Mutex<CallGroup>>> {
     let g = CALL_GROUPS.write().await;
     if let Some(group) = g.lock().await.get_mut(&call_id) {
-        group.clone()
+        if group.lock().await.secret_hash.eq(secret) {
+            Some(group.clone())
+        } else {
+            None
+        }
     } else {
-        let cg = Arc::new(Mutex::new(CallGroup::new(call_id)));
+        let cg = Arc::new(Mutex::new(CallGroup::new(secret.to_string())));
         g.lock().await.insert(call_id, cg.clone());
-        cg
+        Some(cg)
     }
 }
 
@@ -45,7 +45,6 @@ pub async fn remove_inactive() {
             .unwrap()
             .lock()
             .await
-            .callers
             .is_empty()
         {
             rem.push(cg.clone());

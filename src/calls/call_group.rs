@@ -1,24 +1,30 @@
 use crate::calls::caller::Caller;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc::UnboundedSender;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
 pub struct CallGroup {
-    pub call_id: Uuid,
-    pub callers: HashMap<Uuid, Caller>,
+    pub callers: HashMap<Uuid, Arc<Caller>>,
+    pub secret_hash: String,
 }
 
 impl CallGroup {
-    pub fn new(call_id: Uuid) -> Self {
+    pub fn new(secret_hash: String) -> Self {
         Self {
-            call_id,
             callers: HashMap::new(),
+            secret_hash: secret_hash,
         }
     }
 
     pub fn add_member(&mut self, user_id: Uuid, tx: UnboundedSender<Utf8Bytes>) {
-        self.callers.insert(user_id, Caller { user_id, tx });
+        self.callers
+            .insert(user_id, Arc::new(Caller::new(user_id, tx)));
+    }
+    pub fn disconnect_member(&mut self, user_id: Uuid) {
+        if let Some(caller) = self.callers.get(&user_id) {
+            caller.disconnect();
+        }
     }
 
     pub fn remove_member(&mut self, user_id: Uuid) {
@@ -26,7 +32,12 @@ impl CallGroup {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.callers.is_empty()
+        for caller in self.callers.values() {
+            if !caller.is_connected() {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn send_to(&self, user_id: &Uuid, message: &str) {
@@ -41,7 +52,7 @@ impl CallGroup {
         }
     }
 
-    pub fn caller_state_mut(&mut self, user_id: &Uuid) -> Option<&mut Caller> {
-        self.callers.get_mut(user_id)
+    pub fn caller_state_mut(&mut self, user_id: &Uuid) -> Option<&Arc<Caller>> {
+        self.callers.get(user_id)
     }
 }

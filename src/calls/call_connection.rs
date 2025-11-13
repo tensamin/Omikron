@@ -1,10 +1,7 @@
-use async_tungstenite::{
-    WebSocketReceiver, WebSocketSender, WebSocketStream, tungstenite::Message,
-};
-use futures::SinkExt;
+use async_tungstenite::{WebSocketReceiver, WebSocketSender, tungstenite::Message};
 use std::sync::Arc;
 use tokio::sync::{
-    Mutex, RwLock,
+    RwLock,
     mpsc::{UnboundedSender, unbounded_channel},
 };
 use tokio_util::compat::Compat;
@@ -101,6 +98,15 @@ impl CallConnection {
         }
 
         let group = call_manager::get_or_create_group(cid, secret_sha).await;
+        if let None = group {
+            self.send_message(&CommunicationValue::new(
+                CommunicationType::error_invalid_secret,
+            ))
+            .await;
+            return;
+        }
+        let group = group.unwrap();
+
         // Build broadcast
         let broadcast = CommunicationValue::new(CommunicationType::client_connected)
             .with_id(cv.get_id().clone())
@@ -113,7 +119,6 @@ impl CallConnection {
                 .broadcast(&broadcast.to_json().to_string());
         }
 
-        // Add member to group
         {
             group.lock().await.add_member(uid, self.tx.clone());
         }
@@ -244,6 +249,7 @@ impl CallConnection {
                         .to_json()
                         .to_string(),
                 );
+                group.lock().await.get_member(uid).await;
                 group.lock().await.remove_member(uid);
             }
             call_manager::remove_inactive().await;

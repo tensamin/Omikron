@@ -68,36 +68,3 @@ pub async fn connection_count() -> usize {
     let connections = RHO_CONNECTIONS.read().await;
     connections.len()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rho::iota_connection::IotaConnection;
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    #[tokio::test]
-    async fn test_add_and_get_rho() {
-        // Clear any existing connections
-        {
-            let mut connections = RHO_CONNECTIONS.write().await;
-            connections.clear();
-        }
-
-        let iota_id = Uuid::new_v4();
-        let user_ids = vec![Uuid::new_v4(), Uuid::new_v4()];
-
-        // Skip this test due to WebSocket complexity - would require proper mock setup
-        return;
-
-        // This test would need proper WebSocket stream mocking:
-        // let mock_session = create_mock_websocket_stream();
-        // let iota_conn = IotaConnection::new_with_ids(iota_id, user_ids.clone(), mock_session);
-        // let rho_conn = Arc::new(RhoConnection::new(iota_conn, user_ids.clone()));
-
-        // Test assertions would go here:
-        // add_rho(Arc::clone(&rho_conn)).await;
-        // assert!(contains_iota(iota_id).await);
-        // etc.
-    }
-}

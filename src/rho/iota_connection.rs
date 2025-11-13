@@ -1,19 +1,15 @@
 use crate::util::print::PrintType;
 use crate::util::print::line;
 use crate::util::print::line_err;
-use ansi_term::Color;
 use async_tungstenite::WebSocketReceiver;
 use async_tungstenite::WebSocketSender;
-use async_tungstenite::tungstenite::protocol::WebSocketConfig;
-use async_tungstenite::{WebSocketStream, tungstenite::Message};
-use futures::FutureExt;
-use futures::SinkExt;
+use async_tungstenite::tungstenite::Message;
 use json::JsonValue;
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio_util::compat::Compat;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
@@ -280,12 +276,12 @@ impl IotaConnection {
     }
 
     /// Handle GET_CHATS message
-    async fn handle_get_chats(&self, mut cv: CommunicationValue) {
+    async fn handle_get_chats(&self, cv: CommunicationValue) {
         let receiver_id = cv.get_receiver();
-        let mut interested_ids: Vec<Uuid> = Vec::new();
+        let interested_ids: Vec<Uuid> = Vec::new();
 
         // Process contacts and add call information
-        if let Some(contacts_data) = cv.get_data(DataTypes::user_ids) {
+        if let Some(_contacts_data) = cv.get_data(DataTypes::user_ids) {
             // Parse contacts JSON array and enrich with call data
             // This would need proper JSON parsing implementation
             // For now, placeholder logic:
@@ -321,7 +317,7 @@ impl IotaConnection {
     async fn forward_to_client(&self, cv: CommunicationValue) {
         if let Some(rho_conn) = self.get_rho_connection().await {
             let updated_cv = cv.with_sender(self.get_iota_id().await);
-            let receiver_id = updated_cv.get_receiver();
+            let _receiver_id = updated_cv.get_receiver();
             rho_conn.message_to_client(updated_cv).await;
         }
     }

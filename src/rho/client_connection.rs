@@ -1,14 +1,13 @@
+use async_tungstenite::tungstenite::Message;
 use async_tungstenite::{WebSocketReceiver, WebSocketSender};
-use async_tungstenite::{WebSocketStream, tungstenite::Message};
-use futures::SinkExt;
 use std::sync::{Arc, Weak};
-use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio_util::compat::Compat;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
 use super::{rho_connection::RhoConnection, rho_manager};
+use crate::calls::call_manager;
 use crate::util::print::PrintType;
 use crate::util::print::line;
 use crate::util::print::line_err;
@@ -154,7 +153,7 @@ impl ClientConnection {
     }
 
     /// Handle identification message
-    async fn handle_identification(&self, sarc: Arc<ClientConnection>, mut cv: CommunicationValue) {
+    async fn handle_identification(&self, sarc: Arc<ClientConnection>, cv: CommunicationValue) {
         // Extract user ID
         let user_id = match cv.get_data(DataTypes::user_id) {
             Some(id_str) => match Uuid::parse_str(&id_str.to_string()) {
@@ -228,7 +227,7 @@ impl ClientConnection {
     }
 
     /// Handle ping message
-    async fn handle_ping(&self, mut cv: CommunicationValue) {
+    async fn handle_ping(&self, cv: CommunicationValue) {
         // Update our ping if provided
         if let Some(last_ping) = cv.get_data(DataTypes::last_ping) {
             if let Ok(ping_val) = last_ping.to_string().parse::<i64>() {
@@ -253,9 +252,9 @@ impl ClientConnection {
     }
 
     /// Handle client status change
-    async fn handle_client_changed(&self, mut cv: CommunicationValue) {
+    async fn handle_client_changed(&self, cv: CommunicationValue) {
         if let Some(user_id) = self.get_user_id().await {
-            if let Some(status_str) = cv.get_data(DataTypes::user_state) {
+            if let Some(_status_str) = cv.get_data(DataTypes::user_state) {
                 // Parse user status - this would need to be implemented properly
                 let user_status = UserStatus::online; // placeholder
                 if let Some(rho_conn) = self.get_rho_connection().await {
@@ -359,7 +358,7 @@ impl ClientConnection {
     }
 
     /// Handle get call request
-    async fn handle_get_call(&self, mut cv: CommunicationValue) {
+    async fn handle_get_call(&self, cv: CommunicationValue) {
         let user_id = match self.get_user_id().await {
             Some(id) => id,
             None => return,
@@ -396,24 +395,25 @@ impl ClientConnection {
             .with_id(cv.get_id())
             .with_receiver(user_id);
 
-        // Placeholder call group logic
-        // if let Some(call_group) = CallManager::get_call_group(call_id, &call_secret_sha.unwrap(), true).await {
-        //     response = response
-        //         .add_data_str(DataTypes::call_state, call_group.call_state.to_string())
-        //         .add_data_str(DataTypes::start_date, call_group.started_at.to_string());
-        //
-        //     if call_group.ended_at != 0 {
-        //         response = response.add_data_str(DataTypes::end_date, call_group.ended_at.to_string());
-        //     }
-        // } else {
-        response = response.add_data_str(DataTypes::call_state, "DESTROYED".to_string());
-        // }
+        if let Some(_call_group) = call_manager::get_group(call_id).await {
+            /*response = response
+                .add_data_str(DataTypes::call_state, call_group.call_state.to_string())
+                .add_data_str(DataTypes::start_date, call_group.started_at.to_string());
+
+            if call_group.lock(). != 0 {
+                response =
+                    response.add_data_str(DataTypes::end_date, call_group.ended_at.to_string());
+            }
+            */
+        } else {
+            response = response.add_data_str(DataTypes::call_state, "DESTROYED".to_string());
+        }
 
         self.send_message(&response).await;
     }
 
     /// Forward message to Iota
-    async fn forward_to_iota(&self, mut cv: CommunicationValue) {
+    async fn forward_to_iota(&self, cv: CommunicationValue) {
         if let Some(user_id) = self.get_user_id().await {
             if let Some(rho_conn) = self.get_rho_connection().await {
                 let updated_cv = cv.with_sender(user_id);

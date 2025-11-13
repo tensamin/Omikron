@@ -4,9 +4,6 @@ use crate::data::{
     user::UserStatus,
 };
 use crate::omega::omega_connection::OmegaConnection;
-use crate::util::print::PrintType;
-use crate::util::print::line;
-use crate::util::print::line_err;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;

@@ -7,13 +7,10 @@ mod util;
 
 use async_tungstenite::accept_hdr_async;
 use futures::StreamExt;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
-use tungstenite::{
-    Message, Utf8Bytes,
-    handshake::server::{Request, Response},
-};
+use tungstenite::handshake::server::{Request, Response};
 
 use crate::{
     calls::call_connection::CallConnection,
