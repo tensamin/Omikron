@@ -21,19 +21,21 @@ impl CallGroup {
         self.callers
             .insert(user_id, Arc::new(Caller::new(user_id, tx)));
     }
-    pub fn disconnect_member(&mut self, user_id: Uuid) {
-        if let Some(caller) = self.callers.get(&user_id) {
-            caller.disconnect();
-        }
-    }
-
     pub fn remove_member(&mut self, user_id: Uuid) {
         self.callers.remove(&user_id);
     }
+    pub fn get_member(&self, user_id: &Uuid) -> Option<&Arc<Caller>> {
+        self.callers.get(user_id)
+    }
+    pub async fn disconnect_member(&mut self, user_id: Uuid) {
+        if let Some(caller) = self.callers.get(&user_id) {
+            caller.disconnect().await;
+        }
+    }
 
-    pub fn is_empty(&self) -> bool {
+    pub async fn is_empty(&self) -> bool {
         for caller in self.callers.values() {
-            if !caller.is_connected() {
+            if !caller.is_connected().await {
                 return false;
             }
         }

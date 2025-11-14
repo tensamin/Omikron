@@ -133,7 +133,7 @@ impl CallConnection {
                 let mut user_info = JsonValue::new_object();
                 let _ = user_info.insert("state", JsonValue::from("muted"));
                 let _ = user_info.insert("streaming", JsonValue::from(false));
-                let _ = users.insert(&caller.user_id.to_string(), user_info);
+                let _ = users.insert(&caller.user_id.read().await.to_string(), user_info);
             }
         }
         response = response.add_data(DataTypes::about, users);
@@ -249,8 +249,7 @@ impl CallConnection {
                         .to_json()
                         .to_string(),
                 );
-                group.lock().await.get_member(uid).await;
-                group.lock().await.remove_member(uid);
+                group.lock().await.disconnect_member(uid).await;
             }
             call_manager::remove_inactive().await;
         }

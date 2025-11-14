@@ -46,6 +46,7 @@ pub async fn remove_inactive() {
             .lock()
             .await
             .is_empty()
+            .await
         {
             rem.push(cg.clone());
         }
