@@ -45,3 +45,7 @@ walkdir = "2.5.0"
 warp = "*"
 x448 = { version = "*" }
 x509 = "*"
+log = "0.4"
+livekit = "0.7.25"
+livekit-api = "0.4.10"
+dotenv = "0.15.0"

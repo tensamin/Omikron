@@ -1,87 +1,81 @@
-use crate::calls::call_group::CallGroup;
-use futures::lock::Mutex; // Used only to protect CallGroup contents
-use once_cell::sync::Lazy;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock; // Used to protect the global HashMap
+
+use once_cell::sync::Lazy;
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
-// FIX 1: Simplify the global state. Only use RwLock to protect the HashMap.
-// The inner Arc<Mutex<CallGroup>> protects the contents of each group.
-pub static CALL_GROUPS: Lazy<RwLock<HashMap<Uuid, Arc<Mutex<CallGroup>>>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
+use crate::calls::{call_group::CallGroup, caller::Caller};
 
-/// Retrieves a CallGroup by ID, if it exists.
-pub async fn get_group(call_id: Uuid) -> Option<Arc<Mutex<CallGroup>>> {
-    // Acquire read lock (very fast, non-blocking for other readers)
-    CALL_GROUPS
-        .read()
-        .await
-        .get(&call_id) // Use get(), as we only need to clone the Arc
-        .cloned()
-}
+static CALL_GROUPS: Lazy<RwLock<Vec<Arc<CallGroup>>>> = Lazy::new(|| RwLock::new(Vec::new()));
 
-/// Retrieves an existing group or creates a new one, performing a secret check.
-pub async fn get_or_create_group(call_id: Uuid, secret: &str) -> Option<Arc<Mutex<CallGroup>>> {
-    // Phase 1: Check existence under a READ lock.
-    {
-        let groups = CALL_GROUPS.read().await;
-        if let Some(group_arc) = groups.get(&call_id) {
-            // Found it. Release the global READ lock and check the secret.
-            // This await on the group's lock only blocks access to that *specific* group.
-            let group_lock = group_arc.lock().await;
-            if group_lock.secret_hash.eq(secret) {
-                return Some(group_arc.clone());
-            } else {
-                return None; // Secret mismatch
+pub async fn get_call_invites(user_id: Uuid) -> Vec<Arc<Caller>> {
+    let mut callers = Vec::new();
+    for cg in CALL_GROUPS.read().await.iter() {
+        for member in cg.members.read().await.iter() {
+            if member.user_id == user_id {
+                callers.push(member.clone());
             }
         }
-    } // READ lock automatically released here.
+    }
+    callers
+}
 
-    // Phase 2: Not found, acquire a WRITE lock to create (only held for insertion).
-    let mut groups = CALL_GROUPS.write().await;
+pub async fn get_call_groups(user_id: Uuid) -> Vec<Arc<CallGroup>> {
+    let mut call_groups = Vec::new();
+    for cg in CALL_GROUPS.read().await.iter() {
+        for member in cg.members.read().await.iter() {
+            if member.user_id == user_id {
+                call_groups.push(cg.clone());
+            }
+        }
+    }
+    call_groups
+}
 
-    // FIX 2: Double-check (race condition prevention) - A group might have been created
-    // between the read lock release and the write lock acquisition.
-    if let Some(group_arc) = groups.get(&call_id) {
-        // Already created by another task, check secret again.
-        let group_lock = group_arc.lock().await;
-        if group_lock.secret_hash.eq(secret) {
-            return Some(group_arc.clone());
-        } else {
+pub async fn get_call_token(user_id: Uuid, call_id: Uuid) -> Option<String> {
+    let call_groups = CALL_GROUPS.read().await;
+    for cg in call_groups.iter() {
+        if cg.call_id == call_id {
+            for member in cg.members.read().await.iter() {
+                if member.user_id == user_id {
+                    return Some(member.create_token());
+                }
+            }
             return None;
         }
     }
-
-    // Still not found, proceed with creation.
-    let new_group = Arc::new(Mutex::new(CallGroup::new(secret.to_string())));
-    groups.insert(call_id, new_group.clone());
-
-    // WRITE lock automatically released here.
-    Some(new_group)
+    let caller = Arc::new(Caller::new(user_id, user_id, call_id));
+    let call_group = CallGroup::new(call_id, caller.clone());
+    {
+        CALL_GROUPS.write().await.push(Arc::new(call_group));
+    }
+    Some(caller.create_token())
 }
 
-/// Removes inactive groups.
-pub async fn remove_inactive() {
-    // Collect keys to remove under a read lock first.
-    let groups_to_check: Vec<Uuid> = CALL_GROUPS.read().await.keys().cloned().collect();
+pub async fn add_invite(call_id: Uuid, inviter_id: Uuid, invitee_id: Uuid) -> bool {
+    let call_groups = CALL_GROUPS.read().await;
+    for cg in call_groups.iter() {
+        if cg.call_id == call_id {
+            for member in cg.members.read().await.iter() {
+                if member.user_id == inviter_id {
+                    cg.clone().add_member(inviter_id, invitee_id).await;
+                    return true;
+                }
+            }
+            return false;
+        }
+    }
+    false
+}
 
-    let mut rem = Vec::new();
-    for call_id in groups_to_check {
-        // Retrieve the group Arc outside the global lock
-        if let Some(group_arc) = get_group(call_id).await {
-            // FIX 3: Check for emptiness outside the global lock
-            if group_arc.lock().await.is_empty().await {
-                rem.push(call_id);
+pub async fn get_call_group_by_user(user_id: Uuid) -> Option<Arc<CallGroup>> {
+    let call_groups = CALL_GROUPS.read().await;
+    for cg in call_groups.iter() {
+        for member in cg.members.read().await.iter() {
+            if member.user_id == user_id {
+                return Some(cg.clone());
             }
         }
     }
-
-    // Acquire write lock only to perform the removals.
-    if !rem.is_empty() {
-        let mut groups = CALL_GROUPS.write().await;
-        for call_id in rem {
-            groups.remove(&call_id);
-        }
-    }
+    None
 }

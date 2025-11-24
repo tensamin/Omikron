@@ -7,23 +7,24 @@ mod util;
 
 use async_tungstenite::accept_hdr_async;
 use futures::StreamExt;
+use livekit_api::services::room::{CreateRoomOptions, RoomClient};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tungstenite::handshake::server::{Request, Response};
 
 use crate::{
-    calls::call_connection::CallConnection,
+    calls::call_util,
     omega::omega_connection::OmegaConnection,
     rho::{client_connection::ClientConnection, iota_connection::IotaConnection},
-    util::config_util::CONFIG,
-    util::print::{PrintType, line, line_err, print_start_message},
+    util::{
+        config_util::CONFIG,
+        print::{PrintType, line, line_err},
+    },
 };
 
 #[tokio::main]
 async fn main() {
-    print_start_message();
-
     tokio::spawn(async move {
         OmegaConnection::new().connect().await;
     });
@@ -117,39 +118,6 @@ async fn main() {
                             // Stream ended
                             line(PrintType::IotaIn, "Iota stream ended");
                             iota_conn.handle_close().await;
-                            return;
-                        }
-                    }
-                }
-            } else if path == "/ws/call/" {
-                line(PrintType::CallIn, "New Call connection");
-                let call_conn: Arc<CallConnection> =
-                    Arc::from(CallConnection::new(sender, receiver).await);
-                loop {
-                    let msg_result = {
-                        let mut session_lock = call_conn.receiver.write().await;
-                        session_lock.next().await
-                    };
-
-                    match msg_result {
-                        Some(Ok(msg)) => {
-                            if msg.is_text() {
-                                let text = msg.into_text().unwrap();
-                                call_conn.clone().handle_message(text).await;
-                            } else if msg.is_close() {
-                                line(PrintType::CallIn, "Call disconnected");
-                                call_conn.handle_close().await;
-                                return;
-                            }
-                        }
-                        Some(Err(e)) => {
-                            line_err(PrintType::CallIn, &format!("WebSocket error: {}", e));
-                            call_conn.handle_close().await;
-                            return;
-                        }
-                        None => {
-                            line(PrintType::CallIn, "Call stream ended");
-                            call_conn.handle_close().await;
                             return;
                         }
                     }

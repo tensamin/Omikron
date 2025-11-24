@@ -1,3 +1,5 @@
+use crate::calls::call_group::CallGroup;
+use crate::calls::call_manager;
 use crate::util::print::PrintType;
 use crate::util::print::line;
 use crate::util::print::line_err;
@@ -5,12 +7,14 @@ use async_tungstenite::WebSocketReceiver;
 use async_tungstenite::WebSocketSender;
 use async_tungstenite::tungstenite::Message;
 use json::JsonValue;
+use json::parse;
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
 };
 use tokio::sync::RwLock;
 use tokio_util::compat::Compat;
+use tower::retry::backoff::InvalidBackoff;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
@@ -278,22 +282,44 @@ impl IotaConnection {
     /// Handle GET_CHATS message
     async fn handle_get_chats(&self, cv: CommunicationValue) {
         let receiver_id = cv.get_receiver();
-        let interested_ids: Vec<Uuid> = Vec::new();
+        let mut interested_ids: Vec<Uuid> = Vec::new();
+
+        let calls: Vec<Arc<CallGroup>> = call_manager::get_call_groups(receiver_id).await;
+        let mut invites: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+
+        for call in calls {
+            for inviter in call.members.read().await.iter() {
+                let inviter_id = inviter.user_id;
+                if let Some(call_ids) = invites.get_mut(&inviter_id) {
+                    call_ids.push(call.call_id);
+                } else {
+                    invites.insert(inviter_id, vec![call.call_id]);
+                }
+            }
+        }
 
         // Process contacts and add call information
+        // Enriched Contacts data:
+        // [{"user_id": "uuid", "calls": ["call_id"]}, {"user_id": "uuid"}]
+        let mut enriched_contacts = JsonValue::new_array();
+        // Contacts data:
+        // [{"user_id": "uuid"}, {"user_id": "uuid"}]
         if let Some(contacts_data) = cv.get_data(DataTypes::user_ids) {
-            /*let contacts: Vec<(Uuid, String)> = parse_contacts(contacts_data);
-            for contact in &contacts {
-                interested_ids.push(contact.user_id);
+            if let JsonValue::Array(user_ids) = contacts_data {
+                for user_id in user_ids {
+                    if let JsonValue::String(user_id_str) = user_id {
+                        if let Ok(user_id) = Uuid::parse_str(user_id_str) {
+                            interested_ids.push(user_id);
+                            let mut enriched_contact = JsonValue::new_object();
+                            let _ = enriched_contact.insert("user_id", user_id.to_string());
+                            let _ = enriched_contact.insert("calls", JsonValue::new_array());
+                            let _ = enriched_contacts.push(enriched_contact);
+                        }
+                    }
+                }
+            } else {
+                enriched_contacts = contacts_data.clone();
             }
-
-            // Get call invites for receiver
-            let invites = CallManager::get_call_invites(receiver_id).await;
-
-            // Enrich contacts with call information
-            let enriched_contacts = enrich_with_calls(contacts, invites);
-
-            cv = cv.add_data(DataTypes::user_ids, enriched_contacts.into());*/
         }
 
         // Notify OmegaConnection about user states
@@ -305,7 +331,8 @@ impl IotaConnection {
         }
 
         // Forward to client
-        self.forward_to_client(cv).await;
+        self.forward_to_client(cv.add_data(DataTypes::user_ids, enriched_contacts))
+            .await;
     }
 
     /// Forward message to client

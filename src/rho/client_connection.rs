@@ -141,7 +141,7 @@ impl ClientConnection {
         }
 
         // Handle get call requests
-        if cv.is_type(CommunicationType::get_call) {
+        if cv.is_type(CommunicationType::call_get) {
             self.handle_get_call(cv).await;
             return;
         }
@@ -303,13 +303,14 @@ impl ClientConnection {
             }
         };
 
-        // Get call group - placeholder implementation
-        // let call_group = CallManager::get_call_group(call_id, &call_secret_sha.unwrap(), true).await;
-        // if call_group.is_none() {
-        //     self.send_error_response(&cv.get_id(), CommunicationType::error)
-        //         .await;
-        //     return;
-        // }
+        let invited =
+            call_manager::add_invite(call_id, self.user_id.read().await.unwrap(), receiver_id)
+                .await;
+        if invited {
+            self.send_error_response(&cv.get_id(), CommunicationType::error)
+                .await;
+            return;
+        }
 
         // Find target RhoConnection
         let target_rho = match rho_manager::get_rho_con_for_user(receiver_id).await {
@@ -328,20 +329,16 @@ impl ClientConnection {
         };
 
         // Create and send call distribution message
-        let distribute = CommunicationValue::new(CommunicationType::new_call)
+        let forward = CommunicationValue::new(CommunicationType::call_invite)
             .with_receiver(receiver_id)
             .with_sender(sender_id)
             .add_data_str(DataTypes::call_id, call_id.to_string())
             .add_data_str(DataTypes::receiver_id, receiver_id.to_string())
             .add_data_str(DataTypes::sender_id, sender_id.to_string());
 
-        target_rho.message_to_client(distribute).await;
+        target_rho.message_to_client(forward).await;
 
-        // Handle call group invitation logic here
-        // This would require implementing CallGroup::Caller and related functionality
-
-        // Send success response
-        let response = CommunicationValue::new(CommunicationType::call_invite).with_id(cv.get_id());
+        let response = CommunicationValue::new(CommunicationType::success).with_id(cv.get_id());
         self.send_message(&response).await;
     }
 
@@ -368,26 +365,17 @@ impl ClientConnection {
             }
         };
 
-        // Get call group
-        let mut response = CommunicationValue::new(CommunicationType::get_call)
-            .with_id(cv.get_id())
-            .with_receiver(user_id);
-
-        if let Some(_call_group) = call_manager::get_group(call_id).await {
-            /*response = response
-                .add_data_str(DataTypes::call_state, call_group.call_state.to_string())
-                .add_data_str(DataTypes::start_date, call_group.started_at.to_string());
-
-            if call_group.lock(). != 0 {
-                response =
-                    response.add_data_str(DataTypes::end_date, call_group.ended_at.to_string());
-            }
-            */
+        if let Some(token) = call_manager::get_call_token(user_id, call_id).await {
+            let response = CommunicationValue::new(CommunicationType::call_get)
+                .with_id(cv.get_id())
+                .with_receiver(user_id)
+                .add_data_str(DataTypes::call_token, token);
+            self.send_message(&response).await;
         } else {
-            response = response.add_data_str(DataTypes::call_state, "DESTROYED".to_string());
+            self.send_error_response(&cv.get_id(), CommunicationType::error)
+                .await;
+            return;
         }
-
-        self.send_message(&response).await;
     }
 
     /// Forward message to Iota
