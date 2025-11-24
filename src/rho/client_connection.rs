@@ -303,17 +303,6 @@ impl ClientConnection {
             }
         };
 
-        let call_secret_sha = cv
-            .get_data(DataTypes::call_secret_sha)
-            .map(|s| s.to_string());
-        let call_secret = cv.get_data(DataTypes::call_secret).map(|s| s.to_string());
-
-        if call_secret_sha.is_none() || call_secret.is_none() {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
-                .await;
-            return;
-        }
-
         // Get call group - placeholder implementation
         // let call_group = CallManager::get_call_group(call_id, &call_secret_sha.unwrap(), true).await;
         // if call_group.is_none() {
@@ -345,7 +334,6 @@ impl ClientConnection {
             .add_data_str(DataTypes::call_id, call_id.to_string())
             .add_data_str(DataTypes::receiver_id, receiver_id.to_string())
             .add_data_str(DataTypes::sender_id, sender_id.to_string())
-            .add_data_str(DataTypes::call_secret, call_secret.unwrap());
 
         target_rho.message_to_client(distribute).await;
 
@@ -379,16 +367,6 @@ impl ClientConnection {
                 return;
             }
         };
-
-        let call_secret_sha = cv
-            .get_data(DataTypes::call_secret_sha)
-            .map(|s| s.to_string());
-
-        if call_secret_sha.is_none() {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
-                .await;
-            return;
-        }
 
         // Get call group
         let mut response = CommunicationValue::new(CommunicationType::get_call)
