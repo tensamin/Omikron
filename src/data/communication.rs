@@ -11,6 +11,8 @@ pub enum DataTypes {
     error_type,
     accepted_ids,
     uuid,
+    settings,
+    settings_name,
     chat_partner_id,
     iota_id,
     user_id,
@@ -85,6 +87,9 @@ impl DataTypes {
         match normalized.as_str() {
             "errortype" => DataTypes::error_type,
             "chatpartnerid" => DataTypes::chat_partner_id,
+            "uuid" => DataTypes::uuid,
+            "settings" => DataTypes::settings,
+            "settingsname" => DataTypes::settings_name,
             "iotaid" => DataTypes::iota_id,
             "userid" => DataTypes::user_id,
             "userids" => DataTypes::user_ids,
@@ -164,6 +169,9 @@ pub enum CommunicationType {
     error_invalid_secret,
     error_invalid_private_key,
     success,
+    settings_save,
+    settings_load,
+    settings_list,
     message,
     message_send,
     message_live,
@@ -214,6 +222,9 @@ impl CommunicationType {
 
         match normalized.as_str() {
             "error" => CommunicationType::error,
+            "settingssave" => CommunicationType::settings_save,
+            "settingsload" => CommunicationType::settings_load,
+            "settingslist" => CommunicationType::settings_list,
             "success" => CommunicationType::success,
             "message" => CommunicationType::message,
             "messagelive" => CommunicationType::message_live,

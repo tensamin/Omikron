@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 ansi_term = "*"
-async-tungstenite = { version = "*" }
+async-tungstenite = { version = "0.32.0", features = ["futures-03-sink", "futures-util", "handshake", "__rustls-tls", "async-native-tls", "async-std", "async-std-runtime", "async-tls", "gio", "gio-runtime", "glib", "openssl", "real-async-native-tls", "real-async-tls", "real-native-tls", "real-tokio-native-tls", "real-tokio-openssl", "real-tokio-rustls", "rustls-native-certs", "rustls-pki-types", "tokio", "tokio-native-tls", "tokio-openssl", "tokio-runtime", "tokio-rustls-manual-roots", "tokio-rustls-native-certs", "tokio-rustls-webpki-roots", "url", "verbose-logging", "webpki-roots" ] }
 axum = "*"
 base64 = "0.22.1"
 bytes = "*"
@@ -18,7 +18,7 @@ futures = "*"
 futures-util = "*"
 hex = "*"
 http = "*"
-hyper = { version = "*", features = ["full"] }
+hyper = { version = "1.8.1", features = ["full"] }
 json = "*"
 loom = "0.7.2"
 once_cell = "1.21.3"
@@ -36,6 +36,7 @@ tokio-rustls = { version = "*" }
 tokio-stream = "*"
 tokio-util = { version = "*", features = ["full"] }
 tokio_websocket_server = "0.1.0"
+tower = "0.5.2"
 tracing = "*"
 tracing-subscriber = "*"
 tungstenite = "*"

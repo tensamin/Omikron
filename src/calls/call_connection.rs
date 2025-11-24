@@ -1,5 +1,5 @@
 use async_tungstenite::{WebSocketReceiver, WebSocketSender, tungstenite::Message};
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 use tokio::sync::{
     RwLock,
     mpsc::{UnboundedSender, unbounded_channel},
@@ -56,7 +56,21 @@ impl CallConnection {
         if let Some(sender) = *self.user_id.read().await {
             cv = cv.with_sender(sender);
         }
-        if !cv.is_type(CommunicationType::ping) {
+
+        if cv.is_type(CommunicationType::webrtc_sdp)
+            | cv.is_type(CommunicationType::webrtc_ice)
+            | cv.is_type(CommunicationType::watch_stream)
+        {
+            line(
+                PrintType::CallIn,
+                &format!(
+                    "{:?} : {} -> {} ",
+                    &cv.type_id(),
+                    &cv.get_sender(),
+                    &cv.get_data(DataTypes::receiver_id).unwrap()
+                ),
+            );
+        } else if !cv.is_type(CommunicationType::ping) {
             line(PrintType::CallIn, &cv.to_json().to_string());
         }
 
@@ -116,7 +130,8 @@ impl CallConnection {
             group
                 .lock()
                 .await
-                .broadcast(&broadcast.to_json().to_string());
+                .broadcast(&broadcast.to_json().to_string())
+                .await;
         }
 
         {
@@ -167,7 +182,7 @@ impl CallConnection {
 
             let mut bc = cv.clone();
             bc = bc.add_data(DataTypes::sender_id, JsonValue::String(uid.to_string()));
-            group.broadcast(&bc.to_json().to_string());
+            group.broadcast(&bc.to_json().to_string()).await;
         }
     }
 
@@ -187,7 +202,7 @@ impl CallConnection {
             let _streaming = cv.comm_type == CommunicationType::start_stream;
             let mut bc = cv.clone();
             bc = bc.add_data(DataTypes::sender_id, JsonValue::String(uid.to_string()));
-            group.broadcast(&bc.to_json().to_string());
+            group.broadcast(&bc.to_json().to_string()).await;
         }
     }
 
@@ -208,7 +223,8 @@ impl CallConnection {
                     group
                         .lock()
                         .await
-                        .send_to(&receiver_id, &bc.to_json().to_string());
+                        .send_to(&receiver_id, &bc.to_json().to_string())
+                        .await;
                     line(
                         PrintType::CallOut,
                         &format!("Forwarded WebRTC message to receiver: {}", receiver_str),
@@ -243,12 +259,16 @@ impl CallConnection {
         let (uid, cid) = { (*self.user_id.read().await, *self.call_id.read().await) };
         if let (Some(uid), Some(cid)) = (uid, cid) {
             if let Some(group) = call_manager::get_group(cid).await {
-                group.lock().await.broadcast(
-                    &CommunicationValue::new(CommunicationType::client_disconnected)
-                        .add_data_str(DataTypes::user_id, uid.to_string())
-                        .to_json()
-                        .to_string(),
-                );
+                group
+                    .lock()
+                    .await
+                    .broadcast(
+                        &CommunicationValue::new(CommunicationType::client_disconnected)
+                            .add_data_str(DataTypes::user_id, uid.to_string())
+                            .to_json()
+                            .to_string(),
+                    )
+                    .await;
                 group.lock().await.disconnect_member(uid).await;
             }
             call_manager::remove_inactive().await;

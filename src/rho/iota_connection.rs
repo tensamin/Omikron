@@ -281,24 +281,19 @@ impl IotaConnection {
         let interested_ids: Vec<Uuid> = Vec::new();
 
         // Process contacts and add call information
-        if let Some(_contacts_data) = cv.get_data(DataTypes::user_ids) {
-            // Parse contacts JSON array and enrich with call data
-            // This would need proper JSON parsing implementation
-            // For now, placeholder logic:
-
-            // Extract user IDs from contacts
-            // let contacts: Vec<ContactInfo> = parse_contacts(contacts_data);
-            // for contact in &contacts {
-            //     interested_ids.push(contact.user_id);
-            // }
+        if let Some(contacts_data) = cv.get_data(DataTypes::user_ids) {
+            /*let contacts: Vec<(Uuid, String)> = parse_contacts(contacts_data);
+            for contact in &contacts {
+                interested_ids.push(contact.user_id);
+            }
 
             // Get call invites for receiver
-            // let invites = CallManager::get_call_invites(receiver_id).await;
+            let invites = CallManager::get_call_invites(receiver_id).await;
 
             // Enrich contacts with call information
-            // let enriched_contacts = enrich_with_calls(contacts, invites);
+            let enriched_contacts = enrich_with_calls(contacts, invites);
 
-            // cv = cv.add_data(DataTypes::user_ids, enriched_contacts.into());
+            cv = cv.add_data(DataTypes::user_ids, enriched_contacts.into());*/
         }
 
         // Notify OmegaConnection about user states

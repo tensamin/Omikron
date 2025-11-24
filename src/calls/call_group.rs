@@ -35,22 +35,22 @@ impl CallGroup {
 
     pub async fn is_empty(&self) -> bool {
         for caller in self.callers.values() {
-            if !caller.is_connected().await {
+            if caller.is_connected().await {
                 return false;
             }
         }
         true
     }
 
-    pub fn send_to(&self, user_id: &Uuid, message: &str) {
+    pub async fn send_to(&self, user_id: &Uuid, message: &str) {
         if let Some(caller) = self.callers.get(user_id) {
-            let _ = caller.send(Utf8Bytes::from(message.to_string()));
+            caller.send(Utf8Bytes::from(message.to_string())).await;
         }
     }
 
-    pub fn broadcast(&self, message: &str) {
+    pub async fn broadcast(&self, message: &str) {
         for caller in self.callers.values() {
-            let _ = caller.send(Utf8Bytes::from(message.to_string()));
+            caller.send(Utf8Bytes::from(message.to_string())).await;
         }
     }
 

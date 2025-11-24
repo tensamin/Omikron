@@ -333,7 +333,7 @@ impl ClientConnection {
             .with_sender(sender_id)
             .add_data_str(DataTypes::call_id, call_id.to_string())
             .add_data_str(DataTypes::receiver_id, receiver_id.to_string())
-            .add_data_str(DataTypes::sender_id, sender_id.to_string())
+            .add_data_str(DataTypes::sender_id, sender_id.to_string());
 
         target_rho.message_to_client(distribute).await;
 
