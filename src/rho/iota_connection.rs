@@ -7,14 +7,12 @@ use async_tungstenite::WebSocketReceiver;
 use async_tungstenite::WebSocketSender;
 use async_tungstenite::tungstenite::Message;
 use json::JsonValue;
-use json::parse;
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
 };
 use tokio::sync::RwLock;
 use tokio_util::compat::Compat;
-use tower::retry::backoff::InvalidBackoff;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 

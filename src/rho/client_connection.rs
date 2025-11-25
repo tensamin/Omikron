@@ -141,7 +141,7 @@ impl ClientConnection {
         }
 
         // Handle get call requests
-        if cv.is_type(CommunicationType::call_get) {
+        if cv.is_type(CommunicationType::call_token) {
             self.handle_get_call(cv).await;
             return;
         }
@@ -366,7 +366,7 @@ impl ClientConnection {
         };
 
         if let Some(token) = call_manager::get_call_token(user_id, call_id).await {
-            let response = CommunicationValue::new(CommunicationType::call_get)
+            let response = CommunicationValue::new(CommunicationType::call_token)
                 .with_id(cv.get_id())
                 .with_receiver(user_id)
                 .add_data_str(DataTypes::call_token, token);
