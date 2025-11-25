@@ -110,44 +110,44 @@ impl ClientConnection {
 
     /// Handle incoming message from client
     pub async fn handle_message(self: Arc<Self>, message: Utf8Bytes) {
-        let cv = CommunicationValue::from_json(&message);
-
-        // Handle identification
-        if cv.is_type(CommunicationType::identification) && !self.is_identified().await {
-            self.handle_identification(Arc::clone(&self), cv).await;
-            return;
-        }
-
-        if !self.is_identified().await {
-            return;
-        }
-
-        // Handle ping
-        if cv.is_type(CommunicationType::ping) {
-            self.handle_ping(cv).await;
-            return;
-        }
-        line(PrintType::ClientIn, &cv.to_json().to_string());
-        // Handle client status changes
-        if cv.is_type(CommunicationType::client_changed) {
-            self.handle_client_changed(cv).await;
-            return;
-        }
-
-        // Handle call invites
-        if cv.is_type(CommunicationType::call_invite) {
-            self.handle_call_invite(cv).await;
-            return;
-        }
-
-        // Handle get call requests
-        if cv.is_type(CommunicationType::call_token) {
-            self.handle_get_call(cv).await;
-            return;
-        }
-
-        // Forward other messages to Iota
         tokio::spawn(async move {
+            let cv = CommunicationValue::from_json(&message);
+
+            // Handle identification
+            if cv.is_type(CommunicationType::identification) && !self.is_identified().await {
+                self.handle_identification(Arc::clone(&self), cv).await;
+                return;
+            }
+
+            if !self.is_identified().await {
+                return;
+            }
+
+            // Handle ping
+            if cv.is_type(CommunicationType::ping) {
+                self.handle_ping(cv).await;
+                return;
+            }
+            line(PrintType::ClientIn, &cv.to_json().to_string());
+            // Handle client status changes
+            if cv.is_type(CommunicationType::client_changed) {
+                self.handle_client_changed(cv).await;
+                return;
+            }
+
+            // Handle call invites
+            if cv.is_type(CommunicationType::call_invite) {
+                self.handle_call_invite(cv).await;
+                return;
+            }
+
+            // Handle get call requests
+            if cv.is_type(CommunicationType::call_token) {
+                self.handle_get_call(cv).await;
+                return;
+            }
+
+            // Forward other messages to Iota
             self.forward_to_iota(cv).await;
         });
     }

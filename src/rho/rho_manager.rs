@@ -1,7 +1,6 @@
 use super::rho_connection::RhoConnection;
 use crate::util::print::PrintType;
 use crate::util::print::line;
-use crate::util::print::line_err;
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock},

@@ -33,7 +33,8 @@ pub async fn get_call_groups(user_id: Uuid) -> Vec<Arc<CallGroup>> {
 }
 
 pub async fn get_call_token(user_id: Uuid, call_id: Uuid) -> Option<String> {
-    let call_groups = CALL_GROUPS.read().await;
+    let call_groups = { CALL_GROUPS.read().await.clone() };
+
     for cg in call_groups.iter() {
         if cg.call_id == call_id {
             for member in cg.members.read().await.iter() {

@@ -6,15 +6,14 @@ mod rho;
 mod util;
 
 use async_tungstenite::accept_hdr_async;
+use dotenv::dotenv;
 use futures::StreamExt;
-use livekit_api::services::room::{CreateRoomOptions, RoomClient};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tungstenite::handshake::server::{Request, Response};
 
 use crate::{
-    calls::call_util,
     omega::omega_connection::OmegaConnection,
     rho::{client_connection::ClientConnection, iota_connection::IotaConnection},
     util::{
@@ -25,6 +24,7 @@ use crate::{
 
 #[tokio::main]
 async fn main() {
+    dotenv().ok();
     tokio::spawn(async move {
         OmegaConnection::new().connect().await;
     });
