@@ -284,7 +284,7 @@ impl IotaConnection {
 
         let calls: Vec<Arc<CallGroup>> = call_manager::get_call_groups(receiver_id).await;
         let mut invites: HashMap<Uuid, Vec<JsonValue>> = HashMap::new();
-
+        let empty = &calls.is_empty();
         for call in calls {
             for inviter in call.members.read().await.iter() {
                 let inviter_id = inviter.user_id;
@@ -300,26 +300,38 @@ impl IotaConnection {
         }
 
         // Process contacts and add call information
-        let mut enriched_contacts = JsonValue::new_array();
-        if let Some(contacts_data) = cv.get_data(DataTypes::user_ids) {
-            if let JsonValue::Array(user_ids) = contacts_data {
-                for user_json in user_ids {
-                    let user_id_str = user_json["user_id"].as_str().unwrap_or("");
-                    if let Ok(user_id) = Uuid::parse_str(&user_id_str) {
-                        interested_ids.push(user_id);
-                        let mut enriched_contact = JsonValue::new_object();
-                        let _ = enriched_contact.insert("user_id", user_id.to_string());
-                        let _ = enriched_contact.insert(
-                            "calls",
-                            JsonValue::Array(invites.get(&user_id).unwrap_or(&vec![]).clone()),
-                        );
-                        let _ = enriched_contacts.push(enriched_contact);
-                    }
-                }
+        let enriched_contacts = if *empty {
+            if let Some(contacts_data) = cv.get_data(DataTypes::user_ids) {
+                line(PrintType::CallIn, "Call empty");
+                contacts_data.clone()
             } else {
-                enriched_contacts = contacts_data.clone();
+                line(PrintType::CallIn, "Call empty No Data");
+                JsonValue::new_array()
             }
-        }
+        } else {
+            line(PrintType::CallIn, &format!("not empty: {:?}", invites));
+            let mut enrc_contacts = JsonValue::new_array();
+            if let Some(contacts_data) = cv.get_data(DataTypes::user_ids) {
+                if let JsonValue::Array(user_ids) = contacts_data {
+                    for user_json in user_ids {
+                        let user_id_str = user_json["user_id"].as_str().unwrap_or("");
+                        if let Ok(user_id) = Uuid::parse_str(&user_id_str) {
+                            interested_ids.push(user_id);
+                            let mut enriched_contact = JsonValue::new_object();
+                            let _ = enriched_contact.insert("user_id", user_id.to_string());
+                            let _ = enriched_contact.insert(
+                                "calls",
+                                JsonValue::Array(invites.get(&user_id).unwrap_or(&vec![]).clone()),
+                            );
+                            let _ = enrc_contacts.push(enriched_contact);
+                        }
+                    }
+                } else {
+                    enrc_contacts = contacts_data.clone();
+                }
+            }
+            enrc_contacts
+        };
 
         // Notify OmegaConnection about user states
         OmegaConnection::user_states(receiver_id, interested_ids.clone()).await;
