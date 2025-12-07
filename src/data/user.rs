@@ -1,13 +1,11 @@
-use uuid::Uuid;
-
 #[derive(Clone)]
 pub struct User {
-    pub iota_id: Uuid,
-    pub user_id: Uuid,
+    pub iota_id: i64,
+    pub user_id: i64,
     pub status: UserStatus,
 }
 impl User {
-    pub fn new(iota_id: Uuid, user_id: Uuid, status: UserStatus) -> Self {
+    pub fn new(iota_id: i64, user_id: i64, status: UserStatus) -> Self {
         User {
             iota_id,
             user_id,

@@ -1,5 +1,6 @@
 use async_tungstenite::tungstenite::Message;
 use async_tungstenite::{WebSocketReceiver, WebSocketSender};
+use json::number::Number;
 use std::sync::{Arc, Weak};
 use tokio::sync::RwLock;
 use tokio_util::compat::Compat;
@@ -27,7 +28,7 @@ pub struct ClientConnection {
     pub sender: Arc<RwLock<WebSocketSender<Compat<tokio::net::TcpStream>>>>,
     pub receiver: Arc<RwLock<WebSocketReceiver<Compat<tokio::net::TcpStream>>>>,
     /// User ID associated with this client
-    pub user_id: Arc<RwLock<Option<Uuid>>>,
+    pub user_id: Arc<RwLock<i64>>,
     /// Whether this connection has been identified/authenticated
     pub identified: Arc<RwLock<bool>>,
     /// Ping latency tracking
@@ -35,7 +36,7 @@ pub struct ClientConnection {
     /// Weak reference to RhoConnection to avoid circular references
     pub rho_connection: Arc<RwLock<Option<Weak<RhoConnection>>>>,
     /// List of user IDs this client is interested in receiving updates about
-    pub interested_users: Arc<RwLock<Vec<Uuid>>>,
+    pub interested_users: Arc<RwLock<Vec<i64>>>,
 }
 
 impl ClientConnection {
@@ -47,7 +48,7 @@ impl ClientConnection {
         Arc::new(Self {
             sender: Arc::new(RwLock::new(sender)),
             receiver: Arc::new(RwLock::new(receiver)),
-            user_id: Arc::new(RwLock::new(None)),
+            user_id: Arc::new(RwLock::new(0)),
             identified: Arc::new(RwLock::new(false)),
             ping: Arc::new(RwLock::new(-1)),
             rho_connection: Arc::new(RwLock::new(None)),
@@ -56,7 +57,7 @@ impl ClientConnection {
     }
 
     /// Get the user ID
-    pub async fn get_user_id(&self) -> Option<Uuid> {
+    pub async fn get_user_id(&self) -> i64 {
         *self.user_id.read().await
     }
 
@@ -155,18 +156,8 @@ impl ClientConnection {
     /// Handle identification message
     async fn handle_identification(&self, sarc: Arc<ClientConnection>, cv: CommunicationValue) {
         // Extract user ID
-        let user_id = match cv.get_data(DataTypes::user_id) {
-            Some(id_str) => match Uuid::parse_str(&id_str.to_string()) {
-                Ok(id) => id,
-                Err(_) => {
-                    self.send_error_response(
-                        &cv.get_id(),
-                        CommunicationType::error_invalid_user_id,
-                    )
-                    .await;
-                    return;
-                }
-            },
+        let user_id: i64 = match cv.get_data(DataTypes::user_id) {
+            Some(id_str) => id_str.as_i64().unwrap_or(0),
             None => {
                 self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_user_id)
                     .await;
@@ -209,7 +200,7 @@ impl ClientConnection {
         // Set identification data
         {
             let mut user_id_guard = self.user_id.write().await;
-            *user_id_guard = Some(user_id);
+            *user_id_guard = user_id;
         }
         {
             let mut identified_guard = self.identified.write().await;
@@ -253,61 +244,53 @@ impl ClientConnection {
 
     /// Handle client status change
     async fn handle_client_changed(&self, cv: CommunicationValue) {
-        if let Some(user_id) = self.get_user_id().await {
-            if let Some(_status_str) = cv.get_data(DataTypes::user_state) {
-                // Parse user status - this would need to be implemented properly
-                let user_status = UserStatus::online; // placeholder
-                if let Some(rho_conn) = self.get_rho_connection().await {
-                    OmegaConnection::client_changed(
-                        rho_conn.get_iota_id().await,
-                        user_id,
-                        user_status,
-                    )
+        let user_id = self.get_user_id().await;
+        if let Some(_status_str) = cv.get_data(DataTypes::user_state) {
+            // Parse user status - this would need to be implemented properly
+            let user_status = UserStatus::online; // placeholder
+            if let Some(rho_conn) = self.get_rho_connection().await {
+                OmegaConnection::client_changed(rho_conn.get_iota_id().await, user_id, user_status)
                     .await;
-                }
             }
         }
     }
 
     /// Handle call invite
     async fn handle_call_invite(&self, cv: CommunicationValue) {
-        let receiver_id = match cv.get_data(DataTypes::receiver_id) {
-            Some(id_str) => match Uuid::parse_str(&id_str.to_string()) {
-                Ok(id) => id,
-                Err(_) => {
-                    self.send_error_response(&cv.get_id(), CommunicationType::error)
-                        .await;
-                    return;
-                }
-            },
-            None => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
-                    .await;
-                return;
-            }
-        };
+        let receiver_id: i64 = cv
+            .get_data(DataTypes::receiver_id)
+            .unwrap_or(&json::JsonValue::Number(Number::from(0)))
+            .as_i64()
+            .unwrap_or(0);
+        if receiver_id == 0 {
+            self.send_error_response(&cv.get_id(), CommunicationType::error_no_user_id)
+                .await;
+            return;
+        }
 
         let call_id = match cv.get_data(DataTypes::call_id) {
             Some(id_str) => match Uuid::parse_str(&id_str.to_string()) {
                 Ok(id) => id,
                 Err(_) => {
-                    self.send_error_response(&cv.get_id(), CommunicationType::error)
-                        .await;
+                    self.send_error_response(
+                        &cv.get_id(),
+                        CommunicationType::error_invalid_call_id,
+                    )
+                    .await;
                     return;
                 }
             },
             None => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
+                self.send_error_response(&cv.get_id(), CommunicationType::error_no_call_id)
                     .await;
                 return;
             }
         };
 
         let invited =
-            call_manager::add_invite(call_id, self.user_id.read().await.unwrap(), receiver_id)
-                .await;
-        if invited {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
+            call_manager::add_invite(call_id, *self.user_id.read().await, receiver_id).await;
+        if !invited {
+            self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_call_id)
                 .await;
             return;
         }
@@ -323,10 +306,7 @@ impl ClientConnection {
         };
 
         // Get sender user ID
-        let sender_id = match self.get_user_id().await {
-            Some(id) => id,
-            None => return,
-        };
+        let sender_id = self.get_user_id().await;
 
         // Create and send call distribution message
         let forward = CommunicationValue::new(CommunicationType::call_invite)
@@ -344,10 +324,7 @@ impl ClientConnection {
 
     /// Handle get call request
     async fn handle_get_call(&self, cv: CommunicationValue) {
-        let user_id = match self.get_user_id().await {
-            Some(id) => id,
-            None => return,
-        };
+        let user_id = self.get_user_id().await;
 
         let call_id = match cv.get_data(DataTypes::call_id) {
             Some(id_str) => match Uuid::parse_str(&id_str.to_string()) {
@@ -380,11 +357,10 @@ impl ClientConnection {
 
     /// Forward message to Iota
     async fn forward_to_iota(&self, cv: CommunicationValue) {
-        if let Some(user_id) = self.get_user_id().await {
-            if let Some(rho_conn) = self.get_rho_connection().await {
-                let updated_cv = cv.with_sender(user_id);
-                rho_conn.message_to_iota(updated_cv).await;
-            }
+        let user_id = self.get_user_id().await;
+        if let Some(rho_conn) = self.get_rho_connection().await {
+            let updated_cv = cv.with_sender(user_id);
+            rho_conn.message_to_iota(updated_cv).await;
         }
     }
 
@@ -401,7 +377,7 @@ impl ClientConnection {
     }
 
     /// Set interested users list
-    pub async fn set_interested_users(&self, interested_ids: Vec<Uuid>) {
+    pub async fn set_interested_users(&self, interested_ids: Vec<i64>) {
         let mut interested_guard = self.interested_users.write().await;
         *interested_guard = interested_ids;
     }
@@ -424,12 +400,11 @@ impl ClientConnection {
     /// Handle connection close
     pub async fn handle_close(&self) {
         if self.is_identified().await {
-            if let Some(user_id) = self.get_user_id().await {
-                if let Some(rho_conn) = rho_manager::get_rho_con_for_user(user_id).await {
-                    rho_conn
-                        .close_client_connection(Arc::new(self.clone()))
-                        .await;
-                }
+            let user_id = self.get_user_id().await;
+            if let Some(rho_conn) = rho_manager::get_rho_con_for_user(user_id).await {
+                rho_conn
+                    .close_client_connection(Arc::new(self.clone()))
+                    .await;
             }
         }
     }

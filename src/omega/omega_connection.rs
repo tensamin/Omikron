@@ -104,14 +104,16 @@ impl OmegaConnection {
 
                     // Handle CLIENT_CHANGED
                     if cv.is_type(CommunicationType::client_changed) {
-                        let iota_id = Uuid::parse_str(
-                            cv.get_data(DataTypes::iota_id).unwrap().as_str().unwrap(),
-                        )
-                        .unwrap();
-                        let user_id = Uuid::parse_str(
-                            cv.get_data(DataTypes::user_id).unwrap().as_str().unwrap(),
-                        )
-                        .unwrap();
+                        let iota_id = cv
+                            .get_data(DataTypes::iota_id)
+                            .unwrap()
+                            .as_i64()
+                            .unwrap_or(0);
+                        let user_id = cv
+                            .get_data(DataTypes::user_id)
+                            .unwrap()
+                            .as_i64()
+                            .unwrap_or(0);
                         let status_str = cv
                             .get_data(DataTypes::user_state)
                             .unwrap()
@@ -147,7 +149,7 @@ impl OmegaConnection {
         }
     }
 
-    pub async fn connect_iota(iota_id: Uuid, user_ids: Vec<Uuid>) {
+    pub async fn connect_iota(iota_id: i64, user_ids: Vec<i64>) {
         let user_ids_str = user_ids
             .iter()
             .map(|id| id.to_string())
@@ -159,21 +161,21 @@ impl OmegaConnection {
         OmegaConnection::send_global(cv).await;
     }
 
-    pub async fn close_iota(iota_id: Uuid) {
+    pub async fn close_iota(iota_id: i64) {
         let cv = CommunicationValue::new(CommunicationType::iota_closed)
             .add_data(DataTypes::iota_id, JsonValue::from(iota_id.to_string()));
         OmegaConnection::send_global(cv).await;
     }
 
-    pub async fn client_changed(iota_id: Uuid, user_id: Uuid, state: UserStatus) {
+    pub async fn client_changed(iota_id: i64, user_id: i64, state: UserStatus) {
         let cv = CommunicationValue::new(CommunicationType::client_changed)
-            .add_data(DataTypes::iota_id, JsonValue::from(iota_id.to_string()))
-            .add_data(DataTypes::user_id, JsonValue::from(user_id.to_string()))
+            .add_data(DataTypes::iota_id, JsonValue::from(iota_id))
+            .add_data(DataTypes::user_id, JsonValue::from(user_id))
             .add_data(DataTypes::user_state, JsonValue::from(state.to_string()));
         OmegaConnection::send_global(cv).await;
     }
 
-    pub async fn user_states(user_id: Uuid, user_ids: Vec<Uuid>) {
+    pub async fn user_states(user_id: i64, user_ids: Vec<i64>) {
         let user_ids_str = user_ids
             .iter()
             .map(|id| id.to_string())

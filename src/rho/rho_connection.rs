@@ -4,20 +4,20 @@ use crate::data::{
     user::UserStatus,
 };
 use crate::omega::omega_connection::OmegaConnection;
+use json::{JsonValue, number::Number};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 pub struct RhoConnection {
     iota_connection: Arc<IotaConnection>,
-    user_ids: Vec<Uuid>,
+    user_ids: Vec<i64>,
     client_connections: Arc<RwLock<Vec<Arc<ClientConnection>>>>,
 }
 
 impl RhoConnection {
     /// Create a new RhoConnection
-    pub async fn new(iota_connection: Arc<IotaConnection>, user_ids: Vec<Uuid>) -> Self {
+    pub async fn new(iota_connection: Arc<IotaConnection>, user_ids: Vec<i64>) -> Self {
         let rho_connection = Self {
             iota_connection,
             user_ids: user_ids.clone(),
@@ -30,11 +30,11 @@ impl RhoConnection {
         rho_connection
     }
 
-    pub async fn get_iota_id(&self) -> Uuid {
+    pub async fn get_iota_id(&self) -> i64 {
         self.iota_connection.get_iota_id().await
     }
 
-    pub fn get_user_ids(&self) -> &Vec<Uuid> {
+    pub fn get_user_ids(&self) -> &Vec<i64> {
         &self.user_ids
     }
 
@@ -50,12 +50,12 @@ impl RhoConnection {
     /// Get client connections for a specific user
     pub async fn get_client_connections_for_user(
         &self,
-        user_id: Uuid,
+        user_id: i64,
     ) -> Vec<Arc<ClientConnection>> {
         let connections = self.client_connections.read().await;
         let mut collections = Vec::new();
         for con in connections.iter() {
-            if con.get_user_id().await.unwrap() == user_id {
+            if con.get_user_id().await == user_id {
                 collections.push(con.clone());
             }
         }
@@ -64,15 +64,10 @@ impl RhoConnection {
 
     /// Add a client connection
     pub async fn add_client_connection(&self, connection: Arc<ClientConnection>) {
-        let notification = CommunicationValue::new(CommunicationType::client_connected)
-            .add_data_str(
-                DataTypes::user_id,
-                connection
-                    .get_user_id()
-                    .await
-                    .unwrap_or(Uuid::nil())
-                    .to_string(),
-            );
+        let notification = CommunicationValue::new(CommunicationType::client_connected).add_data(
+            DataTypes::user_id,
+            JsonValue::Number(Number::from(connection.get_user_id().await)),
+        );
 
         self.iota_connection.send_message(notification).await;
 
@@ -83,7 +78,7 @@ impl RhoConnection {
 
         OmegaConnection::client_changed(
             self.get_iota_id().await,
-            connection.get_user_id().await.unwrap_or(Uuid::nil()),
+            connection.get_user_id().await,
             UserStatus::online,
         )
         .await;
@@ -94,12 +89,10 @@ impl RhoConnection {
         {
             let mut connections = self.client_connections.write().await;
 
-            let target_user_id = connection.get_user_id().await.unwrap();
+            let target_user_id = connection.get_user_id().await;
 
             connections.retain(|con| {
-                futures::executor::block_on(async {
-                    con.get_user_id().await.unwrap() != target_user_id
-                })
+                futures::executor::block_on(async { con.get_user_id().await != target_user_id })
             });
 
             connections.push(Arc::clone(&connection));
@@ -108,7 +101,7 @@ impl RhoConnection {
         // Notify OmegaConnection
         OmegaConnection::client_changed(
             self.get_iota_id().await,
-            connection.get_user_id().await.unwrap_or(Uuid::nil()),
+            connection.get_user_id().await,
             UserStatus::user_offline,
         )
         .await;
@@ -131,15 +124,9 @@ impl RhoConnection {
 
     /// Send message from Iota to specific client
     pub async fn message_to_client(&self, cv: CommunicationValue) {
-        if let Some(receiver_id) = Some(cv.get_receiver()) {
-            let connections = self.client_connections.read().await;
-            for connection in connections.iter() {
-                if let Some(conn_user_id) = connection.get_user_id().await {
-                    if conn_user_id == receiver_id {
-                        connection.send_message(&cv).await;
-                    }
-                }
-            }
+        let connections = self.client_connections.read().await;
+        for connection in connections.iter() {
+            connection.send_message(&cv).await;
         }
     }
 
@@ -154,16 +141,15 @@ impl RhoConnection {
     }
 
     /// Set interested users for a specific client
-    pub async fn set_interested(&self, user_id: Uuid, interested_ids: Vec<Uuid>) {
+    pub async fn set_interested(&self, user_id: i64, interested_ids: Vec<i64>) {
         let connections = self.client_connections.read().await;
         for connection in connections.iter() {
-            if let Some(conn_user_id) = connection.get_user_id().await {
-                if conn_user_id == user_id {
-                    connection
-                        .set_interested_users(interested_ids.clone())
-                        .await;
-                    break;
-                }
+            let conn_user_id = connection.get_user_id().await;
+            if conn_user_id == user_id {
+                connection
+                    .set_interested_users(interested_ids.clone())
+                    .await;
+                break;
             }
         }
     }
@@ -182,16 +168,15 @@ impl RhoConnection {
         let mut pings = HashMap::new();
 
         for connection in connections.iter() {
-            if let Some(user_id) = connection.get_user_id().await {
-                pings.insert(user_id.to_string(), connection.get_ping().await);
-            }
+            let user_id = connection.get_user_id().await;
+            pings.insert(user_id.to_string(), connection.get_ping().await);
         }
 
         pings
     }
 
     /// Check if this RhoConnection contains a specific user ID
-    pub fn contains_user(&self, user_id: &Uuid) -> bool {
+    pub fn contains_user(&self, user_id: &i64) -> bool {
         self.user_ids.contains(user_id)
     }
 

@@ -1,5 +1,7 @@
 use crate::data::communication::{CommunicationType, CommunicationValue, DataTypes};
 use crate::util::config_util::CONFIG;
+use crate::util::print::{PrintType, line};
+use json::number::Number;
 use reqwest::{Client, Response};
 use std::time::Duration;
 use uuid::Uuid;
@@ -64,7 +66,7 @@ pub async fn get_user(user_id: Uuid) -> Option<AuthUser> {
     })
 }
 
-pub async fn get_iota_id(user_id: Uuid) -> Option<Uuid> {
+pub async fn get_iota_id(user_id: i64) -> Option<i64> {
     let url = format!("https://auth.tensamin.net/api/get/iota-id/{}", user_id);
 
     let client = client();
@@ -81,13 +83,17 @@ pub async fn get_iota_id(user_id: Uuid) -> Option<Uuid> {
 
     let cv = CommunicationValue::from_json(&json);
     if cv.comm_type != CommunicationType::success {
+        line(PrintType::IotaIn, &cv.to_json().to_string());
         return None;
     }
 
-    let iota_id_str = cv.get_data(DataTypes::iota_id)?.to_string();
-    Uuid::parse_str(&iota_id_str).ok()
+    let iota_id = cv.get_data(DataTypes::iota_id)?.as_i64().unwrap_or(0);
+    if iota_id == 0 {
+        return None;
+    }
+    Some(iota_id)
 }
-pub async fn is_private_key_valid(user_id: Uuid, pk_hash: &str) -> bool {
+pub async fn is_private_key_valid(user_id: i64, pk_hash: &str) -> bool {
     let url = format!(
         "https://auth.tensamin.net/api/get/private-key-hash/{}/",
         user_id
@@ -120,7 +126,7 @@ pub async fn is_private_key_valid(user_id: Uuid, pk_hash: &str) -> bool {
         None => false,
     }
 }
-pub async fn get_public_key(user_id: Uuid) -> Option<String> {
+pub async fn get_public_key(user_id: i64) -> Option<String> {
     let url = format!("https://auth.tensamin.net/api/{}/public-key", user_id);
 
     let client = client();
@@ -141,14 +147,16 @@ pub async fn get_public_key(user_id: Uuid) -> Option<String> {
     Some(cv.get_data(DataTypes::ping_clients)?.to_string())
 }
 
-pub async fn get_register() -> Option<Uuid> {
+pub async fn get_register() -> Option<i64> {
     let url = "https://auth.tensamin.net/api/register/init".to_string();
     let client = client();
     let res = client.get(&url).send().await.ok()?;
     let json = res.text().await.ok()?;
 
     let cv = CommunicationValue::from_json(&json);
-    Uuid::parse_str(&*cv.get_data(DataTypes::user_id).unwrap().to_string()).ok()
+    cv.get_data(DataTypes::user_id)
+        .unwrap_or(&json::JsonValue::Number(Number::from(0)))
+        .as_i64()
 }
 
 async fn handle_response(resp: Response) -> bool {

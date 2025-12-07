@@ -14,6 +14,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use tungstenite::handshake::server::{Request, Response};
 
 use crate::{
+    calls::call_manager::garbage_collect_calls,
     omega::omega_connection::OmegaConnection,
     rho::{client_connection::ClientConnection, iota_connection::IotaConnection},
     util::{
@@ -35,6 +36,8 @@ async fn main() {
         PrintType::General,
         &format!("WebSocket server listening on {}", &address),
     );
+
+    garbage_collect_calls();
 
     while let Ok((stream, _)) = listener.accept().await {
         tokio::spawn(async move {

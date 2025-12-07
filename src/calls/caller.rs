@@ -3,13 +3,13 @@ use uuid::Uuid;
 use crate::calls::call_util;
 
 pub struct Caller {
-    pub user_id: Uuid,
+    pub user_id: i64,
     pub call_id: Uuid,
-    pub inviters: Vec<Uuid>,
+    pub inviters: Vec<i64>,
 }
 
 impl Caller {
-    pub fn new(user_id: Uuid, call_id: Uuid, inviter_id: Uuid) -> Self {
+    pub fn new(user_id: i64, call_id: Uuid, inviter_id: i64) -> Self {
         Caller {
             user_id,
             call_id,

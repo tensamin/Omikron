@@ -8,6 +8,7 @@ use crate::calls::caller::Caller;
 pub struct CallGroup {
     pub call_id: Uuid,
     pub members: RwLock<Vec<Arc<Caller>>>,
+    pub show: RwLock<bool>,
 }
 
 impl CallGroup {
@@ -15,13 +16,15 @@ impl CallGroup {
         CallGroup {
             call_id,
             members: RwLock::new(vec![user]),
+            show: RwLock::new(true),
         }
     }
 
-    pub async fn add_member(self: Arc<Self>, member: Uuid, inviter: Uuid) {
+    pub async fn add_member(self: Arc<Self>, member: i64, inviter: i64) {
+        *self.show.write().await = true;
         self.members
             .write()
             .await
-            .push(Arc::new(Caller::new(member, inviter, self.call_id)));
+            .push(Arc::new(Caller::new(member, self.call_id, inviter)));
     }
 }

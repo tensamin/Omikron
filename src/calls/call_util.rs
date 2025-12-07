@@ -2,10 +2,7 @@ use livekit_api::access_token;
 use std::env;
 use uuid::Uuid;
 
-pub fn create_token(
-    user_id: Uuid,
-    call_id: Uuid,
-) -> Result<String, access_token::AccessTokenError> {
+pub fn create_token(user_id: i64, call_id: Uuid) -> Result<String, access_token::AccessTokenError> {
     let api_key = env::var("LIVEKIT_API_KEY").expect("LIVEKIT_API_KEY is not set");
     let api_secret = env::var("LIVEKIT_API_SECRET").expect("LIVEKIT_API_SECRET is not set");
 

@@ -6,12 +6,11 @@ use std::{
     sync::{Arc, LazyLock},
 };
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
-pub static RHO_CONNECTIONS: LazyLock<Arc<RwLock<HashMap<Uuid, Arc<RhoConnection>>>>> =
+pub static RHO_CONNECTIONS: LazyLock<Arc<RwLock<HashMap<i64, Arc<RhoConnection>>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
 
-pub async fn get_rho_con_for_user(user_id: Uuid) -> Option<Arc<RhoConnection>> {
+pub async fn get_rho_con_for_user(user_id: i64) -> Option<Arc<RhoConnection>> {
     let connections = RHO_CONNECTIONS.read().await;
     line(
         PrintType::ClientIn,
@@ -32,13 +31,13 @@ pub async fn get_rho_con_for_user(user_id: Uuid) -> Option<Arc<RhoConnection>> {
     None
 }
 
-pub async fn contains_iota(iota_id: Uuid) -> bool {
+pub async fn contains_iota(iota_id: i64) -> bool {
     let connections = RHO_CONNECTIONS.read().await;
     connections.contains_key(&iota_id)
 }
 
 /// Remove a RhoConnection by Iota ID
-pub async fn remove_rho(iota_id: Uuid) -> Option<Arc<RhoConnection>> {
+pub async fn remove_rho(iota_id: i64) -> Option<Arc<RhoConnection>> {
     let mut connections = RHO_CONNECTIONS.write().await;
     connections.remove(&iota_id)
 }
@@ -51,7 +50,7 @@ pub async fn add_rho(rho_connection: Arc<RhoConnection>) {
 }
 
 /// Get a RhoConnection by Iota ID directly
-pub async fn get_rho_by_iota(iota_id: Uuid) -> Option<Arc<RhoConnection>> {
+pub async fn get_rho_by_iota(iota_id: i64) -> Option<Arc<RhoConnection>> {
     let connections = RHO_CONNECTIONS.read().await;
     connections.get(&iota_id).map(Arc::clone)
 }
