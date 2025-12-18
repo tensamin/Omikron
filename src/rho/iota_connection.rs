@@ -343,11 +343,11 @@ impl IotaConnection {
                         let user_id = user_json["user_id"].as_i64().unwrap_or(0);
                         interested_ids.push(user_id);
                         let mut enriched_contact = JsonValue::new_object();
-                        let _ = enriched_contact.insert("user_id", user_id.to_string());
-                        let _ = enriched_contact.insert(
-                            "calls",
-                            JsonValue::Array(invites.get(&user_id).unwrap_or(&vec![]).clone()),
-                        );
+                        let _ = enriched_contact.insert("user_id", user_id);
+                        if let Some(calls) = invites.get(&user_id) {
+                            let _ =
+                                enriched_contact.insert("calls", JsonValue::Array(calls.clone()));
+                        }
                         let _ = enrc_contacts.push(enriched_contact);
                     }
                 } else {

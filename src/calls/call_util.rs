@@ -9,6 +9,7 @@ pub fn create_token(user_id: i64, call_id: Uuid) -> Result<String, access_token:
     let token = access_token::AccessToken::with_api_key(&api_key, &api_secret)
         .with_identity(&user_id.to_string())
         .with_grants(access_token::VideoGrants {
+            can_update_own_metadata: true,
             room_join: true,
             room: call_id.to_string(),
             ..Default::default()
