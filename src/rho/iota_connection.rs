@@ -15,7 +15,6 @@ use std::{
 use tokio::sync::RwLock;
 use tokio_util::compat::Compat;
 use tungstenite::Utf8Bytes;
-use uuid::Uuid;
 
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::{
@@ -273,21 +272,35 @@ impl IotaConnection {
     async fn handle_forward_message(&self, cv: CommunicationValue) {
         let receiver_id = cv.get_receiver();
         let sender_id = cv.get_sender();
-        if !self.get_user_ids().await.contains(&sender_id) {
-            self.send_message(CommunicationValue::new(
-                CommunicationType::error_invalid_user_id,
-            ))
-            .await;
-            return;
-        }
 
-        if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id).await {
-            target_rho.message_to_iota(cv).await;
+        if self.get_user_ids().await.contains(&receiver_id) {
+            if let Some(target_rho) = self.get_rho_connection().await {
+                target_rho.message_to_iota(cv).await;
+            } else {
+                let error = CommunicationValue::new(CommunicationType::error)
+                    .with_id(cv.get_id())
+                    .with_sender(cv.get_sender());
+                self.send_message(error).await;
+            }
+        } else if self.get_user_ids().await.contains(&sender_id) {
+            if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id).await {
+                target_rho.message_to_iota(cv).await;
+            } else {
+                let error = CommunicationValue::new(CommunicationType::error_no_iota)
+                    .with_id(cv.get_id())
+                    .with_sender(cv.get_sender());
+                self.send_message(error).await;
+            }
         } else {
-            let error = CommunicationValue::new(CommunicationType::error_no_iota)
-                .with_id(cv.get_id())
-                .with_sender(cv.get_sender());
-            self.send_message(error).await;
+            self.send_message(
+                CommunicationValue::new(CommunicationType::error_invalid_user_id).add_data(
+                    DataTypes::error_type,
+                    JsonValue::String(
+                        "You are sending to another User without authority.".to_string(),
+                    ),
+                ),
+            )
+            .await;
         }
     }
 

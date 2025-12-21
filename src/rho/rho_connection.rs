@@ -126,13 +126,10 @@ impl RhoConnection {
     pub async fn message_to_client(&self, cv: CommunicationValue) {
         let connections = self.client_connections.read().await;
         for connection in connections.iter() {
-            connection.send_message(&cv).await;
+            if connection.get_user_id().await == cv.receiver {
+                connection.send_message(&cv).await;
+            }
         }
-    }
-
-    /// Send message to Iota as string
-    pub async fn message_to_iota_str(&self, message: &str) {
-        self.iota_connection.send_message_str(message).await;
     }
 
     /// Send message to Iota

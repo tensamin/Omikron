@@ -357,9 +357,8 @@ impl ClientConnection {
 
     /// Forward message to Iota
     async fn forward_to_iota(&self, cv: CommunicationValue) {
-        let user_id = self.get_user_id().await;
         if let Some(rho_conn) = self.get_rho_connection().await {
-            let updated_cv = cv.with_sender(user_id);
+            let updated_cv = cv.with_sender(self.get_user_id().await);
             rho_conn.message_to_iota(updated_cv).await;
         }
     }

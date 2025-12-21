@@ -355,22 +355,22 @@ impl CommunicationValue {
             object! {
                 id: self.id.to_string(),
                 type: format!("{:?}", self.comm_type),
-                sender: self.sender.to_string(),
-                receiver: self.receiver.to_string(),
+                sender: self.sender,
+                receiver: self.receiver,
                 data: jdata
             }
         } else if self.sender > 0 {
             object! {
                 id: self.id.to_string(),
                 type: format!("{:?}", self.comm_type),
-                sender: self.sender.to_string(),
+                sender: self.sender,
                 data: jdata
             }
         } else if self.receiver > 0 {
             object! {
                 id: self.id.to_string(),
                 type: format!("{:?}", self.comm_type),
-                receiver: self.receiver.to_string(),
+                receiver: self.receiver,
                 data: jdata
             }
         } else {
