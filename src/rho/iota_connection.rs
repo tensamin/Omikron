@@ -1,8 +1,9 @@
 use crate::calls::call_group::CallGroup;
 use crate::calls::call_manager;
-use crate::util::print::PrintType;
-use crate::util::print::line;
-use crate::util::print::line_err;
+use crate::log_err;
+use crate::log_in;
+use crate::log_out;
+use crate::util::logger::PrintType;
 use async_tungstenite::WebSocketReceiver;
 use async_tungstenite::WebSocketSender;
 use async_tungstenite::tungstenite::Message;
@@ -94,17 +95,14 @@ impl IotaConnection {
             .send(Message::Text(Utf8Bytes::from(message.to_string())))
             .await
         {
-            line_err(
-                PrintType::IotaOut,
-                &format!("Failed to send WebSocket message: {:?}", e),
-            );
+            log_err!(PrintType::Iota, "Failed to send WebSocket message: {:?}", e,);
         }
     }
 
     /// Send a CommunicationValue to the Iota
     pub async fn send_message(&self, cv: CommunicationValue) {
         if !cv.is_type(CommunicationType::pong) {
-            line(PrintType::IotaOut, &cv.to_json().to_string());
+            log_out!(PrintType::Iota, "{}", cv.to_json().to_string());
         }
         self.send_message_str(&cv.to_json().to_string()).await;
     }
@@ -115,7 +113,7 @@ impl IotaConnection {
 
         // Handle identification
         if cv.is_type(CommunicationType::identification) && !self.is_identified().await {
-            line(PrintType::IotaIn, &cv.to_json().to_string());
+            log_in!(PrintType::Iota, "{}", &cv.to_json().to_string());
             self.handle_identification(cv).await;
             return;
         }
@@ -129,7 +127,7 @@ impl IotaConnection {
             self.handle_ping(cv).await;
             return;
         }
-        line(PrintType::IotaIn, &cv.to_json().to_string());
+        log_in!(PrintType::Iota, "{}", &cv.to_json().to_string());
         // Handle forwarding to other Iotas or clients
         let receiver_id = cv.get_receiver();
         if !self.get_user_ids().await.contains(&receiver_id)
@@ -171,27 +169,26 @@ impl IotaConnection {
                 match id_str.parse::<i64>() {
                     Ok(user_id) => {
                         if let Some(auth_iota_id) = auth_connector::get_iota_id(user_id).await {
-                            line(
-                                PrintType::IotaIn,
-                                &format!(
-                                    "auth for {} should be {} is {}",
-                                    user_id, iota_id, auth_iota_id
-                                ),
+                            log_in!(
+                                PrintType::Iota,
+                                "auth for {} should be {} is {}",
+                                user_id,
+                                iota_id,
+                                auth_iota_id
                             );
                             if auth_iota_id == iota_id {
                                 validated_user_ids.push(user_id);
                             }
                         } else {
-                            line(
-                                PrintType::IotaIn,
-                                &format!("User ID {} not parsed", id_str.trim()),
-                            );
+                            log_in!(PrintType::Iota, "User ID {} not parsed", user_id);
                         }
                     }
                     Err(e) => {
-                        line(
-                            PrintType::IotaIn,
-                            &format!("Failed to parse '{}' as i64: {:?}", id_str, e),
+                        log_in!(
+                            PrintType::Iota,
+                            "Failed to parse '{}' as i64: {:?}",
+                            id_str,
+                            e,
                         );
                     }
                 }
@@ -273,16 +270,7 @@ impl IotaConnection {
         let receiver_id = cv.get_receiver();
         let sender_id = cv.get_sender();
 
-        if self.get_user_ids().await.contains(&receiver_id) {
-            if let Some(target_rho) = self.get_rho_connection().await {
-                target_rho.message_to_iota(cv).await;
-            } else {
-                let error = CommunicationValue::new(CommunicationType::error)
-                    .with_id(cv.get_id())
-                    .with_sender(cv.get_sender());
-                self.send_message(error).await;
-            }
-        } else if self.get_user_ids().await.contains(&sender_id) {
+        if self.get_user_ids().await.contains(&sender_id) {
             if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id).await {
                 target_rho.message_to_iota(cv).await;
             } else {
@@ -329,10 +317,10 @@ impl IotaConnection {
         // Process contacts and add call information
         let enriched_contacts = if *empty {
             if let Some(contacts_data) = cv.get_data(DataTypes::user_ids) {
-                line(PrintType::CallIn, "Call empty");
+                log_in!(PrintType::Call, "Call empty");
                 contacts_data.clone()
             } else {
-                line(PrintType::CallIn, "Call empty No Data");
+                log_in!(PrintType::Call, "Call empty No Data");
                 JsonValue::new_array()
             }
         } else {

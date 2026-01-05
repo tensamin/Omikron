@@ -19,12 +19,4 @@ impl CallGroup {
             show: RwLock::new(true),
         }
     }
-
-    pub async fn add_member(self: Arc<Self>, member: i64, inviter: i64) {
-        *self.show.write().await = true;
-        self.members
-            .write()
-            .await
-            .push(Arc::new(Caller::new(member, self.call_id, inviter)));
-    }
 }

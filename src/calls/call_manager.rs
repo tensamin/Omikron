@@ -6,23 +6,11 @@ use uuid::Uuid;
 
 use crate::{
     calls::{call_group::CallGroup, caller::Caller},
-    util::print::{PrintType, line},
+    log,
+    util::logger::PrintType,
 };
 
 static CALL_GROUPS: Lazy<RwLock<Vec<Arc<CallGroup>>>> = Lazy::new(|| RwLock::new(Vec::new()));
-
-pub async fn get_call_invites(user_id: i64) -> Vec<Arc<Caller>> {
-    let mut callers = Vec::new();
-    for cg in CALL_GROUPS.read().await.iter() {
-        let members = cg.members.read().await;
-        for member in members.iter() {
-            if member.user_id == user_id {
-                callers.push(member.clone());
-            }
-        }
-    }
-    callers
-}
 
 pub async fn get_call_groups(user_id: i64) -> Vec<Arc<CallGroup>> {
     let mut call_groups = Vec::new();
@@ -45,38 +33,28 @@ pub async fn get_call_token(user_id: i64, call_id: Uuid) -> Option<String> {
         call_groups.iter().find(|g| g.call_id == call_id).cloned()
     };
 
+    // if the group exists
     if let Some(cg) = existing_group {
-        let mut members = cg.members.write().await;
+        let members = cg.members.write().await;
 
+        // if the user is already a member
         if let Some(member) = members.iter().find(|m| m.user_id == user_id) {
             return Some(member.create_token());
         }
-
+        return None;
+        /*
         let new_caller = Arc::new(Caller::new(user_id, call_id, user_id));
         let token = new_caller.create_token();
 
         members.push(new_caller);
 
         return Some(token);
+        */
     }
 
     let mut call_groups = CALL_GROUPS.write().await;
 
-    if let Some(cg) = call_groups.iter().find(|g| g.call_id == call_id) {
-        let cg_clone = cg.clone();
-        drop(call_groups);
-
-        let mut members = cg_clone.members.write().await;
-        if let Some(member) = members.iter().find(|m| m.user_id == user_id) {
-            return Some(member.create_token());
-        }
-        let new_caller = Arc::new(Caller::new(user_id, call_id, user_id));
-        let token = new_caller.create_token();
-        members.push(new_caller);
-        return Some(token);
-    }
-
-    let caller = Arc::new(Caller::new(user_id, call_id, user_id));
+    let caller = Arc::new(Caller::new(user_id, call_id, true));
     let call_group = CallGroup::new(call_id, caller.clone());
 
     call_groups.push(Arc::new(call_group));
@@ -99,7 +77,7 @@ pub async fn add_invite(call_id: Uuid, inviter_id: i64, invitee_id: i64) -> bool
 
         if is_inviter_member {
             if !members.iter().any(|m| m.user_id == invitee_id) {
-                members.push(Arc::new(Caller::new(invitee_id, call_id, inviter_id)));
+                members.push(Arc::new(Caller::new(invitee_id, call_id, false)));
             }
             return true;
         }
@@ -138,13 +116,11 @@ pub async fn clean_calls() {
     let size_post = call_groups.len();
     drop(call_groups);
     if size_pre - size_post != 0 {
-        line(
-            PrintType::CallIn,
-            &format!(
-                "Cleaned {} calls, {} remaining",
-                size_pre - size_post,
-                size_post
-            ),
+        log!(
+            PrintType::Call,
+            "Cleaned {} calls, {} remaining",
+            size_pre - size_post,
+            size_post
         );
     }
 }

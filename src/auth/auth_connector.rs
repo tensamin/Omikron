@@ -1,6 +1,7 @@
 use crate::data::communication::{CommunicationType, CommunicationValue, DataTypes};
+use crate::log;
 use crate::util::config_util::CONFIG;
-use crate::util::print::{PrintType, line};
+use crate::util::logger::PrintType;
 use json::number::Number;
 use reqwest::{Client, Response};
 use std::time::Duration;
@@ -25,6 +26,19 @@ fn client() -> Client {
         .timeout(Duration::from_secs(150))
         .build()
         .unwrap()
+}
+pub async fn get_auth_public_key() -> Option<String> {
+    let url = format!("https://auth.tensamin.net/api/get/public_key");
+    let client = client();
+    let res = client.get(&url).send().await.ok()?;
+    let json = res.text().await.ok()?;
+
+    let cv = CommunicationValue::from_json(&json);
+    if cv.comm_type != CommunicationType::success {
+        return None;
+    }
+
+    Some(cv.get_data(DataTypes::public_key).unwrap().to_string())
 }
 
 pub async fn get_user(user_id: Uuid) -> Option<AuthUser> {
@@ -83,7 +97,7 @@ pub async fn get_iota_id(user_id: i64) -> Option<i64> {
 
     let cv = CommunicationValue::from_json(&json);
     if cv.comm_type != CommunicationType::success {
-        line(PrintType::IotaIn, &cv.to_json().to_string());
+        log!(PrintType::Iota, "{}", &cv.to_json().to_string());
         return None;
     }
 

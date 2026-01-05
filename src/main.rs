@@ -8,33 +8,46 @@ mod util;
 use async_tungstenite::accept_hdr_async;
 use dotenv::dotenv;
 use futures::StreamExt;
-use std::sync::Arc;
+use once_cell::sync::Lazy;
+use std::{env, sync::Arc};
 use tokio::net::TcpListener;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use tungstenite::handshake::server::{Request, Response};
 
 use crate::{
+    auth::crypto_helper::{load_public_key, load_secret_key},
     calls::call_manager::garbage_collect_calls,
     omega::omega_connection::OmegaConnection,
     rho::{client_connection::ClientConnection, iota_connection::IotaConnection},
     util::{
         config_util::CONFIG,
-        print::{PrintType, line, line_err},
+        logger::{PrintType, startup},
     },
 };
+
+static PRIVATE_KEY: Lazy<String> = Lazy::new(|| env::var("PRIVATE_KEY").unwrap());
+pub fn get_private_key() -> x448::Secret {
+    load_secret_key(&*PRIVATE_KEY).unwrap()
+}
+static PUBLIC_KEY: Lazy<String> = Lazy::new(|| env::var("PUBLIC_KEY").unwrap());
+pub fn get_public_key() -> x448::PublicKey {
+    load_public_key(&*PUBLIC_KEY).unwrap()
+}
 
 #[tokio::main]
 async fn main() {
     dotenv().ok();
     tokio::spawn(async move {
-        OmegaConnection::new().connect().await;
+        Arc::new(OmegaConnection::new()).connect();
     });
+    startup();
     let address = format!("{}:{}", &CONFIG.read().await.ip, &CONFIG.read().await.port);
     let listener = TcpListener::bind(&address).await.unwrap();
 
-    line(
+    log!(
         PrintType::General,
-        &format!("WebSocket server listening on {}", &address),
+        "WebSocket server listening on {}",
+        address,
     );
 
     garbage_collect_calls();
@@ -50,16 +63,13 @@ async fn main() {
             let ws_stream = match accept_hdr_async(stream.compat(), callback).await {
                 Ok(ws) => ws,
                 Err(e) => {
-                    line_err(
-                        PrintType::General,
-                        &format!("WebSocket upgrade failed: {}", e),
-                    );
+                    log!(PrintType::General, "WebSocket upgrade failed: {}", e,);
                     return;
                 }
             };
             let (sender, receiver) = ws_stream.split();
             if path == "/ws/client/" {
-                line(PrintType::ClientIn, "New Client connection");
+                log_in!(PrintType::Client, "New Client connection");
                 let client_conn: Arc<ClientConnection> =
                     Arc::from(ClientConnection::new(sender, receiver));
                 loop {
@@ -74,25 +84,25 @@ async fn main() {
                                 let text = msg.into_text().unwrap();
                                 client_conn.clone().handle_message(text).await;
                             } else if msg.is_close() {
-                                line(PrintType::ClientIn, "Client disconnected");
+                                log_in!(PrintType::Client, "Client disconnected");
                                 client_conn.handle_close().await;
                                 return;
                             }
                         }
                         Some(Err(e)) => {
-                            line_err(PrintType::ClientIn, &format!("WebSocket error: {}", e));
+                            log_err!(PrintType::Client, "WebSocket error: {}", e);
                             client_conn.handle_close().await;
                             return;
                         }
                         None => {
-                            line(PrintType::ClientIn, "Client stream ended");
+                            log_in!(PrintType::Client, "Client stream ended");
                             client_conn.handle_close().await;
                             return;
                         }
                     }
                 }
             } else if path == "/ws/iota/" {
-                line(PrintType::IotaIn, "New Iota connection");
+                log_in!(PrintType::Iota, "New Iota connection");
                 let iota_conn: Arc<IotaConnection> =
                     Arc::from(IotaConnection::new(sender, receiver));
                 loop {
@@ -107,19 +117,19 @@ async fn main() {
                                 let text = msg.into_text().unwrap();
                                 iota_conn.clone().handle_message(text).await;
                             } else if msg.is_close() {
-                                line(PrintType::IotaIn, "Iota disconnected");
+                                log_in!(PrintType::Iota, "Iota disconnected");
                                 iota_conn.handle_close().await;
                                 return;
                             }
                         }
                         Some(Err(e)) => {
-                            line_err(PrintType::IotaIn, &format!("WebSocket error: {}", e));
+                            log_err!(PrintType::Iota, "WebSocket error: {}", e);
                             iota_conn.handle_close().await;
                             return;
                         }
                         None => {
                             // Stream ended
-                            line(PrintType::IotaIn, "Iota stream ended");
+                            log_in!(PrintType::Iota, "Iota stream ended");
                             iota_conn.handle_close().await;
                             return;
                         }

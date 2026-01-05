@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 ansi_term = "*"
-async-tungstenite = { version = "0.32.0", features = ["futures-03-sink", "futures-util", "handshake", "__rustls-tls", "async-native-tls", "async-std", "async-std-runtime", "async-tls", "gio", "gio-runtime", "glib", "openssl", "real-async-native-tls", "real-async-tls", "real-native-tls", "real-tokio-native-tls", "real-tokio-openssl", "real-tokio-rustls", "rustls-native-certs", "rustls-pki-types", "tokio", "tokio-native-tls", "tokio-openssl", "tokio-runtime", "tokio-rustls-manual-roots", "tokio-rustls-native-certs", "tokio-rustls-webpki-roots", "url", "verbose-logging", "webpki-roots" ] }
+async-tungstenite = { version = "0.32.0", features = ["futures-03-sink", "futures-util", "handshake", "__rustls-tls", "async-native-tls", "async-std", "async-std-runtime", "async-tls", "gio", "gio-runtime", "glib", "openssl", "real-async-native-tls", "real-async-tls", "real-native-tls", "real-tokio-native-tls", "real-tokio-openssl", "real-tokio-rustls", "rustls-native-certs", "rustls-pki-types", "tokio", "tokio-native-tls", "tokio-openssl", "tokio-runtime", "tokio-rustls-manual-roots", "tokio-rustls-native-certs", "tokio-rustls-webpki-roots", "url", "verbose-logging", "webpki-roots"] }
 axum = "*"
 base64 = "0.22.1"
 bytes = "*"
@@ -49,3 +49,5 @@ log = "0.4"
 livekit = "0.7.25"
 livekit-api = "0.4.10"
 dotenv = "0.15.0"
+aes-gcm = "0.10.3"
+tokio-native-tls = "0.3.1"

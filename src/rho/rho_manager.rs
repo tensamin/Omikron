@@ -1,6 +1,7 @@
 use super::rho_connection::RhoConnection;
-use crate::util::print::PrintType;
-use crate::util::print::line;
+use crate::log_in;
+use crate::log_out;
+use crate::util::logger::PrintType;
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock},
@@ -12,17 +13,12 @@ pub static RHO_CONNECTIONS: LazyLock<Arc<RwLock<HashMap<i64, Arc<RhoConnection>>
 
 pub async fn get_rho_con_for_user(user_id: i64) -> Option<Arc<RhoConnection>> {
     let connections = RHO_CONNECTIONS.read().await;
-    line(
-        PrintType::ClientIn,
-        &format!("Checking user ID: {:?}", user_id),
-    );
+    log_in!(PrintType::Client, "Checking user ID: {:?}", user_id,);
     for rho_connection in connections.values() {
-        line(
-            PrintType::ClientIn,
-            &format!(
-                "Comparing user IDs: {:?}",
-                rho_connection.get_user_ids().to_vec()
-            ),
+        log_in!(
+            PrintType::Client,
+            "Comparing user IDs: {:?}",
+            rho_connection.get_user_ids().to_vec()
         );
         if rho_connection.get_user_ids().contains(&user_id) {
             return Some(Arc::clone(rho_connection));

@@ -9,9 +9,7 @@ use uuid::Uuid;
 
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::calls::call_manager;
-use crate::util::print::PrintType;
-use crate::util::print::line;
-use crate::util::print::line_err;
+use crate::util::logger::PrintType;
 use crate::{
     auth::auth_connector,
     // calls::call_manager::CallManager,
@@ -21,6 +19,7 @@ use crate::{
     },
     omega::omega_connection::OmegaConnection,
 };
+use crate::{log_in, log_out};
 
 /// ClientConnection represents a WebSocket connection from a client device
 pub struct ClientConnection {
@@ -94,17 +93,14 @@ impl ClientConnection {
             .send(Message::Text(Utf8Bytes::from(message.to_string())))
             .await
         {
-            line_err(
-                PrintType::ClientOut,
-                &format!("Failed to send message to client: {}", e),
-            );
+            log_out!(PrintType::Client, "Failed to send message to client: {}", e,);
         }
     }
 
     /// Send a CommunicationValue to the client
     pub async fn send_message(&self, cv: &CommunicationValue) {
         if !cv.is_type(CommunicationType::pong) {
-            line(PrintType::ClientOut, &cv.to_json().to_string());
+            log_out!(PrintType::Client, "{}", &cv.to_json().to_string());
         }
         self.send_message_str(&cv.to_json().to_string()).await;
     }
@@ -129,7 +125,7 @@ impl ClientConnection {
                 self.handle_ping(cv).await;
                 return;
             }
-            line(PrintType::ClientIn, &cv.to_json().to_string());
+            log_in!(PrintType::Client, "{}", &cv.to_json().to_string());
             // Handle client status changes
             if cv.is_type(CommunicationType::client_changed) {
                 self.handle_client_changed(cv).await;
@@ -181,7 +177,7 @@ impl ClientConnection {
                 return;
             }
         } else {
-            line(PrintType::ClientIn, "Missing private key");
+            log_in!(PrintType::Client, "Missing private key");
             self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_private_key)
                 .await;
             return;
@@ -246,8 +242,7 @@ impl ClientConnection {
     async fn handle_client_changed(&self, cv: CommunicationValue) {
         let user_id = self.get_user_id().await;
         if let Some(_status_str) = cv.get_data(DataTypes::user_state) {
-            // Parse user status - this would need to be implemented properly
-            let user_status = UserStatus::online; // placeholder
+            let user_status = UserStatus::online;
             if let Some(rho_conn) = self.get_rho_connection().await {
                 OmegaConnection::client_changed(rho_conn.get_iota_id().await, user_id, user_status)
                     .await;
@@ -353,6 +348,19 @@ impl ClientConnection {
                 .await;
             return;
         }
+    }
+    async fn handle_call_timeout_user(&self, cv: CommunicationValue) {
+        let user_id = cv.get_data(DataTypes::call_id).unwrap();
+        let call_id = cv.get_data(DataTypes::user_id).unwrap(); // JA man braucht CALL_ID
+    }
+    async fn handle_call_disconnect_user(&self, cv: CommunicationValue) {
+        let user_id = cv.get_data(DataTypes::call_id).unwrap();
+        let call_id = cv.get_data(DataTypes::user_id).unwrap(); // JA man braucht CALL_ID
+        let untill = cv.get_data(DataTypes::untill).unwrap();
+    }
+    async fn handle_call_set_anonymous_joining(&self, cv: CommunicationValue) {
+        let call_id = cv.get_data(DataTypes::user_id).unwrap();
+        let enable = cv.get_data(DataTypes::enable).unwrap();
     }
 
     /// Forward message to Iota
