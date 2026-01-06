@@ -16,6 +16,7 @@ pub enum DataTypes {
     iota_id,
     user_id,
     user_ids,
+    iota_ids,
     user_state,
     user_states,
     user_pings,
@@ -75,7 +76,7 @@ pub enum DataTypes {
     challenge,
     community_title,
     communities,
-
+    rho_connections,
     user,
 }
 
@@ -92,6 +93,7 @@ impl DataTypes {
             "iotaid" => DataTypes::iota_id,
             "userid" => DataTypes::user_id,
             "userids" => DataTypes::user_ids,
+            "iotaids" => DataTypes::iota_ids,
             "userstate" => DataTypes::user_state,
             "userstates" => DataTypes::user_states,
             "userpings" => DataTypes::user_pings,
@@ -151,7 +153,7 @@ impl DataTypes {
             "challenge" => DataTypes::challenge,
             "communitytitle" => DataTypes::community_title,
             "communities" => DataTypes::communities,
-
+            "rhoconnections" => DataTypes::rho_connections,
             "user" => DataTypes::user,
             _ => DataTypes::error_type, // fallback if unknown
         }
@@ -202,8 +204,6 @@ pub enum CommunicationType {
     pong,
     add_chat,
     send_chat,
-    iota_connected,
-    iota_closed,
     client_changed,
     client_connected,
     client_disconnected,
@@ -224,6 +224,13 @@ pub enum CommunicationType {
     function,
     update,
     create_user,
+    rho_update,
+
+    user_connected,
+    user_disconnected,
+    iota_connected,
+    iota_disconnected,
+    sync_client_iota_status,
 }
 impl CommunicationType {
     pub fn parse(p0: String) -> CommunicationType {
@@ -280,8 +287,6 @@ impl CommunicationType {
             "pong" => CommunicationType::pong,
             "addchat" => CommunicationType::add_chat,
             "sendchat" => CommunicationType::send_chat,
-            "iotaconnected" => CommunicationType::iota_connected,
-            "iotaclosed" => CommunicationType::iota_closed,
             "clientchanged" => CommunicationType::client_changed,
             "clientconnected" => CommunicationType::client_connected,
             "clientdisconnected" => CommunicationType::client_disconnected,
@@ -292,6 +297,13 @@ impl CommunicationType {
             "webrtcice" => CommunicationType::webrtc_ice,
             "startstream" => CommunicationType::start_stream,
             "endstream" => CommunicationType::end_stream,
+            "rhoupdate" => CommunicationType::rho_update,
+
+            "iotaconnected" => CommunicationType::iota_connected,
+            "iotadisconnected" => CommunicationType::iota_disconnected,
+            "userconnected" => CommunicationType::user_connected,
+            "userdisconnected" => CommunicationType::user_disconnected,
+            "syncclientiotastatus" => CommunicationType::sync_client_iota_status,
 
             _ => CommunicationType::error,
         }

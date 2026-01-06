@@ -1,6 +1,5 @@
 use super::rho_connection::RhoConnection;
 use crate::log_in;
-use crate::log_out;
 use crate::util::logger::PrintType;
 use std::{
     collections::HashMap,

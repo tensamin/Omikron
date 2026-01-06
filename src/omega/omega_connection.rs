@@ -1,5 +1,5 @@
 use async_tungstenite::{
-    WebSocketReceiver, WebSocketSender, WebSocketStream,
+    WebSocketReceiver, WebSocketSender,
     stream::Stream,
     tokio::{TokioAdapter, connect_async},
     tungstenite::protocol::Message,
@@ -23,8 +23,8 @@ use crate::{
         communication::{CommunicationType, CommunicationValue, DataTypes},
         user::UserStatus,
     },
-    get_private_key, log_in, log_out,
-    rho::rho_manager,
+    get_private_key, log, log_in, log_out,
+    rho::rho_manager::{self, RHO_CONNECTIONS},
     util::logger::PrintType,
 };
 use crate::{auth::crypto_helper::secret_key_to_base64, log_err};
@@ -46,6 +46,7 @@ static OMEGA_CONNECTION: Lazy<Arc<OmegaConnection>> = Lazy::new(|| {
     conn
 });
 
+#[allow(dead_code)]
 pub fn get_omega_connection() -> Arc<OmegaConnection> {
     OMEGA_CONNECTION.clone()
 }
@@ -119,6 +120,7 @@ impl OmegaConnection {
                     let cloned_self = self.clone();
                     tokio::spawn(async move {
                         let id = Uuid::new_v4();
+
                         let identify_msg =
                             CommunicationValue::new(CommunicationType::identification)
                                 .with_id(id)
@@ -182,7 +184,7 @@ impl OmegaConnection {
                                         let response_id = response_msg.get_id();
                                         WAITING_TASKS.insert(
                                             response_id,
-                                            Box::new(|_self, final_cv| {
+                                            Box::new(|selfc, final_cv| {
                                                 if !final_cv
                                                     .is_type(CommunicationType::identification_response)
                                                 {
@@ -193,7 +195,30 @@ impl OmegaConnection {
                                                     return false;
                                                 }
 
-                                                log_err!(
+                                                tokio::spawn(async move {
+                                                    let mut connected_iota_ids: Vec<JsonValue> = Vec::new();
+                                                    let mut connected_user_ids: Vec<JsonValue> = Vec::new();
+                                                    let rho_connections_reader = RHO_CONNECTIONS.read().await;
+
+                                                    for iota_id in rho_connections_reader.keys() {
+                                                        connected_iota_ids.push(JsonValue::from(*iota_id));
+                                                    }
+
+                                                    for rho in rho_connections_reader.values() {
+                                                        for client_conn in rho.get_client_connections().await {
+                                                            connected_user_ids.push(JsonValue::from(client_conn.get_user_id().await));
+                                                        }
+                                                    }
+
+                                                    drop(rho_connections_reader);
+
+                                                    let sync_msg = CommunicationValue::new(CommunicationType::sync_client_iota_status)
+                                                        .add_data(DataTypes::iota_ids, JsonValue::Array(connected_iota_ids))
+                                                        .add_data(DataTypes::user_ids, JsonValue::Array(connected_user_ids));
+
+                                                    selfc.send_message(&sync_msg).await;
+                                                });
+                                                log!(
                                                     PrintType::Omega,
                                                     "Successfully identified with Omega.",
                                                 );
@@ -313,30 +338,30 @@ impl OmegaConnection {
         }
     }
 
-    pub async fn connect_iota(iota_id: i64, user_ids: Vec<i64>) {
-        let user_ids_str = user_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+    pub async fn connect_iota(iota_id: i64, _user_ids: Vec<i64>) {
         let cv = CommunicationValue::new(CommunicationType::iota_connected)
-            .add_data(DataTypes::iota_id, JsonValue::from(iota_id.to_string()))
-            .add_data(DataTypes::user_ids, JsonValue::from(user_ids_str));
+            .add_data(DataTypes::iota_id, JsonValue::from(iota_id));
         OmegaConnection::send_global(cv).await;
     }
 
     pub async fn close_iota(iota_id: i64) {
-        let cv = CommunicationValue::new(CommunicationType::iota_closed)
-            .add_data(DataTypes::iota_id, JsonValue::from(iota_id.to_string()));
+        let cv = CommunicationValue::new(CommunicationType::iota_disconnected)
+            .add_data(DataTypes::iota_id, JsonValue::from(iota_id));
         OmegaConnection::send_global(cv).await;
     }
 
-    pub async fn client_changed(iota_id: i64, user_id: i64, state: UserStatus) {
-        let cv = CommunicationValue::new(CommunicationType::client_changed)
-            .add_data(DataTypes::iota_id, JsonValue::from(iota_id))
-            .add_data(DataTypes::user_id, JsonValue::from(user_id))
-            .add_data(DataTypes::user_state, JsonValue::from(state.to_string()));
-        OmegaConnection::send_global(cv).await;
+    pub async fn client_changed(_iota_id: i64, user_id: i64, state: UserStatus) {
+        let msg_type = match state {
+            UserStatus::iota_offline => Some(CommunicationType::user_disconnected),
+            UserStatus::user_offline => Some(CommunicationType::user_disconnected),
+            _ => Some(CommunicationType::user_connected),
+        };
+
+        if let Some(t) = msg_type {
+            let cv =
+                CommunicationValue::new(t).add_data(DataTypes::user_id, JsonValue::from(user_id));
+            OmegaConnection::send_global(cv).await;
+        }
     }
 
     pub async fn user_states(user_id: i64, user_ids: Vec<i64>) {
