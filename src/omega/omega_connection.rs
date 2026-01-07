@@ -286,7 +286,7 @@ impl OmegaConnection {
                 let mut guard = self.read.write().await;
                 let ws = match guard.as_mut() {
                     Some(ws) => ws,
-                    None => break,
+                    _ => break,
                 };
                 ws.next().await
             };
@@ -315,6 +315,7 @@ impl OmegaConnection {
                         }
                     }
                 }
+                #[allow(non_snake_case)]
                 Some(Ok(Message::Close(_))) | None => break,
                 Some(Err(_)) => break,
                 _ => {}

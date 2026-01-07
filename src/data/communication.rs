@@ -78,6 +78,9 @@ pub enum DataTypes {
     communities,
     rho_connections,
     user,
+    online_status,
+    omikron_id,
+    omikron_connections,
 }
 
 impl DataTypes {
@@ -155,6 +158,9 @@ impl DataTypes {
             "communities" => DataTypes::communities,
             "rhoconnections" => DataTypes::rho_connections,
             "user" => DataTypes::user,
+            "onlinestatus" => DataTypes::online_status,
+            "omikronid" => DataTypes::omikron_id,
+            "omikronconnections" => DataTypes::omikron_connections,
             _ => DataTypes::error_type, // fallback if unknown
         }
     }
@@ -231,6 +237,15 @@ pub enum CommunicationType {
     iota_connected,
     iota_disconnected,
     sync_client_iota_status,
+
+    get_user_data,
+    get_iota_data,
+
+    change_user_data,
+    change_iota_data,
+
+    start_register,
+    complete_register,
 }
 impl CommunicationType {
     pub fn parse(p0: String) -> CommunicationType {
@@ -304,6 +319,15 @@ impl CommunicationType {
             "userconnected" => CommunicationType::user_connected,
             "userdisconnected" => CommunicationType::user_disconnected,
             "syncclientiotastatus" => CommunicationType::sync_client_iota_status,
+
+            "getuserdata" => CommunicationType::get_user_data,
+            "getiotadata" => CommunicationType::get_iota_data,
+
+            "changeuserdata" => CommunicationType::change_user_data,
+            "changeiotadata" => CommunicationType::change_iota_data,
+
+            "startregister" => CommunicationType::start_register,
+            "completeregister" => CommunicationType::complete_register,
 
             _ => CommunicationType::error,
         }
