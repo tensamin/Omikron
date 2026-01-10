@@ -69,7 +69,7 @@ impl RhoConnection {
             JsonValue::Number(Number::from(connection.get_user_id().await)),
         );
 
-        self.iota_connection.send_message(notification).await;
+        self.iota_connection.send_message(&notification).await;
 
         {
             let mut connections = self.client_connections.write().await;
@@ -134,7 +134,7 @@ impl RhoConnection {
 
     /// Send message to Iota
     pub async fn message_to_iota(&self, cv: CommunicationValue) {
-        self.iota_connection.send_message(cv).await;
+        self.iota_connection.send_message(&cv).await;
     }
 
     /// Set interested users for a specific client

@@ -80,7 +80,7 @@ pub async fn get_user(user_id: Uuid) -> Option<AuthUser> {
     })
 }
 
-pub async fn get_iota_id(user_id: i64) -> Option<i64> {
+pub async fn get_iota_by_user_id(user_id: i64) -> Option<i64> {
     let url = format!("https://auth.tensamin.net/api/get/iota-id/{}", user_id);
 
     let client = client();

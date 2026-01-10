@@ -64,13 +64,20 @@ fn derive_aes_key(shared: &SharedSecret) -> [u8; 32] {
     key
 }
 
-pub fn encrypt(
+pub fn encrypt_b64(
     base64_secret: &str,
     base64_peer_pub: &str,
     plaintext: &str,
 ) -> Result<String, CryptoError> {
     let secret = load_secret_key(base64_secret).unwrap();
     let peer_pub = load_public_key(base64_peer_pub).unwrap();
+    encrypt(secret, peer_pub, plaintext)
+}
+pub fn encrypt(
+    secret: Secret,
+    peer_pub: PublicKey,
+    plaintext: &str,
+) -> Result<String, CryptoError> {
     let shared = secret
         .to_diffie_hellman(&peer_pub)
         .ok_or(CryptoError::AgreementError)?;
@@ -89,13 +96,20 @@ pub fn encrypt(
     Ok(STANDARD.encode(&out))
 }
 
-pub fn decrypt(
+pub fn decrypt_b64(
     base64_secret: &str,
     base64_peer_pub: &str,
     encrypted_base64: &str,
 ) -> Result<String, CryptoError> {
     let secret = load_secret_key(base64_secret).unwrap();
     let peer_pub = load_public_key(base64_peer_pub).unwrap();
+    decrypt(secret, peer_pub, encrypted_base64)
+}
+pub fn decrypt(
+    secret: Secret,
+    peer_pub: PublicKey,
+    encrypted_base64: &str,
+) -> Result<String, CryptoError> {
     let shared = secret
         .to_diffie_hellman(&peer_pub)
         .ok_or(CryptoError::AgreementError)?;

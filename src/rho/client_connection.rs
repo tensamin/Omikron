@@ -1,7 +1,6 @@
 use async_tungstenite::tungstenite::Message;
 use async_tungstenite::{WebSocketReceiver, WebSocketSender};
 use json::number::Number;
-use rustls::sign::SingleCertAndKey;
 use std::sync::{Arc, Weak};
 use tokio::sync::RwLock;
 use tokio_util::compat::Compat;
@@ -146,28 +145,34 @@ impl ClientConnection {
                 return;
             }
 
-            if cv.is_type(CommunicationType::change_user_data) {
-                let client_for_closure = self.clone();
-                WAITING_TASKS.insert(
-                    cv.get_id(),
-                    Box::new(move |_, response_cv| {
-                        let client = client_for_closure.clone();
-                        tokio::spawn(async move {
-                            client.send_message(&response_cv).await;
-                        });
-                        true
-                    }),
-                );
-
-                get_omega_connection()
-                    .send_message(&cv.with_sender(*self.user_id.read().await))
-                    .await;
+            if cv.is_type(CommunicationType::change_user_data)
+                || cv.is_type(CommunicationType::get_user_data)
+                || cv.is_type(CommunicationType::get_iota_data)
+                || cv.is_type(CommunicationType::delete_user)
+            {
+                self.handle_omega_forward(cv).await;
                 return;
             }
 
             // Forward other messages to Iota
             self.forward_to_iota(cv).await;
         });
+    }
+    async fn handle_omega_forward(&self, cv: CommunicationValue) {
+        let client_for_closure = self.clone();
+        WAITING_TASKS.insert(
+            cv.get_id(),
+            Box::new(move |_, response_cv| {
+                let client = client_for_closure.clone();
+                tokio::spawn(async move {
+                    client.send_message(&response_cv).await;
+                });
+                true
+            }),
+        );
+        get_omega_connection()
+            .send_message(&cv.with_sender(*self.user_id.read().await))
+            .await;
     }
 
     /// Handle identification message
