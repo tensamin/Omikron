@@ -29,7 +29,7 @@ use crate::{
 };
 use crate::{auth::crypto_helper::secret_key_to_base64, log_err};
 
-static WAITING_TASKS: Lazy<
+pub static WAITING_TASKS: Lazy<
     DashMap<Uuid, Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>>,
 > = Lazy::new(DashMap::new);
 

@@ -1,12 +1,13 @@
 use livekit_api::services::room::RoomClient;
 use once_cell::sync::Lazy;
-use std::{str::FromStr, sync::Arc, time::Duration};
+use std::{env, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
+
 use uuid::Uuid;
 
 use crate::{
     calls::{call_group::CallGroup, caller::Caller},
-    log,
+    log, log_err,
     util::logger::PrintType,
 };
 
@@ -93,8 +94,29 @@ pub fn garbage_collect_calls() {
     });
 }
 pub async fn clean_calls() {
-    let room_service = RoomClient::new("https://call.tensamin.net").unwrap();
-    let rooms = room_service.list_rooms(Vec::new()).await.unwrap();
+    let api_key = match env::var("LIVEKIT_API_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            log_err!(PrintType::General, "LIVEKIT_API_KEY not set!");
+            return;
+        }
+    };
+    let api_secret = match env::var("LIVEKIT_API_SECRET") {
+        Ok(secret) => secret,
+        Err(_) => {
+            log_err!(PrintType::General, "LIVEKIT_API_SECRET not set!");
+            return;
+        }
+    };
+    let room_service = RoomClient::with_api_key("https://call.tensamin.net", &api_key, &api_secret);
+
+    let rooms = match room_service.list_rooms(Vec::new()).await {
+        Ok(rooms) => rooms,
+        Err(e) => {
+            log_err!(PrintType::General, "Could not get rooms! {}", e);
+            return;
+        }
+    };
     let mut call_ids: Vec<Uuid> = Vec::new();
     let mut no_users: Vec<Uuid> = Vec::new();
     for room in rooms {

@@ -1,6 +1,7 @@
 use async_tungstenite::tungstenite::Message;
 use async_tungstenite::{WebSocketReceiver, WebSocketSender};
 use json::number::Number;
+use rustls::sign::SingleCertAndKey;
 use std::sync::{Arc, Weak};
 use tokio::sync::RwLock;
 use tokio_util::compat::Compat;
@@ -9,6 +10,7 @@ use uuid::Uuid;
 
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::calls::call_manager;
+use crate::omega::omega_connection::{WAITING_TASKS, get_omega_connection};
 use crate::util::logger::PrintType;
 use crate::{
     auth::auth_connector,
@@ -141,6 +143,25 @@ impl ClientConnection {
             // Handle get call requests
             if cv.is_type(CommunicationType::call_token) {
                 self.handle_get_call(cv).await;
+                return;
+            }
+
+            if cv.is_type(CommunicationType::change_user_data) {
+                let client_for_closure = self.clone();
+                WAITING_TASKS.insert(
+                    cv.get_id(),
+                    Box::new(move |_, response_cv| {
+                        let client = client_for_closure.clone();
+                        tokio::spawn(async move {
+                            client.send_message(&response_cv).await;
+                        });
+                        true
+                    }),
+                );
+
+                get_omega_connection()
+                    .send_message(&cv.with_sender(*self.user_id.read().await))
+                    .await;
                 return;
             }
 
