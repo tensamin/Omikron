@@ -1,6 +1,3 @@
-use crate::auth::crypto_helper::encrypt;
-use crate::auth::crypto_helper::load_public_key;
-use crate::auth::crypto_helper::public_key_to_base64;
 use crate::calls::call_group::CallGroup;
 use crate::calls::call_manager;
 use crate::get_private_key;
@@ -10,14 +7,15 @@ use crate::log_in;
 use crate::log_out;
 use crate::omega::omega_connection::WAITING_TASKS;
 use crate::omega::omega_connection::get_omega_connection;
+use crate::util::crypto_helper::encrypt;
+use crate::util::crypto_helper::load_public_key;
+use crate::util::crypto_helper::public_key_to_base64;
 use crate::util::logger::PrintType;
 use async_tungstenite::WebSocketReceiver;
 use async_tungstenite::WebSocketSender;
 use async_tungstenite::tungstenite::Message;
-use base64::alphabet::STANDARD;
 use dashmap::DashMap;
 use json::JsonValue;
-use json::number::Number;
 use rand::Rng;
 use rand::distributions::Alphanumeric;
 use std::{
@@ -32,7 +30,6 @@ use x448::PublicKey;
 
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::{
-    auth::auth_connector,
     // calls::call_manager::CallManager,
     data::communication::{CommunicationType, CommunicationValue, DataTypes},
     omega::omega_connection::OmegaConnection,
@@ -140,111 +137,241 @@ impl IotaConnection {
     /// Handle incoming message from Iota
     pub async fn handle_message(self: Arc<Self>, message: Utf8Bytes) {
         let cv = CommunicationValue::from_json(&message);
+        let identified = *self.identified.read().await;
+        let challenged = *self.challenged.read().await;
 
-        // Handle identification
-        if !self.is_identified().await {
-            let identified = *self.identified.read().await;
-            let challenged = *self.challenged.read().await;
-
-            if !identified && cv.is_type(CommunicationType::identification) {
-                let iota_id = cv
-                    .get_data(DataTypes::iota_id)
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-
-                let iota_for_closure: Arc<IotaConnection> = self.clone();
-                WAITING_TASKS.insert(
-                    cv.get_id(),
-                    Box::new(|omega_conn: Arc<OmegaConnection>, cv: CommunicationValue| {
-                        let base64_pub = cv
-                            .get_data(DataTypes::public_key)
-                            .unwrap_or(&JsonValue::Null)
-                            .as_str()
-                            .unwrap_or("");
-                        let pub_key: PublicKey = match load_public_key(base64_pub) {
-                            Some(b) => {
-                                let pub_key_bytes: Vec<u8> = b.as_bytes().to_vec();
-                                let iota: Arc<IotaConnection> = iota_for_closure.clone();
-                                tokio::spawn(async move {
-                                    *iota.pub_key.write().await = Some(pub_key_bytes)
-                                });
-                                b
-                            }
-                            _ => {
-                                let iota: Arc<IotaConnection> = iota_for_closure.clone();
-                                tokio::spawn(async move {
-                                    iota.send_message(
-                                        &CommunicationValue::new(
-                                            CommunicationType::error_invalid_omikron_id,
-                                        )
-                                        .with_id(cv.get_id()),
-                                    )
-                                    .await;
-                                });
-                                return true;
-                            }
-                        };
-                        tokio::spawn(async move {
-                            let challenge: String = rand::thread_rng()
-                                .sample_iter(&Alphanumeric)
-                                .take(32)
-                                .map(char::from)
-                                .collect();
-
-                            *self.iota_id.write().await = iota_id;
-                            *self.challenge.write().await = challenge.clone();
-                            *self.identified.write().await = true;
-
-                            let encrypted =
-                                encrypt(get_private_key(), pub_key, &challenge).unwrap_or_default();
-
-                            let response = CommunicationValue::new(CommunicationType::challenge)
-                                .with_id(cv.get_id())
-                                .add_data_str(
-                                    DataTypes::public_key,
-                                    public_key_to_base64(&get_public_key()),
-                                )
-                                .add_data_str(DataTypes::challenge, encrypted);
-
-                            self.send_message(&response).await;
-                        });
-                        true
-                    }),
-                );
-            }
-
-            // ──────────────────────────────
-            // Challenge response
-            // ──────────────────────────────
-            if identified && !challenged && cv.is_type(CommunicationType::challenge_response) {
-                let client_response = cv
-                    .get_data(DataTypes::challenge)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                if client_response == *self.challenge.read().await {
-                    *self.challenged.write().await = true;
-                    let _ = sql::set_omikron_active(self.iota_id.await, true);
-
-                    self.send_message(
-                        &CommunicationValue::new(CommunicationType::identification_response)
-                            .with_id(cv.get_id()),
-                    )
+        if !identified && cv.is_type(CommunicationType::identification) {
+            let iota_id = cv
+                .get_data(DataTypes::iota_id)
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if iota_id == 0 {
+                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
                     .await;
-                } else {
-                    self.send_error_response(
-                        &cv.get_id(),
-                        CommunicationType::error_invalid_challenge,
-                    )
-                    .await;
-                    self.close().await;
-                }
+                self.close().await;
                 return;
             }
 
+            let user_ids_json = cv
+                .get_data(DataTypes::user_ids)
+                .unwrap_or(&JsonValue::Null)
+                .clone();
+            let mut user_ids = Vec::new();
+            if let JsonValue::Array(ids) = user_ids_json {
+                for id_val in ids {
+                    if let Some(id) = id_val.as_i64() {
+                        user_ids.push(id);
+                    }
+                }
+            }
+
+            *self.iota_id.write().await = iota_id;
+            *self.user_ids.write().await = user_ids;
+
+            let get_pub_key_msg = CommunicationValue::new(CommunicationType::get_iota_data)
+                .add_data(DataTypes::iota_id, JsonValue::from(iota_id));
+
+            let msg_id = get_pub_key_msg.get_id();
+            let iota_conn_clone = self.clone();
+            let original_cv_id = cv.get_id();
+
+            WAITING_TASKS.insert(
+                msg_id,
+                Box::new(move |_, response_cv: CommunicationValue| {
+                    let iota_conn_for_task = iota_conn_clone.clone();
+                    tokio::spawn(async move {
+                        if !response_cv.is_type(CommunicationType::get_iota_data) {
+                            iota_conn_for_task
+                                .send_error_response(
+                                    &original_cv_id,
+                                    CommunicationType::error_internal,
+                                )
+                                .await;
+                            iota_conn_for_task.close().await;
+                            return;
+                        }
+
+                        let base64_pub = response_cv
+                            .get_data(DataTypes::public_key)
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+
+                        let pub_key = match load_public_key(base64_pub) {
+                            Some(pk) => pk,
+                            None => {
+                                iota_conn_for_task
+                                    .send_error_response(
+                                        &original_cv_id,
+                                        CommunicationType::error_invalid_public_key,
+                                    )
+                                    .await;
+                                iota_conn_for_task.close().await;
+                                return;
+                            }
+                        };
+
+                        *iota_conn_for_task.pub_key.write().await =
+                            Some(pub_key.as_bytes().to_vec());
+
+                        let challenge: String = rand::thread_rng()
+                            .sample_iter(&Alphanumeric)
+                            .take(32)
+                            .map(char::from)
+                            .collect();
+
+                        *iota_conn_for_task.challenge.write().await = challenge.clone();
+
+                        let encrypted_challenge =
+                            encrypt(get_private_key(), pub_key, &challenge).unwrap_or_default();
+
+                        *iota_conn_for_task.identified.write().await = true;
+
+                        let challenge_msg = CommunicationValue::new(CommunicationType::challenge)
+                            .with_id(original_cv_id)
+                            .add_data_str(
+                                DataTypes::public_key,
+                                public_key_to_base64(&get_public_key()),
+                            )
+                            .add_data_str(DataTypes::challenge, encrypted_challenge);
+
+                        iota_conn_for_task.send_message(&challenge_msg).await;
+                    });
+                    true
+                }),
+            );
+
+            get_omega_connection().send_message(&get_pub_key_msg).await;
+            return;
+        } else if !identified && cv.is_type(CommunicationType::complete_register_iota) {
+            let base64_pub = cv
+                .get_data(DataTypes::public_key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if base64_pub.is_empty() {
+                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_public_key)
+                    .await;
+                self.close().await;
+                return;
+            }
+
+            let register_msg = CommunicationValue::new(CommunicationType::complete_register_iota)
+                .add_data(
+                    DataTypes::public_key,
+                    JsonValue::String(base64_pub.to_string()),
+                );
+
+            let msg_id = register_msg.get_id();
+            let iota_conn_clone = self.clone();
+            let original_cv_id = cv.get_id();
+
+            WAITING_TASKS.insert(
+                msg_id,
+                Box::new(move |_, response_cv: CommunicationValue| {
+                    let iota_conn_for_task = iota_conn_clone.clone();
+                    tokio::spawn(async move {
+                        if !response_cv.is_type(CommunicationType::complete_register_iota) {
+                            iota_conn_for_task
+                                .send_error_response(
+                                    &original_cv_id,
+                                    CommunicationType::error_internal,
+                                )
+                                .await;
+                            iota_conn_for_task.close().await;
+                            return;
+                        }
+
+                        let new_iota_id = response_cv
+                            .get_data(DataTypes::iota_id)
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0);
+
+                        if new_iota_id == 0 {
+                            iota_conn_for_task
+                                .send_error_response(
+                                    &original_cv_id,
+                                    CommunicationType::error_internal,
+                                )
+                                .await;
+                            iota_conn_for_task.close().await;
+                            return;
+                        }
+
+                        *iota_conn_for_task.iota_id.write().await = new_iota_id;
+                        *iota_conn_for_task.identified.write().await = true;
+
+                        let success_msg = CommunicationValue::new(CommunicationType::success)
+                            .with_id(original_cv_id)
+                            .add_data(DataTypes::iota_id, JsonValue::from(new_iota_id));
+
+                        iota_conn_for_task.send_message(&success_msg).await;
+                    });
+                    true
+                }),
+            );
+            get_omega_connection().send_message(&register_msg).await;
+            return;
+        }
+
+        if identified && !challenged && cv.is_type(CommunicationType::challenge_response) {
+            let client_response = cv
+                .get_data(DataTypes::challenge)
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if client_response == *self.challenge.read().await {
+                *self.challenged.write().await = true;
+
+                let iota_id = self.get_iota_id().await;
+                let user_ids = self.get_user_ids().await;
+
+                let mut validated_user_ids: Vec<i64> = Vec::new();
+                for user_id in user_ids {
+                    validated_user_ids.push(user_id);
+                }
+
+                if rho_manager::contains_iota(iota_id).await {
+                    if let Some(existing_rho) = rho_manager::get_rho_by_iota(iota_id).await {
+                        existing_rho.close_iota_connection().await;
+                    }
+                }
+
+                let rho_connection =
+                    Arc::new(RhoConnection::new(self.clone(), validated_user_ids.clone()).await);
+
+                self.set_rho_connection(Arc::downgrade(&rho_connection))
+                    .await;
+
+                rho_manager::add_rho(rho_connection).await;
+
+                let mut str = String::new();
+                for id in &validated_user_ids {
+                    str.push_str(&format!(",{}", id));
+                }
+                if !str.is_empty() {
+                    str.remove(0);
+                }
+
+                self.send_message(
+                    &CommunicationValue::new(CommunicationType::identification_response)
+                        .with_id(cv.get_id())
+                        .add_data_str(DataTypes::accepted_ids, str)
+                        .add_data_str(DataTypes::accepted, validated_user_ids.len().to_string()),
+                )
+                .await;
+            } else {
+                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_challenge)
+                    .await;
+                self.close().await;
+            }
+            return;
+        }
+
+        if !self.is_identified().await {
             self.send_error_response(&cv.get_id(), CommunicationType::error_not_authenticated)
                 .await;
             self.close().await;
+            return;
         }
 
         // Handle ping
@@ -282,6 +409,17 @@ impl IotaConnection {
         // Forward to client
         self.forward_to_client(cv).await;
     }
+
+    async fn send_error_response(&self, message_id: &Uuid, error_type: CommunicationType) {
+        let error = CommunicationValue::new(error_type).with_id(*message_id);
+        self.send_message(&error).await;
+    }
+
+    async fn close(&self) {
+        let mut sender = self.sender.write().await;
+        let _ = sender.close(None).await;
+    }
+
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
         let iota_for_closure = self.clone();
         WAITING_TASKS.insert(
@@ -298,98 +436,6 @@ impl IotaConnection {
             .send_message(&cv.with_sender(*self.iota_id.read().await))
             .await;
     }
-    /// Handle identification message
-    async fn handle_identification(self: Arc<Self>, cv: CommunicationValue) {
-        let iota_id: i64 = cv
-            .get_data(DataTypes::iota_id)
-            .unwrap_or(&JsonValue::Number(Number::from(0)))
-            .as_i64()
-            .unwrap_or(0);
-
-        if iota_id == 0 {
-            let error = CommunicationValue::new(CommunicationType::error).with_id(cv.get_id());
-            self.send_message(&error).await;
-            return;
-        }
-
-        // Parse user IDs
-        let mut validated_user_ids: Vec<i64> = Vec::new();
-        if let Some(user_ids_str) = cv.get_data(DataTypes::user_ids) {
-            for id_str in user_ids_str.to_string().split(',') {
-                match id_str.parse::<i64>() {
-                    Ok(user_id) => {
-                        if let Some(auth_iota_id) = auth_connector::get_iota_by_id(user_id).await {
-                            log_in!(
-                                PrintType::Iota,
-                                "auth for {} should be {} is {}",
-                                user_id,
-                                iota_id,
-                                auth_iota_id
-                            );
-                            if auth_iota_id == iota_id {
-                                validated_user_ids.push(user_id);
-                            }
-                        } else {
-                            log_in!(PrintType::Iota, "User ID {} not parsed", user_id);
-                        }
-                    }
-                    Err(e) => {
-                        log_in!(
-                            PrintType::Iota,
-                            "Failed to parse '{}' as i64: {:?}",
-                            id_str,
-                            e,
-                        );
-                    }
-                }
-            }
-        }
-
-        // Set identification data
-        {
-            let mut iota_id_guard = self.iota_id.write().await;
-            *iota_id_guard = iota_id;
-        }
-        {
-            let mut user_ids_guard = self.user_ids.write().await;
-            *user_ids_guard = validated_user_ids.clone();
-        }
-        {
-            let mut identified_guard = self.identified.write().await;
-            *identified_guard = true;
-        }
-
-        // Check for existing connection and close it
-        if rho_manager::contains_iota(iota_id).await {
-            if let Some(existing_rho) = rho_manager::get_rho_by_iota(iota_id).await {
-                existing_rho.close_iota_connection().await;
-            }
-        }
-
-        // Create RhoConnection
-        let rho_connection =
-            Arc::new(RhoConnection::new(self.clone(), validated_user_ids.clone()).await);
-
-        // Set up bidirectional reference
-        self.set_rho_connection(Arc::downgrade(&rho_connection))
-            .await;
-
-        // Add to manager
-        rho_manager::add_rho(rho_connection).await;
-
-        // Send response
-        let mut str = String::new();
-        for id in &validated_user_ids {
-            str.push_str(&format!(",{}", id));
-        }
-        let response = CommunicationValue::new(CommunicationType::identification_response)
-            .with_id(cv.get_id())
-            .add_data_str(DataTypes::accepted_ids, str)
-            .add_data_str(DataTypes::accepted, validated_user_ids.len().to_string());
-
-        self.send_message(&response).await;
-    }
-
     /// Handle ping message
     async fn handle_ping(&self, cv: CommunicationValue) {
         if let Some(last_ping) = cv.get_data(DataTypes::last_ping) {

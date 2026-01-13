@@ -1,4 +1,3 @@
-mod auth;
 mod calls;
 mod data;
 mod omega;
@@ -15,12 +14,12 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use tungstenite::handshake::server::{Request, Response};
 
 use crate::{
-    auth::crypto_helper::{load_public_key, load_secret_key},
     calls::call_manager::garbage_collect_calls,
     omega::omega_connection::OmegaConnection,
     rho::{client_connection::ClientConnection, iota_connection::IotaConnection},
     util::{
         config_util::CONFIG,
+        crypto_helper::{load_public_key, load_secret_key},
         logger::{PrintType, startup},
     },
 };

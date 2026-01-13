@@ -12,7 +12,6 @@ use crate::calls::call_manager;
 use crate::omega::omega_connection::{WAITING_TASKS, get_omega_connection};
 use crate::util::logger::PrintType;
 use crate::{
-    auth::auth_connector,
     // calls::call_manager::CallManager,
     data::{
         communication::{CommunicationType, CommunicationValue, DataTypes},
@@ -190,8 +189,9 @@ impl ClientConnection {
         // Validate private key
         if let Some(private_key_hash) = cv.get_data(DataTypes::private_key_hash) {
             println!("private_key_hash: {}", private_key_hash);
-            let is_valid =
-                auth_connector::is_private_key_valid(user_id, &private_key_hash.to_string()).await;
+            let is_valid = true; // NO VALIDATION,
+            // SWAP TO AUTH VIA CHALLENGE
+            // auth_connector::is_private_key_valid(user_id, &private_key_hash.to_string()).await;
 
             if !is_valid {
                 println!("Invalid private key");

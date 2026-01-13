@@ -108,7 +108,8 @@ pub async fn clean_calls() {
             return;
         }
     };
-    let room_service = RoomClient::with_api_key("https://call.tensamin.net", &api_key, &api_secret);
+    let room_service =
+        RoomClient::with_api_key("https://call.tensamin.net/", &api_key, &api_secret);
 
     let rooms = match room_service.list_rooms(Vec::new()).await {
         Ok(rooms) => rooms,

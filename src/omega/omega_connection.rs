@@ -11,23 +11,23 @@ use once_cell::sync::Lazy;
 use std::{collections::HashMap, env, sync::Arc, time::Duration};
 use tokio::{
     net::TcpStream,
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, mpsc},
     time::{Instant, sleep},
 };
 use tokio_native_tls::TlsStream;
 use uuid::Uuid;
 
+use crate::log_err;
 use crate::{
-    auth::crypto_helper::decrypt,
     data::{
         communication::{CommunicationType, CommunicationValue, DataTypes},
         user::UserStatus,
     },
     get_private_key, log, log_in, log_out,
     rho::rho_manager::{self, RHO_CONNECTIONS},
+    util::crypto_helper::{decrypt, load_public_key},
     util::logger::PrintType,
 };
-use crate::{auth::crypto_helper::secret_key_to_base64, log_err};
 
 pub static WAITING_TASKS: Lazy<
     DashMap<Uuid, Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>>,
@@ -163,9 +163,11 @@ impl OmegaConnection {
                                                     .to_string()
                                             })?;
 
+                                        let server_pub_key_obj = load_public_key(server_pub_key).ok_or("Failed to load public key".to_string())?;
+
                                         let decrypted_challenge = decrypt(
-                                            &secret_key_to_base64(&get_private_key()),
-                                            server_pub_key,
+                                            get_private_key(),
+                                            server_pub_key_obj,
                                             challenge,
                                         )
                                         .map_err(|e| {
@@ -192,6 +194,16 @@ impl OmegaConnection {
                                                         PrintType::Omega,
                                                         "Expected identification_response, got something else.",
                                                     );
+                                                    return false;
+                                                }
+
+                                                if let Some(accepted) = final_cv.get_data(DataTypes::accepted).and_then(|v| v.as_bool()) {
+                                                    if !accepted {
+                                                        log_err!(PrintType::Omega, "Omega did not accept identification.");
+                                                        return false;
+                                                    }
+                                                } else {
+                                                    log_err!(PrintType::Omega, "Omega response did not contain 'accepted' field.");
                                                     return false;
                                                 }
 
@@ -398,5 +410,48 @@ impl OmegaConnection {
 
     async fn send_global(cv: CommunicationValue) {
         OMEGA_CONNECTION.send_message(&cv).await;
+    }
+
+    pub async fn await_response(
+        &self,
+        cv: &CommunicationValue,
+        timeout_duration: Option<Duration>,
+    ) -> Result<CommunicationValue, String> {
+        let (tx, mut rx) = mpsc::channel(1);
+        let msg_id = cv.get_id();
+
+        let task_tx = tx.clone();
+        WAITING_TASKS.insert(
+            msg_id,
+            Box::new(move |_, response_cv| {
+                let inner_tx = task_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = inner_tx.send(response_cv).await {
+                        log_err!(
+                            PrintType::Omega,
+                            "Failed to send response back to awaiter: {}",
+                            e
+                        );
+                    }
+                });
+                true
+            }),
+        );
+
+        self.send_message(cv).await;
+
+        let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
+
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(response_cv)) => Ok(response_cv),
+            Ok(None) => Err("Failed to receive response, channel was closed.".to_string()),
+            Err(_) => {
+                WAITING_TASKS.remove(&msg_id);
+                Err(format!(
+                    "Request timed out after {} seconds.",
+                    timeout.as_secs()
+                ))
+            }
+        }
     }
 }
