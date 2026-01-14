@@ -236,6 +236,8 @@ impl IotaConnection {
             } else {
                 self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
                     .await;
+                self.close().await;
+                return;
             }
 
             return;
@@ -294,6 +296,11 @@ impl IotaConnection {
                     .add_data(DataTypes::iota_id, JsonValue::from(new_iota_id));
 
                 iota_conn_for_task.send_message(&success_msg).await;
+            } else {
+                iota_conn_for_task
+                    .send_error_response(&cv.get_id(), CommunicationType::error_internal)
+                    .await;
+                iota_conn_for_task.close().await;
             }
             return;
         }
