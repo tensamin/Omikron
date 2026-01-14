@@ -33,10 +33,6 @@ pub static WAITING_TASKS: Lazy<
     DashMap<Uuid, Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>>,
 > = Lazy::new(DashMap::new);
 
-static GENERIC_TASK: Lazy<
-    Mutex<Option<Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>>>,
-> = Lazy::new(|| Mutex::new(None));
-
 static OMEGA_CONNECTION: Lazy<Arc<OmegaConnection>> = Lazy::new(|| {
     let conn = Arc::new(OmegaConnection::new());
     let conn_clone = conn.clone();
@@ -311,24 +307,17 @@ impl OmegaConnection {
                         continue;
                     }
                     let msg_id = cv.get_id();
-                    log_in!(PrintType::Omikron, "{}", &cv.to_json().to_string());
+                    log_in!(PrintType::Omega, "{}", &cv.to_json().to_string());
                     // Handle waiting tasks
                     if let Some(task) = WAITING_TASKS.remove(&msg_id) {
                         if (task.1)(self.clone(), cv.clone()) {
-                            // continue in the read_loop
+                            continue;
                         }
                     } else {
-                        // Handle generic task
-                        let generic_task_option = GENERIC_TASK.lock().await;
-                        if let Some(generic_task) = generic_task_option.as_ref() {
-                            if generic_task(self.clone(), cv.clone()) {
-                                // continue in the read_loop
-                            }
-                        }
                     }
                 }
                 #[allow(non_snake_case)]
-                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Close(_))) | None => continue,
                 Some(Err(_)) => break,
                 _ => {}
             }

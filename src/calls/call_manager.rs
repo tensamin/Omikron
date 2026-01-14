@@ -94,23 +94,9 @@ pub fn garbage_collect_calls() {
     });
 }
 pub async fn clean_calls() {
-    let api_key = match env::var("LIVEKIT_API_KEY") {
-        Ok(key) => key,
-        Err(_) => {
-            log_err!(PrintType::General, "LIVEKIT_API_KEY not set!");
-            return;
-        }
-    };
-    let api_secret = match env::var("LIVEKIT_API_SECRET") {
-        Ok(secret) => secret,
-        Err(_) => {
-            log_err!(PrintType::General, "LIVEKIT_API_SECRET not set!");
-            return;
-        }
-    };
-    let room_service =
-        RoomClient::with_api_key("https://call.tensamin.net/", &api_key, &api_secret);
-
+    let room_service = RoomClient::new("https://call.tensamin.net").unwrap();
+    let rooms = room_service.list_rooms(Vec::new()).await.unwrap();
+    log!(PrintType::General, "{:?}", rooms);
     let rooms = match room_service.list_rooms(Vec::new()).await {
         Ok(rooms) => rooms,
         Err(e) => {
