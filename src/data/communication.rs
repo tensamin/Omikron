@@ -250,6 +250,7 @@ pub enum CommunicationType {
 
     get_user_data,
     get_iota_data,
+    iota_user_data,
 
     change_user_data,
     change_iota_data,
@@ -342,6 +343,7 @@ impl CommunicationType {
 
             "getuserdata" => CommunicationType::get_user_data,
             "getiotadata" => CommunicationType::get_iota_data,
+            "iotauserdata" => CommunicationType::iota_user_data,
 
             "changeuserdata" => CommunicationType::change_user_data,
             "changeiotadata" => CommunicationType::change_iota_data,
@@ -362,11 +364,11 @@ impl CommunicationType {
 
 #[derive(Debug, Clone)]
 pub struct CommunicationValue {
-    pub id: Uuid,
-    pub comm_type: CommunicationType,
-    pub sender: i64,
-    pub receiver: i64,
-    pub data: HashMap<DataTypes, JsonValue>,
+    id: Uuid,
+    comm_type: CommunicationType,
+    sender: i64,
+    receiver: i64,
+    data: HashMap<DataTypes, JsonValue>,
 }
 
 #[allow(dead_code)]
@@ -421,7 +423,10 @@ impl CommunicationValue {
         self.data.get(&key)
     }
 
-    pub(crate) fn is_type(&self, p0: CommunicationType) -> bool {
+    pub fn get_type(&self) -> CommunicationType {
+        self.comm_type.clone()
+    }
+    pub fn is_type(&self, p0: CommunicationType) -> bool {
         self.comm_type == p0
     }
     pub fn to_json(&self) -> JsonValue {

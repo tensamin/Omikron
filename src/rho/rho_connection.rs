@@ -24,9 +24,6 @@ impl RhoConnection {
             client_connections: Arc::new(RwLock::new(Vec::new())),
         };
 
-        // Notify OmegaConnection about the new Iota
-        OmegaConnection::connect_iota(rho_connection.get_iota_id().await, user_ids).await;
-
         rho_connection
     }
 
@@ -126,7 +123,7 @@ impl RhoConnection {
     pub async fn message_to_client(&self, cv: CommunicationValue) {
         let connections = self.client_connections.read().await;
         for connection in connections.iter() {
-            if connection.get_user_id().await == cv.receiver {
+            if connection.get_user_id().await == cv.get_receiver() {
                 connection.send_message(&cv).await;
             }
         }

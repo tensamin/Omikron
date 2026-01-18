@@ -1,7 +1,11 @@
 use async_tungstenite::tungstenite::Message;
 use async_tungstenite::{WebSocketReceiver, WebSocketSender};
+use json::JsonValue;
 use json::number::Number;
+use rand::Rng;
+use rand::distributions::Alphanumeric;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_util::compat::Compat;
 use tungstenite::Utf8Bytes;
@@ -10,6 +14,8 @@ use uuid::Uuid;
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::calls::call_manager;
 use crate::omega::omega_connection::{WAITING_TASKS, get_omega_connection};
+use crate::util::crypto_helper::{load_public_key, public_key_to_base64};
+use crate::util::crypto_util::{DataFormat, SecurePayload};
 use crate::util::logger::PrintType;
 use crate::{
     // calls::call_manager::CallManager,
@@ -19,22 +25,18 @@ use crate::{
     },
     omega::omega_connection::OmegaConnection,
 };
-use crate::{log_in, log_out};
+use crate::{get_private_key, get_public_key, log_in, log_out};
 
-/// ClientConnection represents a WebSocket connection from a client device
 pub struct ClientConnection {
-    /// WebSocket session
     pub sender: Arc<RwLock<WebSocketSender<Compat<tokio::net::TcpStream>>>>,
     pub receiver: Arc<RwLock<WebSocketReceiver<Compat<tokio::net::TcpStream>>>>,
-    /// User ID associated with this client
     pub user_id: Arc<RwLock<i64>>,
-    /// Whether this connection has been identified/authenticated
-    pub identified: Arc<RwLock<bool>>,
-    /// Ping latency tracking
+    identified: Arc<RwLock<bool>>,
+    challenged: Arc<RwLock<bool>>,
+    challenge: Arc<RwLock<String>>,
     pub ping: Arc<RwLock<i64>>,
-    /// Weak reference to RhoConnection to avoid circular references
-    pub rho_connection: Arc<RwLock<Option<Weak<RhoConnection>>>>,
-    /// List of user IDs this client is interested in receiving updates about
+    pub_key: Arc<RwLock<Option<Vec<u8>>>>,
+    pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     pub interested_users: Arc<RwLock<Vec<i64>>>,
 }
 
@@ -49,7 +51,10 @@ impl ClientConnection {
             receiver: Arc::new(RwLock::new(receiver)),
             user_id: Arc::new(RwLock::new(0)),
             identified: Arc::new(RwLock::new(false)),
+            challenged: Arc::new(RwLock::new(false)),
+            challenge: Arc::new(RwLock::new(String::new())),
             ping: Arc::new(RwLock::new(-1)),
+            pub_key: Arc::new(RwLock::new(None)),
             rho_connection: Arc::new(RwLock::new(None)),
             interested_users: Arc::new(RwLock::new(Vec::new())),
         })
@@ -70,20 +75,9 @@ impl ClientConnection {
         *self.ping.read().await
     }
 
-    /// Set the RhoConnection reference
-    pub async fn set_rho_connection(&self, rho_connection: Weak<RhoConnection>) {
-        let mut rho_ref = self.rho_connection.write().await;
-        *rho_ref = Some(rho_connection);
-    }
-
     /// Get RhoConnection if available
     pub async fn get_rho_connection(&self) -> Option<Arc<RhoConnection>> {
-        let rho_ref = self.rho_connection.read().await;
-        if let Some(weak_ref) = rho_ref.as_ref() {
-            weak_ref.upgrade()
-        } else {
-            None
-        }
+        self.rho_connection.read().await.clone()
     }
 
     /// Send a string message to the client
@@ -109,14 +103,156 @@ impl ClientConnection {
     pub async fn handle_message(self: Arc<Self>, message: Utf8Bytes) {
         tokio::spawn(async move {
             let cv = CommunicationValue::from_json(&message);
+            if cv.is_type(CommunicationType::ping) {
+                self.handle_ping(cv).await;
+                return;
+            }
+            log_in!(PrintType::Client, "{}", &cv.to_json().to_string());
+            let identified = *self.identified.read().await;
+            let challenged = *self.challenged.read().await;
 
             // Handle identification
-            if cv.is_type(CommunicationType::identification) && !self.is_identified().await {
-                self.handle_identification(Arc::clone(&self), cv).await;
+            if !identified && cv.is_type(CommunicationType::identification) {
+                let user_id = cv
+                    .get_data(DataTypes::user_id)
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                if user_id == 0 {
+                    log_out!(PrintType::Client, "Invalid USER ID");
+                    self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
+                        .await;
+                    self.close().await;
+                    return;
+                }
+
+                *self.user_id.write().await = user_id;
+
+                let get_pub_key_msg = CommunicationValue::new(CommunicationType::get_user_data)
+                    .with_id(cv.get_id())
+                    .add_data(DataTypes::user_id, JsonValue::from(user_id));
+
+                let response_cv = get_omega_connection()
+                    .await_response(&get_pub_key_msg, Some(Duration::from_secs(20)))
+                    .await;
+
+                if let Ok(response_cv) = response_cv {
+                    if !response_cv.is_type(CommunicationType::get_user_data) {
+                        self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
+                            .await;
+                        self.close().await;
+                        return;
+                    }
+
+                    let base64_pub = response_cv
+                        .get_data(DataTypes::public_key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    let pub_key = match load_public_key(base64_pub) {
+                        Some(pk) => pk,
+                        None => {
+                            self.send_error_response(
+                                &cv.get_id(),
+                                CommunicationType::error_invalid_public_key,
+                            )
+                            .await;
+                            self.close().await;
+                            return;
+                        }
+                    };
+
+                    *self.pub_key.write().await = Some(pub_key.as_bytes().to_vec());
+
+                    let challenge: String = rand::thread_rng()
+                        .sample_iter(&Alphanumeric)
+                        .take(32)
+                        .map(char::from)
+                        .collect();
+
+                    *self.challenge.write().await = challenge.clone();
+
+                    let encrypted_challenge =
+                        SecurePayload::new(challenge, DataFormat::Raw, get_private_key())
+                            .unwrap()
+                            .encrypt_x448(pub_key)
+                            .unwrap()
+                            .export(DataFormat::Base64);
+
+                    *self.identified.write().await = true;
+
+                    let challenge_msg = CommunicationValue::new(CommunicationType::challenge)
+                        .with_id(cv.get_id())
+                        .add_data_str(
+                            DataTypes::public_key,
+                            public_key_to_base64(&get_public_key()),
+                        )
+                        .add_data_str(DataTypes::challenge, encrypted_challenge);
+
+                    self.send_message(&challenge_msg).await;
+                } else {
+                    self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
+                        .await;
+                    self.close().await;
+                    return;
+                }
+
+                return;
+            }
+
+            if identified && !challenged && cv.is_type(CommunicationType::challenge_response) {
+                let client_response = cv
+                    .get_data(DataTypes::challenge)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                if client_response == *self.challenge.read().await {
+                    *self.challenged.write().await = true;
+
+                    let user_id = self.get_user_id().await;
+
+                    let rho_connection = match rho_manager::get_rho_con_for_user(user_id).await {
+                        Some(rho) => rho,
+                        None => {
+                            self.send_error_response(
+                                &cv.get_id(),
+                                CommunicationType::error_no_iota,
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+
+                    // Set identification data
+                    {
+                        let mut user_id_guard = self.user_id.write().await;
+                        *user_id_guard = user_id;
+                    }
+                    {
+                        let mut identified_guard = self.identified.write().await;
+                        *identified_guard = true;
+                    }
+                    *self.rho_connection.write().await = Some(Arc::clone(&rho_connection));
+
+                    let response =
+                        CommunicationValue::new(CommunicationType::identification_response)
+                            .with_id(cv.get_id());
+                    self.send_message(&response).await;
+                } else {
+                    self.send_error_response(
+                        &cv.get_id(),
+                        CommunicationType::error_not_authenticated,
+                    )
+                    .await;
+                    self.close().await;
+                    return;
+                }
                 return;
             }
 
             if !self.is_identified().await {
+                self.send_error_response(&cv.get_id(), CommunicationType::error_not_authenticated)
+                    .await;
+                self.close().await;
                 return;
             }
 
@@ -172,71 +308,6 @@ impl ClientConnection {
         get_omega_connection()
             .send_message(&cv.with_sender(*self.user_id.read().await))
             .await;
-    }
-
-    /// Handle identification message
-    async fn handle_identification(&self, sarc: Arc<ClientConnection>, cv: CommunicationValue) {
-        // Extract user ID
-        let user_id: i64 = match cv.get_data(DataTypes::user_id) {
-            Some(id_str) => id_str.as_i64().unwrap_or(0),
-            None => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_user_id)
-                    .await;
-                return;
-            }
-        };
-
-        // Validate private key
-        if let Some(private_key_hash) = cv.get_data(DataTypes::private_key_hash) {
-            println!("private_key_hash: {}", private_key_hash);
-            let is_valid = true; // NO VALIDATION,
-            // SWAP TO AUTH VIA CHALLENGE
-            // auth_connector::is_private_key_valid(user_id, &private_key_hash.to_string()).await;
-
-            if !is_valid {
-                println!("Invalid private key");
-                self.send_error_response(
-                    &cv.get_id(),
-                    CommunicationType::error_invalid_private_key,
-                )
-                .await;
-                return;
-            }
-        } else {
-            log_in!(PrintType::Client, "Missing private key");
-            self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_private_key)
-                .await;
-            return;
-        }
-
-        // Find RhoConnection for this user
-        let rho_connection = match rho_manager::get_rho_con_for_user(user_id).await {
-            Some(rho) => rho,
-            None => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error_no_iota)
-                    .await;
-                return;
-            }
-        };
-
-        // Set identification data
-        {
-            let mut user_id_guard = self.user_id.write().await;
-            *user_id_guard = user_id;
-        }
-        {
-            let mut identified_guard = self.identified.write().await;
-            *identified_guard = true;
-        }
-
-        self.set_rho_connection(Arc::downgrade(&rho_connection))
-            .await;
-
-        rho_connection.add_client_connection(Arc::from(sarc)).await;
-
-        let response = CommunicationValue::new(CommunicationType::identification_response)
-            .with_id(cv.get_id());
-        self.send_message(&response).await;
     }
 
     /// Handle ping message
@@ -451,7 +522,10 @@ impl Clone for ClientConnection {
             receiver: Arc::clone(&self.receiver),
             user_id: Arc::clone(&self.user_id),
             identified: Arc::clone(&self.identified),
+            challenged: Arc::clone(&self.challenged),
+            challenge: Arc::clone(&self.challenge),
             ping: Arc::clone(&self.ping),
+            pub_key: Arc::clone(&self.pub_key),
             rho_connection: Arc::clone(&self.rho_connection),
             interested_users: Arc::clone(&self.interested_users),
         }

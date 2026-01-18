@@ -8,15 +8,7 @@ use dashmap::DashMap;
 use futures::prelude::*;
 use json::{JsonValue, number::Number};
 use once_cell::sync::Lazy;
-use std::{
-    collections::HashMap,
-    env,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, env, sync::Arc, time::Duration};
 use tokio::{
     net::TcpStream,
     sync::{Mutex, RwLock, mpsc},
@@ -32,30 +24,21 @@ use crate::{
     },
     get_private_key, log, log_in, log_out,
     rho::rho_manager::{self, RHO_CONNECTIONS},
-    util::crypto_helper::{decrypt, load_public_key},
+    util::crypto_helper::{decrypt_b64, secret_key_to_base64},
     util::logger::PrintType,
 };
-use crate::{log_err, util::crypto_helper::secret_key_to_base64};
+use crate::{log_err, util::crypto_helper::load_public_key};
 
 pub static WAITING_TASKS: Lazy<
     DashMap<Uuid, Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>>,
 > = Lazy::new(DashMap::new);
 
-/// Flag to ensure the connection loop is only started once.
-static CONNECTION_LOOP_STARTED: AtomicBool = AtomicBool::new(false);
-
-static GENERIC_TASK: Lazy<
-    Mutex<Option<Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>>>,
-> = Lazy::new(|| Mutex::new(None));
-
 static OMEGA_CONNECTION: Lazy<Arc<OmegaConnection>> = Lazy::new(|| {
     let conn = Arc::new(OmegaConnection::new());
-    if !CONNECTION_LOOP_STARTED.swap(true, Ordering::SeqCst) {
-        let conn_clone = conn.clone();
-        tokio::spawn(async move {
-            conn_clone.connect_internal(0).await;
-        });
-    }
+    let conn_clone = conn.clone();
+    tokio::spawn(async move {
+        conn_clone.connect_internal(0).await;
+    });
     conn
 });
 
@@ -102,12 +85,10 @@ impl OmegaConnection {
         }
     }
     pub fn connect(self: Arc<OmegaConnection>) {
-        if !CONNECTION_LOOP_STARTED.swap(true, Ordering::SeqCst) {
-            let cloned_self = self.clone();
-            tokio::spawn(async move {
-                cloned_self.connect_internal(0).await;
-            });
-        }
+        let cloned_self = self.clone();
+        tokio::spawn(async move {
+            cloned_self.connect_internal(0).await;
+        });
     }
     async fn connect_internal(self: Arc<OmegaConnection>, mut retry: usize) {
         loop {
@@ -178,11 +159,11 @@ impl OmegaConnection {
                                                     .to_string()
                                             })?;
 
-                                        let server_pub_key_obj = load_public_key(server_pub_key).ok_or("Failed to load public key".to_string())?;
+                                        let server_pub_key_obj = load_public_key(server_pub_key).unwrap();
 
-                                        let decrypted_challenge = decrypt(
-                                            get_private_key(),
-                                            server_pub_key_obj,
+                                        let decrypted_challenge = decrypt_b64(
+                                            &secret_key_to_base64(&get_private_key()),
+                                            server_pub_key,
                                             challenge,
                                         )
                                         .map_err(|e| {
@@ -209,6 +190,16 @@ impl OmegaConnection {
                                                         PrintType::Omega,
                                                         "Expected identification_response, got something else.",
                                                     );
+                                                    return false;
+                                                }
+
+                                                if let Some(accepted) = final_cv.get_data(DataTypes::accepted).and_then(|v| v.as_bool()) {
+                                                    if !accepted {
+                                                        log_err!(PrintType::Omega, "Omega did not accept identification.");
+                                                        return false;
+                                                    }
+                                                } else {
+                                                    log_err!(PrintType::Omega, "Omega response did not contain 'accepted' field.");
                                                     return false;
                                                 }
 
@@ -316,24 +307,17 @@ impl OmegaConnection {
                         continue;
                     }
                     let msg_id = cv.get_id();
-                    log_in!(PrintType::Omikron, "{}", &cv.to_json().to_string());
+                    log_in!(PrintType::Omega, "{}", &cv.to_json().to_string());
                     // Handle waiting tasks
                     if let Some(task) = WAITING_TASKS.remove(&msg_id) {
                         if (task.1)(self.clone(), cv.clone()) {
-                            // continue in the read_loop
+                            continue;
                         }
                     } else {
-                        // Handle generic task
-                        let generic_task_option = GENERIC_TASK.lock().await;
-                        if let Some(generic_task) = generic_task_option.as_ref() {
-                            if generic_task(self.clone(), cv.clone()) {
-                                // continue in the read_loop
-                            }
-                        }
                     }
                 }
                 #[allow(non_snake_case)]
-                Some(Ok(Message::Close(_))) | None => break,
+                Some(Ok(Message::Close(_))) | None => continue,
                 Some(Err(_)) => break,
                 _ => {}
             }
