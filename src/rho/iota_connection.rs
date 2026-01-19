@@ -2,12 +2,12 @@ use crate::calls::call_group::CallGroup;
 use crate::calls::call_manager;
 use crate::get_private_key;
 use crate::get_public_key;
+use crate::log;
 use crate::log_err;
 use crate::log_in;
 use crate::log_out;
 use crate::omega::omega_connection::WAITING_TASKS;
 use crate::omega::omega_connection::get_omega_connection;
-use crate::util::crypto_helper::encrypt;
 use crate::util::crypto_helper::load_public_key;
 use crate::util::crypto_helper::public_key_to_base64;
 use crate::util::crypto_util::DataFormat;
@@ -30,7 +30,6 @@ use tokio::sync::mpsc;
 use tokio_util::compat::Compat;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
-use warp::filters::method::get;
 use x448::PublicKey;
 
 use super::{rho_connection::RhoConnection, rho_manager};
@@ -395,21 +394,19 @@ impl IotaConnection {
             self.close().await;
             return;
         }
+        // Handle GET_CHATS
+        if cv.is_type(CommunicationType::get_chats) {
+            self.handle_get_chats(cv).await;
+            return;
+        }
 
-        log_in!(PrintType::Iota, "{}", &cv.to_json().to_string());
         // Handle forwarding to other Iotas or clients
         let receiver_id = cv.get_receiver();
-        if !self.get_user_ids().await.contains(&receiver_id)
+        if (receiver_id != 0 && !self.get_user_ids().await.contains(&receiver_id))
             || cv.is_type(CommunicationType::message_other_iota)
             || cv.is_type(CommunicationType::send_chat)
         {
             self.handle_forward_message(cv).await;
-            return;
-        }
-
-        // Handle GET_CHATS
-        if cv.is_type(CommunicationType::get_chats) {
-            self.handle_get_chats(cv).await;
             return;
         }
 
@@ -510,6 +507,7 @@ impl IotaConnection {
         let receiver_id = cv.get_receiver();
         let mut interested_ids: Vec<i64> = Vec::new();
 
+        // loading Calls
         let calls: Vec<Arc<CallGroup>> = call_manager::get_call_groups(receiver_id).await;
         let mut invites: HashMap<i64, Vec<JsonValue>> = HashMap::new();
         let empty = &calls.is_empty();
@@ -543,8 +541,7 @@ impl IotaConnection {
                     for user_json in user_ids {
                         let user_id = user_json["user_id"].as_i64().unwrap_or(0);
                         interested_ids.push(user_id);
-                        let mut enriched_contact = JsonValue::new_object();
-                        let _ = enriched_contact.insert("user_id", user_id);
+                        let mut enriched_contact = user_json.clone();
                         if let Some(calls) = invites.get(&user_id) {
                             let _ =
                                 enriched_contact.insert("calls", JsonValue::Array(calls.clone()));
@@ -575,8 +572,9 @@ impl IotaConnection {
     async fn forward_to_client(&self, cv: CommunicationValue) {
         if let Some(rho_conn) = self.get_rho_connection().await {
             let updated_cv = cv.with_sender(self.get_iota_id().await);
-            let _receiver_id = updated_cv.get_receiver();
             rho_conn.message_to_client(updated_cv).await;
+        } else {
+            log_err!(PrintType::General, "Failed to forward message to client");
         }
     }
 

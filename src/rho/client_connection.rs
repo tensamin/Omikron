@@ -4,7 +4,7 @@ use json::JsonValue;
 use json::number::Number;
 use rand::Rng;
 use rand::distributions::Alphanumeric;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio_util::compat::Compat;
@@ -38,6 +38,7 @@ pub struct ClientConnection {
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     pub interested_users: Arc<RwLock<Vec<i64>>>,
+    is_open: Arc<RwLock<bool>>,
 }
 
 impl ClientConnection {
@@ -57,6 +58,7 @@ impl ClientConnection {
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: Arc::new(RwLock::new(None)),
             interested_users: Arc::new(RwLock::new(Vec::new())),
+            is_open: Arc::new(RwLock::new(true)),
         })
     }
 
@@ -81,7 +83,7 @@ impl ClientConnection {
     }
 
     /// Send a string message to the client
-    pub async fn send_message_str(&self, message: &str) {
+    pub async fn send_message_str(self: Arc<Self>, message: &str) {
         let mut session = self.sender.write().await;
         if let Err(e) = session
             .send(Message::Text(Utf8Bytes::from(message.to_string())))
@@ -92,7 +94,14 @@ impl ClientConnection {
     }
 
     /// Send a CommunicationValue to the client
-    pub async fn send_message(&self, cv: &CommunicationValue) {
+    pub async fn send_message(self: Arc<Self>, cv: &CommunicationValue) {
+        if !*self.is_open.read().await {
+            log_out!(
+                PrintType::Client,
+                "Attempted to send message to a closed connection."
+            );
+            return;
+        }
         if !cv.is_type(CommunicationType::pong) {
             log_out!(PrintType::Client, "{}", &cv.to_json().to_string());
         }
@@ -119,7 +128,8 @@ impl ClientConnection {
                     .unwrap_or(0);
                 if user_id == 0 {
                     log_out!(PrintType::Client, "Invalid USER ID");
-                    self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
+                    self.clone()
+                        .send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
                         .await;
                     self.close().await;
                     return;
@@ -137,7 +147,8 @@ impl ClientConnection {
 
                 if let Ok(response_cv) = response_cv {
                     if !response_cv.is_type(CommunicationType::get_user_data) {
-                        self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
+                        self.clone()
+                            .send_error_response(&cv.get_id(), CommunicationType::error_internal)
                             .await;
                         self.close().await;
                         return;
@@ -151,11 +162,12 @@ impl ClientConnection {
                     let pub_key = match load_public_key(base64_pub) {
                         Some(pk) => pk,
                         None => {
-                            self.send_error_response(
-                                &cv.get_id(),
-                                CommunicationType::error_invalid_public_key,
-                            )
-                            .await;
+                            self.clone()
+                                .send_error_response(
+                                    &cv.get_id(),
+                                    CommunicationType::error_invalid_public_key,
+                                )
+                                .await;
                             self.close().await;
                             return;
                         }
@@ -190,7 +202,8 @@ impl ClientConnection {
 
                     self.send_message(&challenge_msg).await;
                 } else {
-                    self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
+                    self.clone()
+                        .send_error_response(&cv.get_id(), CommunicationType::error_internal)
                         .await;
                     self.close().await;
                     return;
@@ -221,6 +234,7 @@ impl ClientConnection {
                             return;
                         }
                     };
+                    rho_connection.add_client_connection(self.clone()).await;
 
                     // Set identification data
                     {
@@ -238,11 +252,12 @@ impl ClientConnection {
                             .with_id(cv.get_id());
                     self.send_message(&response).await;
                 } else {
-                    self.send_error_response(
-                        &cv.get_id(),
-                        CommunicationType::error_not_authenticated,
-                    )
-                    .await;
+                    self.clone()
+                        .send_error_response(
+                            &cv.get_id(),
+                            CommunicationType::error_not_authenticated,
+                        )
+                        .await;
                     self.close().await;
                     return;
                 }
@@ -250,7 +265,8 @@ impl ClientConnection {
             }
 
             if !self.is_identified().await {
-                self.send_error_response(&cv.get_id(), CommunicationType::error_not_authenticated)
+                self.clone()
+                    .send_error_response(&cv.get_id(), CommunicationType::error_not_authenticated)
                     .await;
                 self.close().await;
                 return;
@@ -288,12 +304,11 @@ impl ClientConnection {
                 self.handle_omega_forward(cv).await;
                 return;
             }
-
             // Forward other messages to Iota
             self.forward_to_iota(cv).await;
         });
     }
-    async fn handle_omega_forward(&self, cv: CommunicationValue) {
+    async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
         let client_for_closure = self.clone();
         WAITING_TASKS.insert(
             cv.get_id(),
@@ -311,7 +326,7 @@ impl ClientConnection {
     }
 
     /// Handle ping message
-    async fn handle_ping(&self, cv: CommunicationValue) {
+    async fn handle_ping(self: Arc<Self>, cv: CommunicationValue) {
         // Update our ping if provided
         if let Some(last_ping) = cv.get_data(DataTypes::last_ping) {
             if let Ok(ping_val) = last_ping.to_string().parse::<i64>() {
@@ -336,7 +351,7 @@ impl ClientConnection {
     }
 
     /// Handle client status change
-    async fn handle_client_changed(&self, cv: CommunicationValue) {
+    async fn handle_client_changed(self: Arc<Self>, cv: CommunicationValue) {
         let user_id = self.get_user_id().await;
         if let Some(_status_str) = cv.get_data(DataTypes::user_state) {
             let user_status = UserStatus::online;
@@ -348,7 +363,7 @@ impl ClientConnection {
     }
 
     /// Handle call invite
-    async fn handle_call_invite(&self, cv: CommunicationValue) {
+    async fn handle_call_invite(self: Arc<Self>, cv: CommunicationValue) {
         let receiver_id: i64 = cv
             .get_data(DataTypes::receiver_id)
             .unwrap_or(&json::JsonValue::Number(Number::from(0)))
@@ -415,7 +430,7 @@ impl ClientConnection {
     }
 
     /// Handle get call request
-    async fn handle_get_call(&self, cv: CommunicationValue) {
+    async fn handle_get_call(self: Arc<Self>, cv: CommunicationValue) {
         let user_id = self.get_user_id().await;
 
         let call_id = match cv.get_data(DataTypes::call_id) {
@@ -446,22 +461,59 @@ impl ClientConnection {
             return;
         }
     }
-    async fn handle_call_timeout_user(&self, cv: CommunicationValue) {
+    async fn handle_call_timeout_user(self: Arc<Self>, cv: CommunicationValue) {
         let user_id = cv.get_data(DataTypes::call_id).unwrap();
         let call_id = cv.get_data(DataTypes::user_id).unwrap(); // JA man braucht CALL_ID
     }
-    async fn handle_call_disconnect_user(&self, cv: CommunicationValue) {
+    async fn handle_call_disconnect_user(self: Arc<Self>, cv: CommunicationValue) {
         let user_id = cv.get_data(DataTypes::call_id).unwrap();
         let call_id = cv.get_data(DataTypes::user_id).unwrap(); // JA man braucht CALL_ID
         let untill = cv.get_data(DataTypes::untill).unwrap();
     }
-    async fn handle_call_set_anonymous_joining(&self, cv: CommunicationValue) {
+    async fn handle_call_set_anonymous_joining(self: Arc<Self>, cv: CommunicationValue) {
         let call_id = cv.get_data(DataTypes::user_id).unwrap();
         let enable = cv.get_data(DataTypes::enable).unwrap();
     }
 
     /// Forward message to Iota
-    async fn forward_to_iota(&self, cv: CommunicationValue) {
+    async fn forward_to_iota(self: Arc<Self>, cv: CommunicationValue) {
+        if cv.is_type(CommunicationType::add_conversation)
+            && cv.get_data(DataTypes::chat_partner_id).is_none()
+        {
+            let chat_partner_name = cv
+                .get_data(DataTypes::chat_partner_name)
+                .unwrap_or(&JsonValue::Null)
+                .as_str()
+                .unwrap_or("");
+
+            let load_uuid_response = get_omega_connection()
+                .await_response(
+                    &CommunicationValue::new(CommunicationType::get_user_data)
+                        .with_id(cv.get_id())
+                        .add_data(DataTypes::username, JsonValue::from(chat_partner_name)),
+                    Some(Duration::from_secs(20)),
+                )
+                .await;
+            let chat_partner_id = {
+                if let Ok(load_uuid_response) = load_uuid_response {
+                    load_uuid_response
+                        .get_data(DataTypes::user_id)
+                        .unwrap_or(&JsonValue::Null)
+                        .clone()
+                } else {
+                    JsonValue::Null
+                }
+            };
+
+            if let Some(rho_conn) = self.get_rho_connection().await {
+                let updated_cv = cv
+                    .with_sender(self.get_user_id().await)
+                    .add_data(DataTypes::chat_partner_id, chat_partner_id);
+                rho_conn.message_to_iota(updated_cv).await;
+            }
+            return;
+        }
+
         if let Some(rho_conn) = self.get_rho_connection().await {
             let updated_cv = cv.with_sender(self.get_user_id().await);
             rho_conn.message_to_iota(updated_cv).await;
@@ -469,26 +521,40 @@ impl ClientConnection {
     }
 
     /// Send error response
-    async fn send_error_response(&self, message_id: &Uuid, error_type: CommunicationType) {
+    async fn send_error_response(
+        self: Arc<Self>,
+        message_id: &Uuid,
+        error_type: CommunicationType,
+    ) {
         let error = CommunicationValue::new(error_type).with_id(*message_id);
         self.send_message(&error).await;
     }
 
     /// Close the connection
     pub async fn close(&self) {
+        let mut is_open_guard = self.is_open.write().await;
+        if *is_open_guard {
+            return;
+        }
+        *is_open_guard = false;
+
         let mut session = self.sender.write().await;
         let _ = session.close(None).await;
     }
 
     /// Set interested users list
-    pub async fn set_interested_users(&self, interested_ids: Vec<i64>) {
+    pub async fn set_interested_users(self: Arc<Self>, interested_ids: Vec<i64>) {
         let mut interested_guard = self.interested_users.write().await;
         *interested_guard = interested_ids;
     }
+    pub async fn get_interested_users(self: Arc<Self>) -> Vec<i64> {
+        let interested_guard = self.interested_users.read().await;
+        interested_guard.clone()
+    }
 
     /// Check if interested in a user and send notification
-    pub async fn are_you_interested(&self, user: &User) {
-        let interested_guard = self.interested_users.read().await;
+    pub async fn are_you_interested(self: Arc<Self>, user: &User) {
+        let interested_guard = self.clone().get_interested_users().await;
         if interested_guard.contains(&user.user_id) {
             let notification = CommunicationValue::new(CommunicationType::client_changed)
                 .add_data_str(DataTypes::user_id, user.user_id.to_string())
@@ -528,16 +594,7 @@ impl Clone for ClientConnection {
             pub_key: Arc::clone(&self.pub_key),
             rho_connection: Arc::clone(&self.rho_connection),
             interested_users: Arc::clone(&self.interested_users),
+            is_open: Arc::clone(&self.is_open),
         }
-    }
-}
-
-impl std::fmt::Debug for ClientConnection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClientConnection")
-            .field("user_id", &"[async]")
-            .field("identified", &"[async]")
-            .field("ping", &"[async]")
-            .finish()
     }
 }

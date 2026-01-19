@@ -2,9 +2,11 @@ use json::number::Number;
 use json::{Array, JsonValue, object, parse};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+use strum::IntoEnumIterator;
+use strum_macros::EnumIter;
 use uuid::Uuid;
 
-#[derive(Eq, Hash, PartialEq, Clone, Debug)]
+#[derive(Eq, Hash, PartialEq, EnumIter, Clone, Debug)]
 #[allow(non_camel_case_types, dead_code)]
 pub enum DataTypes {
     error_type,
@@ -14,6 +16,7 @@ pub enum DataTypes {
     settings,
     settings_name,
     chat_partner_id,
+    chat_partner_name,
     iota_id,
     user_id,
     user_ids,
@@ -88,91 +91,21 @@ pub enum DataTypes {
 
 impl DataTypes {
     pub fn parse(p0: String) -> DataTypes {
-        let normalized = p0.to_lowercase().replace('_', "");
-
-        match normalized.as_str() {
-            "errortype" => DataTypes::error_type,
-            "chatpartnerid" => DataTypes::chat_partner_id,
-            "registerid" => DataTypes::register_id,
-            "uuid" => DataTypes::uuid,
-            "settings" => DataTypes::settings,
-            "settingsname" => DataTypes::settings_name,
-            "iotaid" => DataTypes::iota_id,
-            "userid" => DataTypes::user_id,
-            "userids" => DataTypes::user_ids,
-            "iotaids" => DataTypes::iota_ids,
-            "userstate" => DataTypes::user_state,
-            "userstates" => DataTypes::user_states,
-            "userpings" => DataTypes::user_pings,
-            "callstate" => DataTypes::call_state,
-            "screenshare" => DataTypes::screen_share,
-            "privatekeyhash" => DataTypes::private_key_hash,
-            "accepted" => DataTypes::accepted,
-            "acceptedprofiles" => DataTypes::accepted_profiles,
-            "deniedprofiles" => DataTypes::denied_profiles,
-            "content" => DataTypes::content,
-            "messages" => DataTypes::messages,
-            "sendtime" => DataTypes::send_time,
-            "gettime" => DataTypes::get_time,
-            "getvariant" => DataTypes::get_variant,
-            "sharedsecretown" => DataTypes::shared_secret_own,
-            "sharedsecretother" => DataTypes::shared_secret_other,
-            "sharedsecretsign" => DataTypes::shared_secret_sign,
-            "sharedsecret" => DataTypes::shared_secret,
-            "callid" => DataTypes::call_id,
-            "calltoken" => DataTypes::call_token,
-            "untill" => DataTypes::untill,
-            "enable" => DataTypes::enable,
-            "startdate" => DataTypes::start_date,
-            "enddate" => DataTypes::end_date,
-            "receiverid" => DataTypes::receiver_id,
-            "senderid" => DataTypes::sender_id,
-            "signature" => DataTypes::signature,
-            "signed" => DataTypes::signed,
-            "message" => DataTypes::message,
-            "lastping" => DataTypes::last_ping,
-            "pingiota" => DataTypes::ping_iota,
-            "pingclients" => DataTypes::ping_clients,
-            "matches" => DataTypes::matches,
-            "omikron" => DataTypes::omikron,
-            "offset" => DataTypes::offset,
-            "amount" => DataTypes::amount,
-            "position" => DataTypes::position,
-            "name" => DataTypes::name,
-            "path" => DataTypes::path,
-            "codec" => DataTypes::codec,
-            "function" => DataTypes::function,
-            "payload" => DataTypes::payload,
-            "result" => DataTypes::result,
-            "interactables" => DataTypes::interactables,
-            "wanttowatch" => DataTypes::want_to_watch,
-            "watcher" => DataTypes::watcher,
-            "createdat" => DataTypes::created_at,
-            "username" => DataTypes::username,
-            "display" => DataTypes::display,
-            "avatar" => DataTypes::avatar,
-            "about" => DataTypes::about,
-            "status" => DataTypes::status,
-            "publickey" => DataTypes::public_key,
-            "sublevel" => DataTypes::sub_level,
-            "subend" => DataTypes::sub_end,
-            "communityaddress" => DataTypes::community_address,
-            "challenge" => DataTypes::challenge,
-            "communitytitle" => DataTypes::community_title,
-            "communities" => DataTypes::communities,
-            "rhoconnections" => DataTypes::rho_connections,
-            "user" => DataTypes::user,
-            "onlinestatus" => DataTypes::online_status,
-            "omikronid" => DataTypes::omikron_id,
-            "omikronconnections" => DataTypes::omikron_connections,
-            "resettoken" => DataTypes::reset_token,
-            "newtoken" => DataTypes::new_token,
-            _ => DataTypes::error_type, // fallback if unknown
+        for datatype in DataTypes::iter() {
+            if datatype.to_string().to_lowercase().replace('_', "")
+                == p0.to_lowercase().replace('_', "")
+            {
+                return datatype;
+            }
         }
+        DataTypes::error_type
+    }
+    pub fn to_string(&self) -> String {
+        return format!("{:?}", self);
     }
 }
 
-#[derive(PartialEq, Clone, Debug)]
+#[derive(PartialEq, Clone, EnumIter, Debug)]
 #[allow(non_camel_case_types, dead_code)]
 pub enum CommunicationType {
     error,
@@ -218,7 +151,7 @@ pub enum CommunicationType {
     register_iota_success,
     ping,
     pong,
-    add_chat,
+    add_conversation,
     send_chat,
     client_changed,
     client_connected,
@@ -266,99 +199,17 @@ pub enum CommunicationType {
 }
 impl CommunicationType {
     pub fn parse(p0: String) -> CommunicationType {
-        let normalized = p0.to_lowercase().replace('_', "");
-
-        match normalized.as_str() {
-            "watchstream" => CommunicationType::watch_stream,
-            "calltoken" => CommunicationType::call_token,
-            "callinvite" => CommunicationType::call_invite,
-            "calldisconnectuser" => CommunicationType::call_disconnect_user,
-            "calltimeoutuser" => CommunicationType::call_timeout_user,
-            "callsetanonymousjoining" => CommunicationType::call_set_anonymous_joining,
-            "endcall" => CommunicationType::end_call,
-            "function" => CommunicationType::function,
-            "update" => CommunicationType::update,
-            "createuser" => CommunicationType::create_user,
-            "errorinternal" => CommunicationType::error_internal,
-            "errorinvaliddata" => CommunicationType::error_invalid_data,
-            "errorinvaliduserid" => CommunicationType::error_invalid_user_id,
-            "errorinvalidomikronid" => CommunicationType::error_invalid_omikron_id,
-            "errornotfound" => CommunicationType::error_not_found,
-            "errornotauthenticated" => CommunicationType::error_not_authenticated,
-            "errornoiota" => CommunicationType::error_no_iota,
-            "errorinvalidchallenge" => CommunicationType::error_invalid_challenge,
-            "errorinvalidpublickey" => CommunicationType::error_invalid_public_key,
-            "errorinvalidsecret" => CommunicationType::error_invalid_secret,
-            "errorinvalidprivatekey" => CommunicationType::error_invalid_private_key,
-            "errornouserid" => CommunicationType::error_no_user_id,
-            "errornocallid" => CommunicationType::error_no_call_id,
-            "errorinvalidcallid" => CommunicationType::error_invalid_call_id,
-            "success" => CommunicationType::success,
-            "settingssave" => CommunicationType::settings_save,
-            "settingsload" => CommunicationType::settings_load,
-            "settingslist" => CommunicationType::settings_list,
-            "message" => CommunicationType::message,
-            "messagesend" => CommunicationType::message_send,
-            "messagelive" => CommunicationType::message_live,
-            "messageotheriota" => CommunicationType::message_other_iota,
-            "messagechunk" => CommunicationType::message_chunk,
-            "messagesget" => CommunicationType::messages_get,
-            "changeconfirm" => CommunicationType::change_confirm,
-            "confirmreceive" => CommunicationType::confirm_receive,
-            "confirmread" => CommunicationType::confirm_read,
-            "getchats" => CommunicationType::get_chats,
-            "getstates" => CommunicationType::get_states,
-            "addcommunity" => CommunicationType::add_community,
-            "removecommunity" => CommunicationType::remove_community,
-            "getcommunities" => CommunicationType::get_communities,
-            "challenge" => CommunicationType::challenge,
-            "challengeresponse" => CommunicationType::challenge_response,
-            "register" => CommunicationType::register,
-            "registerresponse" => CommunicationType::register_response,
-            "identification" => CommunicationType::identification,
-            "identificationresponse" => CommunicationType::identification_response,
-            "registeriota" => CommunicationType::register_iota,
-            "registeriotasuccess" => CommunicationType::register_iota_success,
-            "ping" => CommunicationType::ping,
-            "pong" => CommunicationType::pong,
-            "addchat" => CommunicationType::add_chat,
-            "sendchat" => CommunicationType::send_chat,
-            "clientchanged" => CommunicationType::client_changed,
-            "clientconnected" => CommunicationType::client_connected,
-            "clientdisconnected" => CommunicationType::client_disconnected,
-            "clientclosed" => CommunicationType::client_closed,
-            "publickey" => CommunicationType::public_key,
-            "privatekey" => CommunicationType::private_key,
-            "webrtcsdp" => CommunicationType::webrtc_sdp,
-            "webrtcice" => CommunicationType::webrtc_ice,
-            "startstream" => CommunicationType::start_stream,
-            "endstream" => CommunicationType::end_stream,
-            "rhoupdate" => CommunicationType::rho_update,
-
-            "iotaconnected" => CommunicationType::iota_connected,
-            "iotadisconnected" => CommunicationType::iota_disconnected,
-            "userconnected" => CommunicationType::user_connected,
-            "userdisconnected" => CommunicationType::user_disconnected,
-            "syncclientiotastatus" => CommunicationType::sync_client_iota_status,
-
-            "getuserdata" => CommunicationType::get_user_data,
-            "getiotadata" => CommunicationType::get_iota_data,
-            "iotauserdata" => CommunicationType::iota_user_data,
-
-            "changeuserdata" => CommunicationType::change_user_data,
-            "changeiotadata" => CommunicationType::change_iota_data,
-
-            "getregister" => CommunicationType::get_register,
-            "completeregisteruser" => CommunicationType::complete_register_user,
-            "completeregisteriota" => CommunicationType::complete_register_iota,
-            "deleteuser" => CommunicationType::delete_user,
-            "deleteiota" => CommunicationType::delete_iota,
-
-            "startregister" => CommunicationType::start_register,
-            "completeregister" => CommunicationType::complete_register,
-
-            _ => CommunicationType::error,
+        for datatype in CommunicationType::iter() {
+            if datatype.to_string().to_lowercase().replace('_', "")
+                == p0.to_lowercase().replace('_', "")
+            {
+                return datatype;
+            }
         }
+        CommunicationType::error
+    }
+    pub fn to_string(&self) -> String {
+        return format!("{:?}", self);
     }
 }
 

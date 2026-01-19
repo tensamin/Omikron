@@ -1,9 +1,13 @@
 use super::{client_connection::ClientConnection, iota_connection::IotaConnection, rho_manager};
-use crate::data::{
-    communication::{CommunicationType, CommunicationValue, DataTypes},
-    user::UserStatus,
-};
 use crate::omega::omega_connection::OmegaConnection;
+use crate::util::logger::PrintType;
+use crate::{
+    data::{
+        communication::{CommunicationType, CommunicationValue, DataTypes},
+        user::UserStatus,
+    },
+    log,
+};
 use json::{JsonValue, number::Number};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -83,16 +87,12 @@ impl RhoConnection {
 
     /// Remove a client connection
     pub async fn close_client_connection(&self, connection: Arc<ClientConnection>) {
+        let target_user_id = connection.get_user_id().await;
         {
             let mut connections = self.client_connections.write().await;
-
-            let target_user_id = connection.get_user_id().await;
-
             connections.retain(|con| {
                 futures::executor::block_on(async { con.get_user_id().await != target_user_id })
             });
-
-            connections.push(Arc::clone(&connection));
         }
 
         // Notify OmegaConnection
@@ -122,9 +122,10 @@ impl RhoConnection {
     /// Send message from Iota to specific client
     pub async fn message_to_client(&self, cv: CommunicationValue) {
         let connections = self.client_connections.read().await;
+        let receiver_id = cv.get_receiver();
         for connection in connections.iter() {
-            if connection.get_user_id().await == cv.get_receiver() {
-                connection.send_message(&cv).await;
+            if connection.get_user_id().await == receiver_id {
+                connection.clone().send_message(&cv).await;
             }
         }
     }
@@ -141,6 +142,7 @@ impl RhoConnection {
             let conn_user_id = connection.get_user_id().await;
             if conn_user_id == user_id {
                 connection
+                    .clone()
                     .set_interested_users(interested_ids.clone())
                     .await;
                 break;
@@ -152,7 +154,7 @@ impl RhoConnection {
     pub async fn are_they_interested(&self, user: &crate::data::user::User) {
         let connections = self.client_connections.read().await;
         for connection in connections.iter() {
-            connection.are_you_interested(user).await;
+            connection.clone().are_you_interested(user).await;
         }
     }
 
