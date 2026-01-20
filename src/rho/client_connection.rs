@@ -273,12 +273,6 @@ impl ClientConnection {
                 return;
             }
 
-            // Handle ping
-            if cv.is_type(CommunicationType::ping) {
-                self.handle_ping(cv).await;
-                return;
-            }
-            log_in!(PrintType::Client, "{}", &cv.to_json().to_string());
             // Handle client status changes
             if cv.is_type(CommunicationType::client_changed) {
                 self.handle_client_changed(cv).await;
@@ -504,7 +498,11 @@ impl ClientConnection {
                 .unwrap()
                 .has_admin()
             {
-                call.get_caller(user_id).await.unwrap().set_timeout(untill);
+                call.get_caller(user_id)
+                    .await
+                    .unwrap()
+                    .set_timeout(untill)
+                    .await;
             }
         }
     }
@@ -543,12 +541,14 @@ impl ClientConnection {
         )
         .unwrap();
         let enable = cv
-            .get_data(DataTypes::enable)
+            .get_data(DataTypes::enabled)
             .unwrap_or(&JsonValue::Null)
             .as_bool()
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         let call = call_manager::get_call(call_id).await;
+
+        let mut short_link = None;
         if let Some(call) = call {
             if call
                 .get_caller(self.get_user_id().await)
@@ -558,7 +558,17 @@ impl ClientConnection {
             {
                 call.set_anonymous_joining(enable).await;
             }
+            short_link = call.get_short_link().await;
         }
+        let mut response_cv =
+            CommunicationValue::new(CommunicationType::call_set_anonymous_joining)
+                .with_id(cv.get_id())
+                .add_data(DataTypes::call_id, JsonValue::String(call_id.to_string()))
+                .add_data(DataTypes::enabled, JsonValue::Boolean(enable));
+        if let Some(short_link) = short_link {
+            response_cv = response_cv.add_data(DataTypes::link, JsonValue::String(short_link));
+        }
+        self.send_message(&response_cv).await;
     }
 
     /// Forward message to Iota

@@ -1,13 +1,9 @@
 use super::{client_connection::ClientConnection, iota_connection::IotaConnection, rho_manager};
-use crate::omega::omega_connection::OmegaConnection;
-use crate::util::logger::PrintType;
-use crate::{
-    data::{
-        communication::{CommunicationType, CommunicationValue, DataTypes},
-        user::UserStatus,
-    },
-    log,
+use crate::data::{
+    communication::{CommunicationType, CommunicationValue, DataTypes},
+    user::UserStatus,
 };
+use crate::omega::omega_connection::OmegaConnection;
 use json::{JsonValue, number::Number};
 use std::collections::HashMap;
 use std::sync::Arc;

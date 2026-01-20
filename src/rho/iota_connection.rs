@@ -2,7 +2,6 @@ use crate::calls::call_group::CallGroup;
 use crate::calls::call_manager;
 use crate::get_private_key;
 use crate::get_public_key;
-use crate::log;
 use crate::log_err;
 use crate::log_in;
 use crate::log_out;
@@ -514,22 +513,22 @@ impl IotaConnection {
         for call in calls {
             for inviter in call.members.read().await.iter() {
                 let call_self = call.get_caller(receiver_id).await.unwrap();
+                let admin = call_self.has_admin();
                 let inviter_id = inviter.user_id;
+                let timeout = *call_self.timeout.read().await;
+
+                let mut call_obj = JsonValue::new_object();
+                let _ = call_obj.insert("call_id", JsonValue::String(call.call_id.to_string()));
+                if timeout > 0 {
+                    let _ = call_obj.insert("timeout", JsonValue::from(timeout));
+                }
+                if admin {
+                    let _ = call_obj.insert("admin", JsonValue::Boolean(admin));
+                }
+
                 if let Some(call_ids) = invites.get_mut(&inviter_id) {
-                    let mut call_obj = JsonValue::new_object();
-                    let _ = call_obj.insert("call_id", JsonValue::String(call.call_id.to_string()));
-                    let timeout = *call_self.timeout.read().await;
-                    if timeout > 0 {
-                        let _ = call_obj.insert("timeout", JsonValue::from(timeout));
-                    }
                     call_ids.push(call_obj);
                 } else {
-                    let mut call_obj = JsonValue::new_object();
-                    let _ = call_obj.insert("call_id", JsonValue::String(call.call_id.to_string()));
-                    let timeout = *call_self.timeout.read().await;
-                    if timeout > 0 {
-                        let _ = call_obj.insert("timeout", JsonValue::from(timeout));
-                    }
                     invites.insert(inviter_id, vec![call_obj]);
                 }
             }

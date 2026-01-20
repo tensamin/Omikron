@@ -5,7 +5,6 @@ use aes_gcm::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STD};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
-use std::fmt;
 use x448::{PublicKey, Secret};
 
 // --- Custom Errors ---

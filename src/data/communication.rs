@@ -13,6 +13,9 @@ pub enum DataTypes {
     accepted_ids,
     uuid,
     register_id,
+
+    link,
+
     settings,
     settings_name,
     chat_partner_id,
@@ -42,7 +45,7 @@ pub enum DataTypes {
     call_id,
     call_token,
     untill,
-    enable,
+    enabled,
     start_date,
     end_date,
     receiver_id,
@@ -124,6 +127,9 @@ pub enum CommunicationType {
     error_no_call_id,
     error_invalid_call_id,
     success,
+
+    shorten_link,
+
     settings_save,
     settings_load,
     settings_list,

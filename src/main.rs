@@ -1,3 +1,4 @@
+mod anonymous_clients;
 mod calls;
 mod data;
 mod omega;
@@ -7,6 +8,7 @@ mod util;
 use async_tungstenite::accept_hdr_async;
 use dotenv::dotenv;
 use futures::StreamExt;
+use json::JsonValue;
 use once_cell::sync::Lazy;
 use std::{env, sync::Arc};
 use tokio::net::TcpListener;
@@ -14,7 +16,9 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use tungstenite::handshake::server::{Request, Response};
 
 use crate::{
+    anonymous_clients::anonymous_client_connection::AnonymousClientConnection,
     calls::call_manager::garbage_collect_calls,
+    data::communication::{CommunicationType, CommunicationValue, DataTypes},
     omega::omega_connection::OmegaConnection,
     rho::{client_connection::ClientConnection, iota_connection::IotaConnection},
     util::{
@@ -95,6 +99,39 @@ async fn main() {
                         }
                         None => {
                             log_in!(PrintType::Client, "Client stream ended");
+                            client_conn.handle_close().await;
+                            return;
+                        }
+                    }
+                }
+            } else if path == "/ws/anonymous_client/" {
+                log_in!(PrintType::Client, "New Anonymous Client connection");
+                let client_conn: Arc<AnonymousClientConnection> =
+                    Arc::from(AnonymousClientConnection::new(sender, receiver));
+                loop {
+                    let msg_result = {
+                        let mut session_lock = client_conn.receiver.write().await;
+                        session_lock.next().await
+                    };
+
+                    match msg_result {
+                        Some(Ok(msg)) => {
+                            if msg.is_text() {
+                                let text = msg.into_text().unwrap();
+                                client_conn.clone().handle_message(text).await;
+                            } else if msg.is_close() {
+                                log_in!(PrintType::Client, "Anonymous Client disconnected");
+                                client_conn.handle_close().await;
+                                return;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            log_err!(PrintType::Client, "WebSocket error: {}", e);
+                            client_conn.handle_close().await;
+                            return;
+                        }
+                        None => {
+                            log_in!(PrintType::Client, "Anonymous Client stream ended");
                             client_conn.handle_close().await;
                             return;
                         }

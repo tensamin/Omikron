@@ -50,6 +50,9 @@ pub async fn get_call_token(user_id: i64, call_id: Uuid) -> Option<String> {
             }
             return Some(member.create_token());
         }
+        if cg.is_anonymous().await {
+            return cg.create_anonymous_token(user_id).await;
+        }
         return None;
     }
 
