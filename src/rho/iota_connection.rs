@@ -513,14 +513,24 @@ impl IotaConnection {
         let empty = &calls.is_empty();
         for call in calls {
             for inviter in call.members.read().await.iter() {
+                let call_self = call.get_caller(receiver_id).await.unwrap();
                 let inviter_id = inviter.user_id;
                 if let Some(call_ids) = invites.get_mut(&inviter_id) {
-                    call_ids.push(JsonValue::String(call.call_id.to_string()));
+                    let mut call_obj = JsonValue::new_object();
+                    let _ = call_obj.insert("call_id", JsonValue::String(call.call_id.to_string()));
+                    let timeout = *call_self.timeout.read().await;
+                    if timeout > 0 {
+                        let _ = call_obj.insert("timeout", JsonValue::from(timeout));
+                    }
+                    call_ids.push(call_obj);
                 } else {
-                    invites.insert(
-                        inviter_id,
-                        vec![JsonValue::String(call.call_id.to_string())],
-                    );
+                    let mut call_obj = JsonValue::new_object();
+                    let _ = call_obj.insert("call_id", JsonValue::String(call.call_id.to_string()));
+                    let timeout = *call_self.timeout.read().await;
+                    if timeout > 0 {
+                        let _ = call_obj.insert("timeout", JsonValue::from(timeout));
+                    }
+                    invites.insert(inviter_id, vec![call_obj]);
                 }
             }
         }

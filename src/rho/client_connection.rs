@@ -4,6 +4,7 @@ use json::JsonValue;
 use json::number::Number;
 use rand::Rng;
 use rand::distributions::Alphanumeric;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -296,6 +297,21 @@ impl ClientConnection {
                 return;
             }
 
+            if cv.is_type(CommunicationType::call_disconnect_user) {
+                self.handle_call_disconnect_user(cv).await;
+                return;
+            }
+
+            if cv.is_type(CommunicationType::call_timeout_user) {
+                self.handle_call_timeout_user(cv).await;
+                return;
+            }
+
+            if cv.is_type(CommunicationType::call_set_anonymous_joining) {
+                self.handle_call_set_anonymous_joining(cv).await;
+                return;
+            }
+
             if cv.is_type(CommunicationType::change_user_data)
                 || cv.is_type(CommunicationType::get_user_data)
                 || cv.is_type(CommunicationType::get_iota_data)
@@ -462,17 +478,87 @@ impl ClientConnection {
         }
     }
     async fn handle_call_timeout_user(self: Arc<Self>, cv: CommunicationValue) {
-        let user_id = cv.get_data(DataTypes::call_id).unwrap();
-        let call_id = cv.get_data(DataTypes::user_id).unwrap(); // JA man braucht CALL_ID
+        let call_id = Uuid::from_str(
+            cv.get_data(DataTypes::call_id)
+                .unwrap_or(&JsonValue::Null)
+                .as_str()
+                .unwrap_or(""),
+        )
+        .unwrap();
+        let user_id = cv
+            .get_data(DataTypes::user_id)
+            .unwrap_or(&JsonValue::Null)
+            .as_i64()
+            .unwrap_or(0);
+        let untill = cv
+            .get_data(DataTypes::untill)
+            .unwrap_or(&JsonValue::Null)
+            .as_i64()
+            .unwrap_or(0);
+
+        let call = call_manager::get_call(call_id).await;
+        if let Some(call) = call {
+            if call
+                .get_caller(self.get_user_id().await)
+                .await
+                .unwrap()
+                .has_admin()
+            {
+                call.get_caller(user_id).await.unwrap().set_timeout(untill);
+            }
+        }
     }
     async fn handle_call_disconnect_user(self: Arc<Self>, cv: CommunicationValue) {
-        let user_id = cv.get_data(DataTypes::call_id).unwrap();
-        let call_id = cv.get_data(DataTypes::user_id).unwrap(); // JA man braucht CALL_ID
-        let untill = cv.get_data(DataTypes::untill).unwrap();
+        let call_id = Uuid::from_str(
+            cv.get_data(DataTypes::call_id)
+                .unwrap_or(&JsonValue::Null)
+                .as_str()
+                .unwrap_or(""),
+        )
+        .unwrap();
+        let user_id = cv
+            .get_data(DataTypes::user_id)
+            .unwrap_or(&JsonValue::Null)
+            .as_i64()
+            .unwrap_or(0);
+
+        let call = call_manager::get_call(call_id).await;
+        if let Some(call) = call {
+            if call
+                .get_caller(self.get_user_id().await)
+                .await
+                .unwrap()
+                .has_admin()
+            {
+                call.remove_caller(user_id).await;
+            }
+        }
     }
     async fn handle_call_set_anonymous_joining(self: Arc<Self>, cv: CommunicationValue) {
-        let call_id = cv.get_data(DataTypes::user_id).unwrap();
-        let enable = cv.get_data(DataTypes::enable).unwrap();
+        let call_id = Uuid::from_str(
+            cv.get_data(DataTypes::call_id)
+                .unwrap_or(&JsonValue::Null)
+                .as_str()
+                .unwrap_or(""),
+        )
+        .unwrap();
+        let enable = cv
+            .get_data(DataTypes::enable)
+            .unwrap_or(&JsonValue::Null)
+            .as_bool()
+            .unwrap_or(false);
+
+        let call = call_manager::get_call(call_id).await;
+        if let Some(call) = call {
+            if call
+                .get_caller(self.get_user_id().await)
+                .await
+                .unwrap()
+                .has_admin()
+            {
+                call.set_anonymous_joining(enable).await;
+            }
+        }
     }
 
     /// Forward message to Iota

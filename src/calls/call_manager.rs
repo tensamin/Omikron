@@ -1,6 +1,6 @@
 use livekit_api::services::room::RoomClient;
 use once_cell::sync::Lazy;
-use std::{env, str::FromStr, sync::Arc, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 
 use uuid::Uuid;
@@ -28,6 +28,11 @@ pub async fn get_call_groups(user_id: i64) -> Vec<Arc<CallGroup>> {
     call_groups
 }
 
+pub async fn get_call(call_id: Uuid) -> Option<Arc<CallGroup>> {
+    let call_groups = CALL_GROUPS.read().await;
+    call_groups.iter().find(|g| g.call_id == call_id).cloned()
+}
+
 pub async fn get_call_token(user_id: i64, call_id: Uuid) -> Option<String> {
     let existing_group = {
         let call_groups = CALL_GROUPS.read().await;
@@ -36,21 +41,16 @@ pub async fn get_call_token(user_id: i64, call_id: Uuid) -> Option<String> {
 
     // if the group exists
     if let Some(cg) = existing_group {
-        let members = cg.members.write().await;
+        let members = cg.members.read().await;
 
         // if the user is already a member
         if let Some(member) = members.iter().find(|m| m.user_id == user_id) {
+            if member.is_timeout().await {
+                return None;
+            }
             return Some(member.create_token());
         }
         return None;
-        /*
-        let new_caller = Arc::new(Caller::new(user_id, call_id, user_id));
-        let token = new_caller.create_token();
-
-        members.push(new_caller);
-
-        return Some(token);
-        */
     }
 
     let mut call_groups = CALL_GROUPS.write().await;
@@ -85,6 +85,7 @@ pub async fn add_invite(call_id: Uuid, inviter_id: i64, invitee_id: i64) -> bool
     }
     false
 }
+
 pub fn garbage_collect_calls() {
     tokio::spawn(async move {
         loop {
