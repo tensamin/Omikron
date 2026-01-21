@@ -112,6 +112,7 @@ impl DataTypes {
 #[allow(non_camel_case_types, dead_code)]
 pub enum CommunicationType {
     error,
+    error_anonymous,
     error_internal,
     error_invalid_data,
     error_invalid_user_id,

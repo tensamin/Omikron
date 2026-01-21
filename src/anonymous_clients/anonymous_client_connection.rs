@@ -71,6 +71,10 @@ impl AnonymousClientConnection {
         self.display_name.read().await.clone()
     }
 
+    pub async fn set_display_name(&self, display: String) {
+        *self.display_name.write().await = display;
+    }
+
     /// Get the avatar
     pub async fn get_avatar(&self) -> String {
         self.avatar.read().await.clone()
@@ -260,7 +264,14 @@ impl AnonymousClientConnection {
             }
 
             if cv.is_type(CommunicationType::change_user_data) {
-                // TODO
+                if let Some(display_name) = cv
+                    .get_data(DataTypes::display)
+                    .unwrap_or(&JsonValue::Null)
+                    .as_str()
+                {
+                    let _ = self.set_display_name(display_name.to_string()).await;
+                }
+
                 return;
             }
 

@@ -19,3 +19,18 @@ pub async fn remove_anonymous_user(user_id: i64) {
 pub async fn get_anonymous_user(user_id: i64) -> Option<Arc<AnonymousClientConnection>> {
     ANONYMOUS_USERS.get(&user_id).map(|c| c.clone())
 }
+
+pub async fn get_anonymous_user_by_name(
+    username: String,
+) -> Option<Arc<AnonymousClientConnection>> {
+    for user_conn in ANONYMOUS_USERS
+        .iter()
+        .map(|ref_multi| ref_multi.value().clone())
+    {
+        if user_conn.get_user_name().await == username {
+            return Some(user_conn);
+        }
+    }
+
+    return None;
+}

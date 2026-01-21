@@ -13,6 +13,7 @@ use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
 use super::{rho_connection::RhoConnection, rho_manager};
+use crate::anonymous_clients::anonymous_manager;
 use crate::calls::call_manager;
 use crate::omega::omega_connection::{WAITING_TASKS, get_omega_connection};
 use crate::util::crypto_helper::{load_public_key, public_key_to_base64};
@@ -305,6 +306,40 @@ impl ClientConnection {
                 self.handle_call_set_anonymous_joining(cv).await;
                 return;
             }
+            if cv.is_type(CommunicationType::get_user_data) {
+                if let Some(anonymous) = {
+                    if let Some(user_id) = cv
+                        .get_data(DataTypes::user_id)
+                        .unwrap_or(&JsonValue::Null)
+                        .as_i64()
+                    {
+                        anonymous_manager::get_anonymous_user(user_id).await
+                    } else if let Some(username) = cv
+                        .get_data(DataTypes::username)
+                        .unwrap_or(&JsonValue::Null)
+                        .as_str()
+                    {
+                        anonymous_manager::get_anonymous_user_by_name(username.to_string()).await
+                    } else {
+                        None
+                    }
+                } {
+                    let response = CommunicationValue::new(CommunicationType::get_user_data)
+                        .with_id(cv.get_id())
+                        .add_data_str(DataTypes::username, anonymous.get_user_name().await)
+                        .add_data(
+                            DataTypes::user_id,
+                            JsonValue::Number(Number::from(anonymous.get_user_id().await)),
+                        )
+                        .add_data_str(DataTypes::display, anonymous.get_display_name().await)
+                        .add_data_str(DataTypes::user_state, "online".to_string())
+                        .add_data_str(DataTypes::avatar, anonymous.get_avatar().await);
+
+                    self.send_message(&response).await;
+
+                    return;
+                }
+            }
 
             if cv.is_type(CommunicationType::change_user_data)
                 || cv.is_type(CommunicationType::get_user_data)
@@ -582,6 +617,15 @@ impl ClientConnection {
                 .as_str()
                 .unwrap_or("")
                 .to_string();
+
+            if anonymous_manager::get_anonymous_user_by_name(chat_partner_name.to_string())
+                .await
+                .is_some()
+            {
+                self.send_error_response(&cv.get_id(), CommunicationType::error_anonymous)
+                    .await;
+                return;
+            }
 
             let load_uuid_response = get_omega_connection()
                 .await_response(
