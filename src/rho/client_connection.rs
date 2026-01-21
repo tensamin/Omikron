@@ -580,13 +580,17 @@ impl ClientConnection {
                 .get_data(DataTypes::chat_partner_name)
                 .unwrap_or(&JsonValue::Null)
                 .as_str()
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_string();
 
             let load_uuid_response = get_omega_connection()
                 .await_response(
                     &CommunicationValue::new(CommunicationType::get_user_data)
-                        .with_id(cv.get_id())
-                        .add_data(DataTypes::username, JsonValue::from(chat_partner_name)),
+                        .with_id(cv.clone().get_id())
+                        .add_data(
+                            DataTypes::username,
+                            JsonValue::from(chat_partner_name.clone()),
+                        ),
                     Some(Duration::from_secs(20)),
                 )
                 .await;
