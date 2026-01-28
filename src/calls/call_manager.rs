@@ -1,8 +1,8 @@
+use dashmap::DashMap;
+use livekit::Room;
 use livekit_api::services::room::RoomClient;
 use once_cell::sync::Lazy;
-use std::{str::FromStr, sync::Arc, time::Duration};
-use tokio::sync::RwLock;
-
+use std::{env, str::FromStr, sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use crate::{
@@ -11,11 +11,32 @@ use crate::{
     util::logger::PrintType,
 };
 
-static CALL_GROUPS: Lazy<RwLock<Vec<Arc<CallGroup>>>> = Lazy::new(|| RwLock::new(Vec::new()));
+static CALL_GROUPS: Lazy<DashMap<Uuid, Arc<CallGroup>>> = Lazy::new(|| DashMap::new());
+
+pub async fn get_call_invites(user_id: i64) -> Vec<Arc<Caller>> {
+    let mut callers = Vec::new();
+    for (_, cg) in CALL_GROUPS.clone().into_iter() {
+        let members = cg.members.read().await;
+        for member in members.iter() {
+            if member.user_id == user_id {
+                callers.push(member.clone());
+            }
+        }
+    }
+    callers
+}
+
+pub async fn get_call(call_id: Uuid) -> Option<Arc<CallGroup>> {
+    if let Some(b) = CALL_GROUPS.get(&call_id) {
+        Some(b.clone())
+    } else {
+        None
+    }
+}
 
 pub async fn get_call_groups(user_id: i64) -> Vec<Arc<CallGroup>> {
     let mut call_groups = Vec::new();
-    for cg in CALL_GROUPS.read().await.iter() {
+    for (_, cg) in CALL_GROUPS.clone().into_iter() {
         let is_member = {
             let members = cg.members.read().await;
             members.iter().any(|m| m.user_id == user_id)
@@ -28,53 +49,45 @@ pub async fn get_call_groups(user_id: i64) -> Vec<Arc<CallGroup>> {
     call_groups
 }
 
-pub async fn get_call(call_id: Uuid) -> Option<Arc<CallGroup>> {
-    let call_groups = CALL_GROUPS.read().await;
-    call_groups.iter().find(|g| g.call_id == call_id).cloned()
-}
-
 pub async fn get_call_token(user_id: i64, call_id: Uuid) -> Option<String> {
-    let existing_group = {
-        let call_groups = CALL_GROUPS.read().await;
-        call_groups.iter().find(|g| g.call_id == call_id).cloned()
-    };
+    if let Some(cg) = CALL_GROUPS.get(&call_id) {
+        let mut members = cg.members.write().await;
 
-    // if the group exists
-    if let Some(cg) = existing_group {
-        let members = cg.members.read().await;
-
-        // if the user is already a member
         if let Some(member) = members.iter().find(|m| m.user_id == user_id) {
-            if member.is_timeout().await {
-                return None;
-            }
             return Some(member.create_token());
         }
-        if cg.is_anonymous().await {
-            return cg.create_anonymous_token(user_id).await;
-        }
-        return None;
+
+        let new_caller = Arc::new(Caller::new(user_id, call_id, false));
+        let token = new_caller.create_token();
+
+        members.push(new_caller);
+
+        return Some(token);
     }
 
-    let mut call_groups = CALL_GROUPS.write().await;
+    if let Some(cg) = CALL_GROUPS.get(&call_id) {
+        let cg_clone = cg.clone();
+
+        let mut members = cg_clone.members.write().await;
+        if let Some(member) = members.iter().find(|m| m.user_id == user_id) {
+            return Some(member.create_token());
+        }
+        let new_caller = Arc::new(Caller::new(user_id, call_id, false));
+        let token = new_caller.create_token();
+        members.push(new_caller);
+        return Some(token);
+    }
 
     let caller = Arc::new(Caller::new(user_id, call_id, true));
     let call_group = CallGroup::new(call_id, caller.clone());
 
-    call_groups.push(Arc::new(call_group));
+    CALL_GROUPS.insert(call_id, Arc::new(call_group));
 
     Some(caller.create_token())
 }
 
 pub async fn add_invite(call_id: Uuid, inviter_id: i64, invitee_id: i64) -> bool {
-    let target_group: Option<Arc<CallGroup>> = CALL_GROUPS
-        .read()
-        .await
-        .iter()
-        .find(|g| g.call_id == call_id)
-        .cloned();
-
-    if let Some(cg) = target_group {
+    if let Some(cg) = CALL_GROUPS.get(&call_id) {
         let mut members = cg.members.write().await;
 
         let is_inviter_member = members.iter().any(|m| m.user_id == inviter_id);
@@ -98,16 +111,22 @@ pub fn garbage_collect_calls() {
     });
 }
 pub async fn clean_calls() {
-    let room_service = RoomClient::new("https://call.tensamin.net").unwrap();
-    let rooms = room_service.list_rooms(Vec::new()).await.unwrap();
-    log!(PrintType::General, "{:?}", rooms);
-    let rooms = match room_service.list_rooms(Vec::new()).await {
-        Ok(rooms) => rooms,
-        Err(e) => {
-            log_err!(PrintType::General, "Could not get rooms! {}", e);
+    let api_key = match env::var("LIVEKIT_API_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            log_err!(PrintType::General, "LIVEKIT_API_KEY not set!");
             return;
         }
     };
+    let api_secret = match env::var("LIVEKIT_API_SECRET") {
+        Ok(secret) => secret,
+        Err(_) => {
+            log_err!(PrintType::General, "LIVEKIT_API_SECRET not set!");
+            return;
+        }
+    };
+    let room_service = RoomClient::with_api_key("https:call.tensamin.net", &api_key, &api_secret);
+    let rooms = room_service.list_rooms(Vec::new()).await.unwrap();
     let mut call_ids: Vec<Uuid> = Vec::new();
     let mut no_users: Vec<Uuid> = Vec::new();
     for room in rooms {
@@ -118,16 +137,17 @@ pub async fn clean_calls() {
             call_ids.push(id);
         }
     }
-    let mut call_groups = CALL_GROUPS.write().await;
-    let size_pre = call_groups.len();
-    call_groups.retain(|cg| call_ids.contains(&cg.call_id));
-
-    for cg in call_groups.iter() {
+    let size_pre = CALL_GROUPS.len();
+    for (id, _) in CALL_GROUPS.clone().into_iter() {
+        if !call_ids.contains(&id) {
+            CALL_GROUPS.remove(&id);
+        }
+    }
+    for (_, cg) in CALL_GROUPS.clone().into_iter() {
         *cg.show.write().await = !no_users.contains(&cg.call_id);
     }
 
-    let size_post = call_groups.len();
-    drop(call_groups);
+    let size_post = CALL_GROUPS.len();
     if size_pre - size_post != 0 {
         log!(
             PrintType::Call,
