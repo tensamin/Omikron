@@ -10,6 +10,7 @@ use tokio_util::compat::Compat;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
+use crate::anonymous_clients::anonymous_manager::generate_username;
 use crate::calls::call_manager;
 use crate::data::{
     communication::{CommunicationType, CommunicationValue, DataTypes},
@@ -38,6 +39,7 @@ impl AnonymousClientConnection {
         sender: WebSocketSender<Compat<tokio::net::TcpStream>>,
         receiver: WebSocketReceiver<Compat<tokio::net::TcpStream>>,
     ) -> Arc<Self> {
+        let username: String = generate_username();
         Arc::new(Self {
             sender: Arc::new(RwLock::new(sender)),
             receiver: Arc::new(RwLock::new(receiver)),
@@ -50,8 +52,8 @@ impl AnonymousClientConnection {
             ping: Arc::new(RwLock::new(-1)),
             interested_users: Arc::new(RwLock::new(Vec::new())),
             is_open: Arc::new(RwLock::new(true)),
-            user_name: Arc::new(RwLock::new(String::new())),
-            display_name: Arc::new(RwLock::new(String::new())),
+            user_name: Arc::new(RwLock::new(username.to_lowercase())),
+            display_name: Arc::new(RwLock::new(username)),
             avatar: Arc::new(RwLock::new(String::new())),
         })
     }

@@ -401,11 +401,37 @@ impl OmegaConnection {
         OMEGA_CONNECTION.send_message(&cv).await;
     }
 
+    pub async fn await_connection(&self, timeout_duration: Option<Duration>) -> Result<(), String> {
+        if *self.is_connected.read().await {
+            return Ok(());
+        }
+        let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
+
+        let start = Instant::now();
+        loop {
+            {
+                if *self.is_connected.read().await {
+                    return Ok(());
+                }
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(format!(
+                    "Connection not established within {} seconds",
+                    timeout.as_secs()
+                ));
+            }
+
+            sleep(Duration::from_millis(100)).await; // short interval polling
+        }
+    }
+
     pub async fn await_response(
         &self,
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
+        let _ = self.await_connection(timeout_duration).await;
         let (tx, mut rx) = mpsc::channel(1);
         let msg_id = cv.get_id();
 
