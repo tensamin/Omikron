@@ -10,7 +10,7 @@ use tokio_util::compat::Compat;
 use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
-use crate::anonymous_clients::anonymous_manager::generate_username;
+use crate::anonymous_clients::anonymous_manager::{self, generate_username};
 use crate::calls::call_manager;
 use crate::data::communication::{CommunicationType, CommunicationValue, DataTypes};
 use crate::omega::omega_connection::{WAITING_TASKS, get_omega_connection};
@@ -272,6 +272,41 @@ impl AnonymousClientConnection {
                 }
 
                 return;
+            }
+
+            if cv.is_type(CommunicationType::get_user_data) {
+                if let Some(anonymous) = {
+                    if let Some(user_id) = cv
+                        .get_data(DataTypes::user_id)
+                        .unwrap_or(&JsonValue::Null)
+                        .as_i64()
+                    {
+                        anonymous_manager::get_anonymous_user(user_id).await
+                    } else if let Some(username) = cv
+                        .get_data(DataTypes::username)
+                        .unwrap_or(&JsonValue::Null)
+                        .as_str()
+                    {
+                        anonymous_manager::get_anonymous_user_by_name(username.to_string()).await
+                    } else {
+                        None
+                    }
+                } {
+                    let response = CommunicationValue::new(CommunicationType::get_user_data)
+                        .with_id(cv.get_id())
+                        .add_data_str(DataTypes::username, anonymous.get_user_name().await)
+                        .add_data(
+                            DataTypes::user_id,
+                            JsonValue::Number(Number::from(anonymous.get_user_id().await)),
+                        )
+                        .add_data_str(DataTypes::display, anonymous.get_display_name().await)
+                        .add_data_str(DataTypes::user_state, "online".to_string())
+                        .add_data_str(DataTypes::avatar, anonymous.get_avatar().await);
+
+                    self.send_message(&response).await;
+
+                    return;
+                }
             }
 
             if cv.is_type(CommunicationType::get_user_data)
