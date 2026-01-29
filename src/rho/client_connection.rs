@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::anonymous_clients::anonymous_manager;
-use crate::calls::call_manager;
+use crate::calls::{call_manager, call_util};
 use crate::omega::omega_connection::{WAITING_TASKS, get_omega_connection};
 use crate::util::crypto_helper::{load_public_key, public_key_to_base64};
 use crate::util::crypto_util::{DataFormat, SecurePayload};
@@ -532,6 +532,7 @@ impl ClientConnection {
                 .unwrap()
                 .has_admin()
             {
+                let _ = call_util::remove_participant(call_id, user_id).await;
                 call.get_caller(user_id)
                     .await
                     .unwrap()

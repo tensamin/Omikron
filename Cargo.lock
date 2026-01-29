@@ -30,6 +30,7 @@ dependencies = [
  "json",
  "livekit",
  "livekit-api",
+ "livekit-protocol",
  "log",
  "loom",
  "once_cell",

@@ -44,6 +44,12 @@ impl CallGroup {
     pub async fn set_anonymous_joining(&self, enable: bool) {
         *self.anonymous_joining.write().await = enable;
 
+        let _ = call_util::set_room_metadata(
+            self.call_id,
+            format!("{{\"anonymous_joining\": \"{}\"}}", enable),
+        )
+        .await;
+
         if self.short_link.read().await.is_none() {
             let long_link = format!(
                 "https://app.tensamin.net/call/anonymous?call_id={}&omikron_id={}",
@@ -88,6 +94,7 @@ impl CallGroup {
     }
 
     pub async fn remove_caller(&self, user_id: i64) {
+        let _ = call_util::remove_participant(self.call_id, user_id).await;
         self.members
             .write()
             .await
