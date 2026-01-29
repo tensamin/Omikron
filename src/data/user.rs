@@ -2,14 +2,14 @@ use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
 
 #[derive(Debug, Clone, PartialEq, EnumIter, Eq)]
-#[allow(unused)]
+#[allow(unused, non_camel_case_types)]
 pub enum UserStatus {
-    Online,
-    PhoneOnline,
-    Away,
-    DoNotDisturb,
-    UserOffline,
-    IotaOffline,
+    online,
+    phone_online,
+    away,
+    do_not_disturb,
+    user_offline,
+    iota_offline,
 }
 #[allow(unused)]
 impl UserStatus {
