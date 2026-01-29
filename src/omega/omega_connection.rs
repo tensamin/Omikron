@@ -258,7 +258,7 @@ impl OmegaConnection {
                                 break;
                             }
                             cloned_self.send_ping().await;
-                            sleep(Duration::from_secs(1)).await;
+                            sleep(Duration::from_secs(5)).await;
                         }
                     });
 
