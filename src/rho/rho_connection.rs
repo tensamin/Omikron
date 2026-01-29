@@ -147,10 +147,10 @@ impl RhoConnection {
     }
 
     /// Check if clients are interested in a user
-    pub async fn are_they_interested(&self, user: &crate::data::user::User) {
+    pub async fn are_they_interested(&self, user_id: i64) {
         let connections = self.client_connections.read().await;
         for connection in connections.iter() {
-            connection.clone().are_you_interested(user).await;
+            connection.clone().are_you_interested(user_id).await;
         }
     }
 

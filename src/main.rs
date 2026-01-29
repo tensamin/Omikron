@@ -18,11 +18,10 @@ use crate::{
     anonymous_clients::{
         anonymous_client_connection::AnonymousClientConnection, anonymous_manager,
     },
-    calls::call_manager::garbage_collect_calls,
+    calls::call_util::garbage_collect_calls,
     omega::omega_connection::OmegaConnection,
     rho::{client_connection::ClientConnection, iota_connection::IotaConnection},
     util::{
-        config_util::CONFIG,
         crypto_helper::{load_public_key, load_secret_key},
         logger::{PrintType, startup},
     },
@@ -44,7 +43,11 @@ async fn main() {
         Arc::new(OmegaConnection::new()).connect();
     });
     startup();
-    let address = format!("{}:{}", &CONFIG.read().await.ip, &CONFIG.read().await.port);
+    let address = format!(
+        "{}:{}",
+        env::var("IP").unwrap_or("0.0.0.0".to_string()),
+        env::var("PORT").unwrap_or("959".to_string())
+    );
     let listener = TcpListener::bind(&address).await.unwrap();
 
     log!(
@@ -97,7 +100,7 @@ async fn main() {
                             client_conn.handle_close().await;
                             return;
                         }
-                        None => {
+                        _ => {
                             log_in!(PrintType::Client, "Client stream ended");
                             client_conn.handle_close().await;
                             return;
@@ -139,7 +142,7 @@ async fn main() {
                             client_conn.handle_close().await;
                             return;
                         }
-                        None => {
+                        _ => {
                             log_in!(PrintType::Client, "Anonymous Client stream ended");
                             anonymous_manager::remove_anonymous_user(
                                 client_conn.get_user_id().await,
@@ -176,7 +179,7 @@ async fn main() {
                             iota_conn.handle_close().await;
                             return;
                         }
-                        None => {
+                        _ => {
                             // Stream ended
                             log_in!(PrintType::Iota, "Iota stream ended");
                             iota_conn.handle_close().await;

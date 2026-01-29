@@ -17,17 +17,19 @@ use tokio::{
 use tokio_native_tls::TlsStream;
 use uuid::Uuid;
 
+use crate::log_err;
 use crate::{
     data::{
         communication::{CommunicationType, CommunicationValue, DataTypes},
         user::UserStatus,
     },
     get_private_key, log, log_in, log_out,
-    rho::rho_manager::{self, RHO_CONNECTIONS},
-    util::crypto_helper::{decrypt_b64, secret_key_to_base64},
-    util::logger::PrintType,
+    rho::rho_manager::{self, RHO_CONNECTIONS, connection_count},
+    util::{
+        crypto_helper::{decrypt_b64, secret_key_to_base64},
+        logger::PrintType,
+    },
 };
-use crate::{log_err, util::crypto_helper::load_public_key};
 
 pub static WAITING_TASKS: Lazy<
     DashMap<Uuid, Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>>,
@@ -159,8 +161,6 @@ impl OmegaConnection {
                                                     .to_string()
                                             })?;
 
-                                        let server_pub_key_obj = load_public_key(server_pub_key).unwrap();
-
                                         let decrypted_challenge = decrypt_b64(
                                             &secret_key_to_base64(&get_private_key()),
                                             server_pub_key,
@@ -222,7 +222,8 @@ impl OmegaConnection {
 
                                                     let sync_msg = CommunicationValue::new(CommunicationType::sync_client_iota_status)
                                                         .add_data(DataTypes::iota_ids, JsonValue::Array(connected_iota_ids))
-                                                        .add_data(DataTypes::user_ids, JsonValue::Array(connected_user_ids));
+                                                        .add_data(DataTypes::user_ids, JsonValue::Array(connected_user_ids))
+                                                        .add_data(DataTypes::rho_connections, JsonValue::from(connection_count().await));
 
                                                     selfc.send_message(&sync_msg).await;
                                                 });
@@ -340,12 +341,6 @@ impl OmegaConnection {
         }
     }
 
-    pub async fn connect_iota(iota_id: i64, _user_ids: Vec<i64>) {
-        let cv = CommunicationValue::new(CommunicationType::iota_connected)
-            .add_data(DataTypes::iota_id, JsonValue::from(iota_id));
-        OmegaConnection::send_global(cv).await;
-    }
-
     pub async fn close_iota(iota_id: i64) {
         let cv = CommunicationValue::new(CommunicationType::iota_disconnected)
             .add_data(DataTypes::iota_id, JsonValue::from(iota_id));
@@ -459,7 +454,7 @@ impl OmegaConnection {
 
         match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(response_cv)) => Ok(response_cv),
-            Ok(None) => Err("Failed to receive response, channel was closed.".to_string()),
+            Ok(_) => Err("Failed to receive response, channel was closed.".to_string()),
             Err(_) => {
                 WAITING_TASKS.remove(&msg_id);
                 Err(format!(

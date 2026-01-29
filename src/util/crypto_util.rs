@@ -25,11 +25,8 @@ pub enum DataFormat {
     Hex,
 }
 
-// --- Main Class Structure ---
 pub struct SecurePayload {
-    /// The internal canonical representation is always raw bytes.
     inner_data: Vec<u8>,
-    /// The private key of the user associated with this payload instance.
     private_key: Secret,
 }
 
@@ -109,22 +106,14 @@ impl SecurePayload {
         let peer_pub = public_key.into();
         let shared_secret = self.private_key.as_diffie_hellman(&peer_pub).unwrap();
 
-        println!(
-            "Encryption Shared Secret (Hex): {}",
-            hex::encode(shared_secret.as_bytes())
-        );
-
-        // 3. Key & Nonce Derivation (HKDF)
-        // We derive 32 bytes for the key and 12 bytes for a deterministic nonce.
         let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
-        let mut okm = [0u8; 44]; // 32 (Key) + 12 (Nonce)
+        let mut okm = [0u8; 44];
         hkdf.expand(b"x448-aes-gcm-no-overhead", &mut okm)
             .map_err(|_| SecurePayloadError::EncryptionError)?;
 
         let key = &okm[..32];
         let nonce_bytes = &okm[32..];
 
-        // 4. Encrypt with AES-256-GCM
         let cipher = Aes256Gcm::new(key.into());
         let nonce = Nonce::from_slice(nonce_bytes);
 
@@ -138,7 +127,6 @@ impl SecurePayload {
             )
             .map_err(|_| SecurePayloadError::EncryptionError)?;
 
-        // 5. Result is ONLY the ciphertext. No key or nonce is packed.
         Ok(SecurePayload {
             inner_data: ciphertext,
             private_key: Secret::from_bytes(self.private_key.as_bytes()).unwrap(),
@@ -160,17 +148,9 @@ impl SecurePayload {
         &self,
         peer_public_key_bytes: &[u8; 56],
     ) -> Result<SecurePayload, SecurePayloadError> {
-        // 1. Perform Exchange
         let peer_pub = PublicKey::from_bytes(peer_public_key_bytes).unwrap();
         let shared_secret = self.private_key.as_diffie_hellman(&peer_pub).unwrap();
 
-        // LOGGING: Shared Secret
-        println!(
-            "Decryption Shared Secret (Hex): {}",
-            hex::encode(shared_secret.as_bytes())
-        );
-
-        // 2. Key & Nonce Derivation (Must match encryption exactly)
         let hkdf = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
         let mut okm = [0u8; 44];
         hkdf.expand(b"x448-aes-gcm-no-overhead", &mut okm)
@@ -179,7 +159,6 @@ impl SecurePayload {
         let key = &okm[..32];
         let nonce_bytes = &okm[32..];
 
-        // 3. Decrypt with AES-256-GCM
         let cipher = Aes256Gcm::new(key.into());
         let nonce = Nonce::from_slice(nonce_bytes);
 

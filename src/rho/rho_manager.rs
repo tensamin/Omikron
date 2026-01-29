@@ -50,12 +50,6 @@ pub async fn get_rho_by_iota(iota_id: i64) -> Option<Arc<RhoConnection>> {
     connections.get(&iota_id).map(Arc::clone)
 }
 
-/// Get all active RhoConnections
-pub async fn get_all_connections() -> Vec<Arc<RhoConnection>> {
-    let connections = RHO_CONNECTIONS.read().await;
-    connections.values().map(Arc::clone).collect()
-}
-
 /// Get the count of active connections
 pub async fn connection_count() -> usize {
     let connections = RHO_CONNECTIONS.read().await;

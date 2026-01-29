@@ -56,7 +56,7 @@ pub fn startup() {
             let ts = fixed_box(&msg.timestamp_ms.to_string(), 13);
             let sender = match msg.sender {
                 Some(id) => fixed_box(&id.to_string(), 19),
-                None => fixed_box("", 19),
+                _ => fixed_box("", 19),
             };
 
             let line = format!("{} {} {} {}", ts, sender, msg.prefix, msg.message);

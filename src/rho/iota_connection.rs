@@ -189,7 +189,7 @@ impl IotaConnection {
 
                 let pub_key = match load_public_key(base64_pub) {
                     Some(pk) => pk,
-                    None => {
+                    _ => {
                         self.send_error_response(
                             &cv.get_id(),
                             CommunicationType::error_invalid_public_key,
@@ -594,6 +594,7 @@ impl IotaConnection {
             }
         }
     }
+
     pub async fn await_response(
         &self,
         cv: &CommunicationValue,
@@ -626,7 +627,7 @@ impl IotaConnection {
 
         match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(response_cv)) => Ok(response_cv),
-            Ok(None) => Err("Failed to receive response, channel was closed.".to_string()),
+            Ok(_) => Err("Failed to receive response, channel was closed.".to_string()),
             Err(_) => {
                 self.waiting_tasks.remove(&msg_id);
                 Err(format!(

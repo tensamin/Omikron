@@ -27,7 +27,7 @@ impl Caller {
     pub fn has_admin(&self) -> bool {
         self.has_admin
     }
-    pub async fn is_timeout(&self) -> bool {
+    pub async fn is_timeouted(&self) -> bool {
         *self.timeout.read().await
             > SystemTime::now()
                 .duration_since(UNIX_EPOCH)

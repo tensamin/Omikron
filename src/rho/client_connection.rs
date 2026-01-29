@@ -20,10 +20,9 @@ use crate::util::crypto_helper::{load_public_key, public_key_to_base64};
 use crate::util::crypto_util::{DataFormat, SecurePayload};
 use crate::util::logger::PrintType;
 use crate::{
-    // calls::call_manager::CallManager,
     data::{
         communication::{CommunicationType, CommunicationValue, DataTypes},
-        user::{User, UserStatus},
+        user::UserStatus,
     },
     omega::omega_connection::OmegaConnection,
 };
@@ -163,7 +162,7 @@ impl ClientConnection {
 
                     let pub_key = match load_public_key(base64_pub) {
                         Some(pk) => pk,
-                        None => {
+                        _ => {
                             self.clone()
                                 .send_error_response(
                                     &cv.get_id(),
@@ -227,7 +226,7 @@ impl ClientConnection {
 
                     let rho_connection = match rho_manager::get_rho_con_for_user(user_id).await {
                         Some(rho) => rho,
-                        None => {
+                        _ => {
                             self.send_error_response(
                                 &cv.get_id(),
                                 CommunicationType::error_no_iota,
@@ -432,7 +431,7 @@ impl ClientConnection {
                     return;
                 }
             },
-            None => {
+            _ => {
                 self.send_error_response(&cv.get_id(), CommunicationType::error_no_call_id)
                     .await;
                 return;
@@ -450,7 +449,7 @@ impl ClientConnection {
         // Find target RhoConnection
         let target_rho = match rho_manager::get_rho_con_for_user(receiver_id).await {
             Some(rho) => rho,
-            None => {
+            _ => {
                 self.send_error_response(&cv.get_id(), CommunicationType::error)
                     .await;
                 return;
@@ -487,7 +486,7 @@ impl ClientConnection {
                     return;
                 }
             },
-            None => {
+            _ => {
                 self.send_error_response(&cv.get_id(), CommunicationType::error)
                     .await;
                 return;
@@ -697,15 +696,12 @@ impl ClientConnection {
     }
 
     /// Check if interested in a user and send notification
-    pub async fn are_you_interested(self: Arc<Self>, user: &User) {
+    pub async fn are_you_interested(self: Arc<Self>, user_id: i64) {
         let interested_guard = self.clone().get_interested_users().await;
-        if interested_guard.contains(&user.user_id) {
+        if interested_guard.contains(&user_id) {
             let notification = CommunicationValue::new(CommunicationType::client_changed)
-                .add_data_str(DataTypes::user_id, user.user_id.to_string())
-                .add_data_str(
-                    DataTypes::user_state,
-                    format!("{:?}", user.status.to_string()),
-                );
+                .add_data_str(DataTypes::user_id, user_id.to_string())
+                .add_data_str(DataTypes::user_state, format!("online"));
 
             self.send_message(&notification).await;
         }

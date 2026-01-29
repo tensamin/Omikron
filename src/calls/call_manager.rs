@@ -1,17 +1,11 @@
 use dashmap::DashMap;
-use livekit::Room;
-use livekit_api::services::room::RoomClient;
 use once_cell::sync::Lazy;
-use std::{env, str::FromStr, sync::Arc, time::Duration};
+use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::{
-    calls::{call_group::CallGroup, caller::Caller},
-    log, log_err,
-    util::logger::PrintType,
-};
+use crate::calls::{call_group::CallGroup, caller::Caller};
 
-static CALL_GROUPS: Lazy<DashMap<Uuid, Arc<CallGroup>>> = Lazy::new(|| DashMap::new());
+pub static CALL_GROUPS: Lazy<DashMap<Uuid, Arc<CallGroup>>> = Lazy::new(|| DashMap::new());
 
 pub async fn get_call_invites(user_id: i64) -> Vec<Arc<Caller>> {
     let mut callers = Vec::new();
@@ -100,60 +94,4 @@ pub async fn add_invite(call_id: Uuid, inviter_id: i64, invitee_id: i64) -> bool
         }
     }
     false
-}
-
-pub fn garbage_collect_calls() {
-    tokio::spawn(async move {
-        loop {
-            clean_calls().await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
-}
-pub async fn clean_calls() {
-    let api_key = match env::var("LIVEKIT_API_KEY") {
-        Ok(key) => key,
-        Err(_) => {
-            log_err!(PrintType::General, "LIVEKIT_API_KEY not set!");
-            return;
-        }
-    };
-    let api_secret = match env::var("LIVEKIT_API_SECRET") {
-        Ok(secret) => secret,
-        Err(_) => {
-            log_err!(PrintType::General, "LIVEKIT_API_SECRET not set!");
-            return;
-        }
-    };
-    let room_service = RoomClient::with_api_key("https:call.tensamin.net", &api_key, &api_secret);
-    let rooms = room_service.list_rooms(Vec::new()).await.unwrap();
-    let mut call_ids: Vec<Uuid> = Vec::new();
-    let mut no_users: Vec<Uuid> = Vec::new();
-    for room in rooms {
-        if let Ok(id) = Uuid::from_str(&room.name) {
-            if room.num_participants == 0 {
-                no_users.push(id);
-            }
-            call_ids.push(id);
-        }
-    }
-    let size_pre = CALL_GROUPS.len();
-    for (id, _) in CALL_GROUPS.clone().into_iter() {
-        if !call_ids.contains(&id) {
-            CALL_GROUPS.remove(&id);
-        }
-    }
-    for (_, cg) in CALL_GROUPS.clone().into_iter() {
-        *cg.show.write().await = !no_users.contains(&cg.call_id);
-    }
-
-    let size_post = CALL_GROUPS.len();
-    if size_pre - size_post != 0 {
-        log!(
-            PrintType::Call,
-            "Cleaned {} calls, {} remaining",
-            size_pre - size_post,
-            size_post
-        );
-    }
 }
