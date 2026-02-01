@@ -30,8 +30,6 @@ struct LogMessage {
     message: String,
 }
 
-/// Initialize the logging subsystem.
-/// Must be called exactly once during startup.
 pub fn startup() {
     let (tx, rx) = mpsc::channel::<LogMessage>();
     LOGGER.set(tx).expect("Logger already initialized");
@@ -61,10 +59,8 @@ pub fn startup() {
 
             let line = format!("{} {} {} {}", ts, sender, msg.prefix, msg.message);
 
-            // Console (ANSI-colored)
             println!("{}", colorize(msg.kind, msg.is_error).paint(&line));
 
-            // File (plain text)
             let _ = writeln!(file, "{}", line);
         }
     });
@@ -95,16 +91,15 @@ fn fixed_box(content: &str, width: usize) -> String {
     }
 }
 
-/** Internal async logging entry point.
-* Not exposed publicly; all access goes through macros.
-*/
 pub fn log_internal(
-    sender: Option<i64>,
+    sender: i64,
     kind: PrintType,
     prefix: &'static str,
     is_error: bool,
     message: String,
 ) {
+    let sender = if sender == 0 { None } else { Some(sender) };
+
     if let Some(tx) = LOGGER.get() {
         let _ = tx.send(LogMessage {
             timestamp_ms: SystemTime::now()
@@ -119,101 +114,27 @@ pub fn log_internal(
         });
     }
 }
-/// Log a general informational message.
 #[macro_export]
 macro_rules! log {
-
-    // actor only
-    ($kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal(None, $kind, "", false, format!($($arg)*))
-    };
-
-    // sender + actor
-    ($sender:expr, $kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal(Some($sender), $kind, "", false, format!($($arg)*))
-    };
-
-    // plain
-    ($($arg:tt)*) => {
-        $crate::util::logger::log_internal(
-            None,
-            $crate::util::logger::PrintType::General,
-            "",
-            false,
-            format!($($arg)*)
-        )
+    ($sender: expr, $kind:expr, $($arg:tt)*) => {
+        $crate::util::logger::log_internal($sender, $kind, "", false, format!($($arg)*))
     };
 }
-/// Log an inbound message (`>`).
 #[macro_export]
 macro_rules! log_in {
-    // actor only
-    ($kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal(None, $kind, ">", false, format!($($arg)*))
-    };
-
-    // sender + actor
-    ($sender:expr, $kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal(Some($sender), $kind, ">", false, format!($($arg)*))
-    };
-
-    // plain
-    ($($arg:tt)*) => {
-        $crate::util::logger::log_internal(
-            None,
-            $crate::util::logger::PrintType::General,
-            ">",
-            false,
-            format!($($arg)*)
-        )
+    ($sender: expr, $kind:expr, $($arg:tt)*) => {
+        $crate::util::logger::log_internal($sender, $kind, ">", false, format!($($arg)*))
     };
 }
-/// Log an outbound message (`<`).
 #[macro_export]
 macro_rules! log_out {
-    // actor only
-    ($kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal(None, $kind, "<", false, format!($($arg)*))
-    };
-
-    // sender + actor
     ($sender:expr, $kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal(Some($sender), $kind, "<", false, format!($($arg)*))
-    };
-
-    // plain
-    ($($arg:tt)*) => {
-        $crate::util::logger::log_internal(
-            None,
-            $crate::util::logger::PrintType::General,
-            "<",
-            false,
-            format!($($arg)*)
-        )
+        $crate::util::logger::log_internal($sender, $kind, "<", false, format!($($arg)*))
     };
 }
-/// Log an error message (`>>`).
 #[macro_export]
 macro_rules! log_err {
-
-    // actor only
-    ($kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal(None, $kind, ">>", true, format!($($arg)*))
-    };
-
-    // sender + actor
     ($sender:expr, $kind:expr, $($arg:tt)*) => {
-        $crate::util::logger::log_internal(Some($sender), $kind, ">>", true, format!($($arg)*))
-    };
-
-    // plain
-    ($($arg:tt)*) => {
-        $crate::util::logger::log_internal(
-            None,
-            $crate::util::logger::PrintType::General,
-            ">>",
-            true,
-            format!($($arg)*)
-        )
+        $crate::util::logger::log_internal($sender, $kind, ">>", true, format!($($arg)*))
     };
 }

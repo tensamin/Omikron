@@ -87,6 +87,7 @@ impl AnonymousClientConnection {
             .await
         {
             log_out!(
+                self.get_user_id().await,
                 PrintType::Client,
                 "Failed to send message to anonymous client: {}",
                 e,
@@ -98,13 +99,19 @@ impl AnonymousClientConnection {
     pub async fn send_message(self: Arc<Self>, cv: &CommunicationValue) {
         if !*self.is_open.read().await {
             log_out!(
+                self.get_user_id().await,
                 PrintType::Client,
                 "Attempted to send message to a closed connection."
             );
             return;
         }
         if !cv.is_type(CommunicationType::pong) {
-            log_out!(PrintType::Client, "{}", &cv.to_json().to_string());
+            log_out!(
+                self.get_user_id().await,
+                PrintType::Client,
+                "{}",
+                &cv.to_json().to_string()
+            );
         }
         self.send_message_str(&cv.to_json().to_string()).await;
     }
@@ -118,6 +125,7 @@ impl AnonymousClientConnection {
                 return;
             }
             log_in!(
+                self.get_user_id().await,
                 PrintType::Client,
                 "Anonymous: {}",
                 &cv.to_json().to_string()

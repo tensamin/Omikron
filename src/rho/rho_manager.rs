@@ -12,9 +12,9 @@ pub static RHO_CONNECTIONS: LazyLock<Arc<RwLock<HashMap<i64, Arc<RhoConnection>>
 
 pub async fn get_rho_con_for_user(user_id: i64) -> Option<Arc<RhoConnection>> {
     let connections = RHO_CONNECTIONS.read().await;
-    log_in!(PrintType::Client, "Checking user ID: {:?}", user_id,);
     for rho_connection in connections.values() {
         log_in!(
+            user_id,
             PrintType::Client,
             "Comparing user IDs: {:?}",
             rho_connection.get_user_ids().to_vec()

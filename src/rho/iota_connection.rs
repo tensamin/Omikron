@@ -49,7 +49,7 @@ pub struct IotaConnection {
     pub ping: Arc<RwLock<i64>>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub waiting_tasks:
-        DashMap<Uuid, Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>>,
+        DashMap<Uuid, Box<dyn Fn(Arc<IotaConnection>, CommunicationValue) -> bool + Send + Sync>>,
     pub rho_connection: Arc<RwLock<Option<Weak<RhoConnection>>>>,
 }
 
@@ -125,14 +125,24 @@ impl IotaConnection {
             .send(Message::Text(Utf8Bytes::from(message.to_string())))
             .await
         {
-            log_err!(PrintType::Iota, "Failed to send WebSocket message: {:?}", e,);
+            log_err!(
+                self.get_iota_id().await,
+                PrintType::Iota,
+                "Failed to send WebSocket message: {:?}",
+                e,
+            );
         }
     }
 
     /// Send a CommunicationValue to the Iota
     pub async fn send_message(&self, cv: &CommunicationValue) {
         if !cv.is_type(CommunicationType::pong) {
-            log_out!(PrintType::Iota, "{}", cv.to_json().to_string());
+            log_out!(
+                self.get_iota_id().await,
+                PrintType::Iota,
+                "{}",
+                cv.to_json().to_string()
+            );
         }
         self.send_message_str(&cv.to_json().to_string()).await;
     }
@@ -146,7 +156,12 @@ impl IotaConnection {
             return;
         }
 
-        log_in!(PrintType::Iota, "{}", cv.to_json().to_string());
+        log_in!(
+            self.get_iota_id().await,
+            PrintType::Iota,
+            "{}",
+            cv.to_json().to_string()
+        );
 
         let identified = *self.identified.read().await;
         let challenged = *self.challenged.read().await;
@@ -157,7 +172,7 @@ impl IotaConnection {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
             if iota_id == 0 {
-                log_out!(PrintType::Iota, "Invalid IOTA ID");
+                log_out!(self.get_iota_id().await, PrintType::Iota, "Invalid IOTA ID");
                 self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
                     .await;
                 self.close().await;
@@ -332,6 +347,7 @@ impl IotaConnection {
                 if let Ok(iota_users_cv) = iota_users_cv {
                     if !iota_users_cv.is_type(CommunicationType::iota_user_data) {
                         log_err!(
+                            self.get_iota_id().await,
                             PrintType::Omikron,
                             "Invalid communication type {:?}",
                             iota_users_cv.get_type()
@@ -351,9 +367,18 @@ impl IotaConnection {
                         _ => {}
                     }
                 } else {
-                    log_err!(PrintType::Omikron, "Failed to retrieve user IDs");
+                    log_err!(
+                        self.get_iota_id().await,
+                        PrintType::Omikron,
+                        "Failed to retrieve user IDs"
+                    );
                 }
-                log_in!(PrintType::General, "User IDs: {:?}", user_ids.clone());
+                log_in!(
+                    self.get_iota_id().await,
+                    PrintType::General,
+                    "User IDs: {:?}",
+                    user_ids.clone()
+                );
 
                 *self.user_ids.write().await = user_ids.clone();
                 let rho_connection =
@@ -537,10 +562,14 @@ impl IotaConnection {
         // Process contacts and add call information
         let enriched_contacts = if *empty {
             if let Some(contacts_data) = cv.get_data(DataTypes::user_ids) {
-                log_in!(PrintType::Call, "Call empty");
+                log_in!(self.get_iota_id().await, PrintType::Call, "Call empty");
                 contacts_data.clone()
             } else {
-                log_in!(PrintType::Call, "Call empty No Data");
+                log_in!(
+                    self.get_iota_id().await,
+                    PrintType::Call,
+                    "Call empty No Data"
+                );
                 JsonValue::new_array()
             }
         } else {
@@ -583,7 +612,11 @@ impl IotaConnection {
             let updated_cv = cv.with_sender(self.get_iota_id().await);
             rho_conn.message_to_client(updated_cv).await;
         } else {
-            log_err!(PrintType::General, "Failed to forward message to client");
+            log_err!(
+                self.get_iota_id().await,
+                PrintType::General,
+                "Failed to forward message to client"
+            );
         }
     }
 
@@ -596,7 +629,7 @@ impl IotaConnection {
     }
 
     pub async fn await_response(
-        &self,
+        self: Arc<IotaConnection>,
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
@@ -606,11 +639,12 @@ impl IotaConnection {
         let task_tx = tx.clone();
         self.waiting_tasks.insert(
             msg_id,
-            Box::new(move |_, response_cv| {
+            Box::new(move |io, response_cv| {
                 let inner_tx = task_tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = inner_tx.send(response_cv).await {
                         log_err!(
+                            io.get_iota_id().await,
                             PrintType::Iota,
                             "Failed to send response back to awaiter: {}",
                             e

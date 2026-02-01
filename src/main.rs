@@ -51,6 +51,7 @@ async fn main() {
     let listener = TcpListener::bind(&address).await.unwrap();
 
     log!(
+        0,
         PrintType::General,
         "WebSocket server listening on {}",
         address,
@@ -69,13 +70,13 @@ async fn main() {
             let ws_stream = match accept_hdr_async(stream.compat(), callback).await {
                 Ok(ws) => ws,
                 Err(e) => {
-                    log!(PrintType::General, "WebSocket upgrade failed: {}", e,);
+                    log!(0, PrintType::General, "WebSocket upgrade failed: {}", e,);
                     return;
                 }
             };
             let (sender, receiver) = ws_stream.split();
             if path == "/ws/client/" {
-                log_in!(PrintType::Client, "New Client connection");
+                log_in!(0, PrintType::Client, "New Client connection");
                 let client_conn: Arc<ClientConnection> =
                     Arc::from(ClientConnection::new(sender, receiver));
                 loop {
@@ -90,25 +91,38 @@ async fn main() {
                                 let text = msg.into_text().unwrap();
                                 client_conn.clone().handle_message(text).await;
                             } else if msg.is_close() {
-                                log_in!(PrintType::Client, "Client disconnected");
+                                log_in!(
+                                    client_conn.get_user_id().await,
+                                    PrintType::Client,
+                                    "Client disconnected"
+                                );
                                 client_conn.handle_close().await;
                                 return;
                             }
                         }
                         Some(Err(e)) => {
-                            log_err!(PrintType::Client, "WebSocket error: {}", e);
+                            log_err!(
+                                client_conn.get_user_id().await,
+                                PrintType::Client,
+                                "WebSocket error: {}",
+                                e
+                            );
                             client_conn.handle_close().await;
                             return;
                         }
                         _ => {
-                            log_in!(PrintType::Client, "Client stream ended");
+                            log_in!(
+                                client_conn.get_user_id().await,
+                                PrintType::Client,
+                                "Client stream ended"
+                            );
                             client_conn.handle_close().await;
                             return;
                         }
                     }
                 }
             } else if path == "/ws/anonymous_client/" {
-                log_in!(PrintType::Client, "New Anonymous Client connection");
+                log_in!(0, PrintType::Client, "New Anonymous Client connection");
                 let client_conn: Arc<AnonymousClientConnection> =
                     Arc::from(AnonymousClientConnection::new(sender, receiver));
                 anonymous_manager::add_anonymous_user(client_conn.clone()).await;
@@ -124,7 +138,11 @@ async fn main() {
                                 let text = msg.into_text().unwrap();
                                 client_conn.clone().handle_message(text).await;
                             } else if msg.is_close() {
-                                log_in!(PrintType::Client, "Anonymous Client disconnected");
+                                log_in!(
+                                    client_conn.get_user_id().await,
+                                    PrintType::Client,
+                                    "Anonymous Client disconnected"
+                                );
                                 anonymous_manager::remove_anonymous_user(
                                     client_conn.get_user_id().await,
                                 )
@@ -134,7 +152,12 @@ async fn main() {
                             }
                         }
                         Some(Err(e)) => {
-                            log_err!(PrintType::Client, "WebSocket error: {}", e);
+                            log_err!(
+                                client_conn.get_user_id().await,
+                                PrintType::Client,
+                                "WebSocket error: {}",
+                                e
+                            );
                             anonymous_manager::remove_anonymous_user(
                                 client_conn.get_user_id().await,
                             )
@@ -143,7 +166,11 @@ async fn main() {
                             return;
                         }
                         _ => {
-                            log_in!(PrintType::Client, "Anonymous Client stream ended");
+                            log_in!(
+                                client_conn.get_user_id().await,
+                                PrintType::Client,
+                                "Anonymous Client stream ended"
+                            );
                             anonymous_manager::remove_anonymous_user(
                                 client_conn.get_user_id().await,
                             )
@@ -154,7 +181,7 @@ async fn main() {
                     }
                 }
             } else if path == "/ws/iota/" {
-                log_in!(PrintType::Iota, "New Iota connection");
+                log_in!(0, PrintType::Iota, "New Iota connection");
                 let iota_conn: Arc<IotaConnection> =
                     Arc::from(IotaConnection::new(sender, receiver));
                 loop {
@@ -169,19 +196,32 @@ async fn main() {
                                 let text = msg.into_text().unwrap();
                                 iota_conn.clone().handle_message(text).await;
                             } else if msg.is_close() {
-                                log_in!(PrintType::Iota, "Iota disconnected");
+                                log_in!(
+                                    iota_conn.get_iota_id().await,
+                                    PrintType::Iota,
+                                    "Iota disconnected"
+                                );
                                 iota_conn.handle_close().await;
                                 return;
                             }
                         }
                         Some(Err(e)) => {
-                            log_err!(PrintType::Iota, "WebSocket error: {}", e);
+                            log_err!(
+                                iota_conn.get_iota_id().await,
+                                PrintType::Iota,
+                                "WebSocket error: {}",
+                                e
+                            );
                             iota_conn.handle_close().await;
                             return;
                         }
                         _ => {
                             // Stream ended
-                            log_in!(PrintType::Iota, "Iota stream ended");
+                            log_in!(
+                                iota_conn.get_iota_id().await,
+                                PrintType::Iota,
+                                "Iota stream ended"
+                            );
                             iota_conn.handle_close().await;
                             return;
                         }

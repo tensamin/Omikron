@@ -95,7 +95,11 @@ impl OmegaConnection {
     async fn connect_internal(self: Arc<OmegaConnection>, mut retry: usize) {
         loop {
             if retry > 5 {
-                log_err!(PrintType::Omega, "Max retry attempts reached, giving up.");
+                log_err!(
+                    0,
+                    PrintType::Omega,
+                    "Max retry attempts reached, giving up."
+                );
                 return;
             }
 
@@ -104,7 +108,7 @@ impl OmegaConnection {
             match connect_async(&url_str).await {
                 Ok((ws_stream, _)) => {
                     *self.is_connected.write().await = true;
-                    log_in!(PrintType::Omega, "WebSocket connected to {}", url_str);
+                    log_in!(0, PrintType::Omega, "WebSocket connected to {}", url_str);
                     retry = 0;
                     let (write, read) = ws_stream.split();
                     *self.read.write().await = Some(read);
@@ -135,7 +139,7 @@ impl OmegaConnection {
                             id,
                             Box::new(|selfc, cv| {
                                 if cv.is_type(CommunicationType::error_not_found) {
-                                    log_err!(
+                                    log_err!(0,
                                         PrintType::Omega,
                                         "Identification failed: Omikron ID not found on Omega.",
                                     );
@@ -186,7 +190,7 @@ impl OmegaConnection {
                                                 if !final_cv
                                                     .is_type(CommunicationType::identification_response)
                                                 {
-                                                    log_err!(
+                                                    log_err!(0,
                                                         PrintType::Omega,
                                                         "Expected identification_response, got something else.",
                                                     );
@@ -195,11 +199,11 @@ impl OmegaConnection {
 
                                                 if let Some(accepted) = final_cv.get_data(DataTypes::accepted).and_then(|v| v.as_bool()) {
                                                     if !accepted {
-                                                        log_err!(PrintType::Omega, "Omega did not accept identification.");
+                                                        log_err!(0, PrintType::Omega, "Omega did not accept identification.");
                                                         return false;
                                                     }
                                                 } else {
-                                                    log_err!(PrintType::Omega, "Omega response did not contain 'accepted' field.");
+                                                    log_err!(0, PrintType::Omega, "Omega response did not contain 'accepted' field.");
                                                     return false;
                                                 }
 
@@ -227,7 +231,7 @@ impl OmegaConnection {
 
                                                     selfc.send_message(&sync_msg).await;
                                                 });
-                                                log!(
+                                                log!(0,
                                                     PrintType::Omega,
                                                     "Successfully identified with Omega.",
                                                 );
@@ -241,7 +245,7 @@ impl OmegaConnection {
                                     };
 
                                     if let Err(e) = task.await {
-                                        log_err!(PrintType::Omega, "{}", &e);
+                                        log_err!(0, PrintType::Omega, "{}", &e);
                                     }
                                 });
 
@@ -270,12 +274,13 @@ impl OmegaConnection {
                     }
                     *self.read.write().await = None;
                     *self.write.write().await = None;
-                    log_err!(PrintType::Omega, "Connection lost. Retrying...");
+                    log_err!(0, PrintType::Omega, "Connection lost. Retrying...");
                     retry += 1;
                     sleep(Duration::from_secs(2)).await;
                 }
                 Err(e) => {
                     log_err!(
+                        0,
                         PrintType::Omega,
                         "WebSocket connection failed (attempt {}): {}",
                         retry + 1,
@@ -308,7 +313,7 @@ impl OmegaConnection {
                         continue;
                     }
                     let msg_id = cv.get_id();
-                    log_in!(PrintType::Omega, "{}", &cv.to_json().to_string());
+                    log_in!(0, PrintType::Omega, "{}", &cv.to_json().to_string());
                     // Handle waiting tasks
                     if let Some(task) = WAITING_TASKS.remove(&msg_id) {
                         if (task.1)(self.clone(), cv.clone()) {
@@ -333,7 +338,7 @@ impl OmegaConnection {
         let mut guard = self.write.write().await;
         if let Some(ws) = guard.as_mut() {
             if !cv.is_type(CommunicationType::ping) {
-                log_out!(PrintType::Omega, "{}", &cv.to_json().to_string());
+                log_out!(0, PrintType::Omega, "{}", &cv.to_json().to_string());
             }
             let _ = ws
                 .send(Message::Text(cv.to_json().to_string().into()))
@@ -438,6 +443,7 @@ impl OmegaConnection {
                 tokio::spawn(async move {
                     if let Err(e) = inner_tx.send(response_cv).await {
                         log_err!(
+                            0,
                             PrintType::Omega,
                             "Failed to send response back to awaiter: {}",
                             e

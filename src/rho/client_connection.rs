@@ -90,7 +90,12 @@ impl ClientConnection {
             .send(Message::Text(Utf8Bytes::from(message.to_string())))
             .await
         {
-            log_out!(PrintType::Client, "Failed to send message to client: {}", e,);
+            log_out!(
+                self.get_user_id().await,
+                PrintType::Client,
+                "Failed to send message to client: {}",
+                e,
+            );
         }
     }
 
@@ -98,13 +103,19 @@ impl ClientConnection {
     pub async fn send_message(self: Arc<Self>, cv: &CommunicationValue) {
         if !*self.is_open.read().await {
             log_out!(
+                self.get_user_id().await,
                 PrintType::Client,
                 "Attempted to send message to a closed connection."
             );
             return;
         }
         if !cv.is_type(CommunicationType::pong) {
-            log_out!(PrintType::Client, "{}", &cv.to_json().to_string());
+            log_out!(
+                self.get_user_id().await,
+                PrintType::Client,
+                "{}",
+                &cv.to_json().to_string()
+            );
         }
         self.send_message_str(&cv.to_json().to_string()).await;
     }
@@ -117,7 +128,12 @@ impl ClientConnection {
                 self.handle_ping(cv).await;
                 return;
             }
-            log_in!(PrintType::Client, "{}", &cv.to_json().to_string());
+            log_in!(
+                self.get_user_id().await,
+                PrintType::Client,
+                "{}",
+                &cv.to_json().to_string()
+            );
             let identified = *self.identified.read().await;
             let challenged = *self.challenged.read().await;
 
@@ -128,7 +144,11 @@ impl ClientConnection {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
                 if user_id == 0 {
-                    log_out!(PrintType::Client, "Invalid USER ID");
+                    log_out!(
+                        self.get_user_id().await,
+                        PrintType::Client,
+                        "Invalid USER ID"
+                    );
                     self.clone()
                         .send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
                         .await;

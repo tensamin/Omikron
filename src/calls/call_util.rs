@@ -14,21 +14,21 @@ pub fn get_livekit() -> Result<(String, String, String), ()> {
     let hostname = match env::var("LIVEKI_HOSTNAME") {
         Ok(secret) => secret,
         Err(_) => {
-            log_err!(PrintType::General, "LIVEKI_HOSTNAME not set!");
+            log_err!(0, PrintType::General, "LIVEKI_HOSTNAME not set!");
             return Err(());
         }
     };
     let api_key = match env::var("LIVEKIT_API_KEY") {
         Ok(key) => key,
         Err(_) => {
-            log_err!(PrintType::General, "LIVEKIT_API_KEY not set!");
+            log_err!(0, PrintType::General, "LIVEKIT_API_KEY not set!");
             return Err(());
         }
     };
     let api_secret = match env::var("LIVEKIT_API_SECRET") {
         Ok(secret) => secret,
         Err(_) => {
-            log_err!(PrintType::General, "LIVEKIT_API_SECRET not set!");
+            log_err!(0, PrintType::General, "LIVEKIT_API_SECRET not set!");
             return Err(());
         }
     };
@@ -139,6 +139,7 @@ pub async fn clean_calls(room_service: RoomClient) {
     let size_post = CALL_GROUPS.len();
     if size_pre - size_post != 0 {
         log!(
+            0,
             PrintType::Call,
             "Cleaned {} calls, {} remaining",
             size_pre - size_post,
