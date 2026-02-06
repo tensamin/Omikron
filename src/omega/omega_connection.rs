@@ -323,7 +323,7 @@ impl OmegaConnection {
                     }
                 }
                 #[allow(non_snake_case)]
-                Some(Ok(Message::Close(_))) | None => continue,
+                Some(Ok(Message::Close(_))) | None => break,
                 Some(Err(_)) => break,
                 _ => {}
             }
