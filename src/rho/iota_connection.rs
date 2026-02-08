@@ -434,6 +434,7 @@ impl IotaConnection {
         }
 
         if cv.is_type(CommunicationType::change_iota_data)
+            || cv.is_type(CommunicationType::push_notification)
             || cv.is_type(CommunicationType::get_user_data)
             || cv.is_type(CommunicationType::get_iota_data)
             || cv.is_type(CommunicationType::get_register)

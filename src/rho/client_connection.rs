@@ -361,6 +361,8 @@ impl ClientConnection {
             }
 
             if cv.is_type(CommunicationType::change_user_data)
+                || cv.is_type(CommunicationType::read_notification)
+                || cv.is_type(CommunicationType::get_notifications)
                 || cv.is_type(CommunicationType::get_user_data)
                 || cv.is_type(CommunicationType::get_iota_data)
                 || cv.is_type(CommunicationType::delete_user)
