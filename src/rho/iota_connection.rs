@@ -32,7 +32,6 @@ use x448::PublicKey;
 
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::{
-    // calls::call_manager::CallManager,
     data::communication::{CommunicationType, CommunicationValue, DataTypes},
     omega::omega_connection::OmegaConnection,
 };
@@ -434,6 +433,7 @@ impl IotaConnection {
         }
 
         if cv.is_type(CommunicationType::change_iota_data)
+            || cv.is_type(CommunicationType::push_notification)
             || cv.is_type(CommunicationType::get_user_data)
             || cv.is_type(CommunicationType::get_iota_data)
             || cv.is_type(CommunicationType::get_register)

@@ -35,6 +35,7 @@ pub enum DataTypes {
     denied_profiles,
     content,
     messages,
+    notifications,
     send_time,
     get_time,
     get_variant,
@@ -142,6 +143,11 @@ pub enum CommunicationType {
     message_other_iota,
     message_chunk,
     messages_get,
+
+    push_notification,
+    read_notification,
+    get_notifications,
+
     change_confirm,
     confirm_receive,
     confirm_read,

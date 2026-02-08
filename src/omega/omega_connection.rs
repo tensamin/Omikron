@@ -126,7 +126,7 @@ impl OmegaConnection {
         }
 
         loop {
-            if retry > 5 {
+            if retry > 500 {
                 log_err!(
                     0,
                     PrintType::Omega,
