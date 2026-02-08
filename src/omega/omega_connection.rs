@@ -31,9 +31,12 @@ use crate::{
     },
 };
 
-pub static WAITING_TASKS: Lazy<
-    DashMap<Uuid, Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>>,
-> = Lazy::new(DashMap::new);
+pub struct WaitingTask {
+    pub task: Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>,
+    pub inserted_at: Instant,
+}
+
+pub static WAITING_TASKS: Lazy<DashMap<Uuid, WaitingTask>> = Lazy::new(DashMap::new);
 
 static OMEGA_CONNECTION: Lazy<Arc<OmegaConnection>> = Lazy::new(|| {
     let conn = Arc::new(OmegaConnection::new());
@@ -41,6 +44,14 @@ static OMEGA_CONNECTION: Lazy<Arc<OmegaConnection>> = Lazy::new(|| {
     tokio::spawn(async move {
         conn_clone.connect_internal(0).await;
     });
+
+    tokio::spawn(async {
+        loop {
+            sleep(Duration::from_secs(60)).await;
+            WAITING_TASKS.retain(|_, v| v.inserted_at.elapsed() < Duration::from_secs(60));
+        }
+    });
+
     conn
 });
 
@@ -52,7 +63,7 @@ pub fn get_omega_connection() -> Arc<OmegaConnection> {
 #[derive(Clone)]
 pub struct OmegaConnection {
     write: Arc<
-        RwLock<
+        Mutex<
             Option<
                 WebSocketSender<
                     Stream<TokioAdapter<TcpStream>, TokioAdapter<TlsStream<TcpStream>>>,
@@ -61,7 +72,7 @@ pub struct OmegaConnection {
         >,
     >,
     read: Arc<
-        RwLock<
+        Mutex<
             Option<
                 WebSocketReceiver<
                     Stream<TokioAdapter<TcpStream>, TokioAdapter<TlsStream<TcpStream>>>,
@@ -72,27 +83,48 @@ pub struct OmegaConnection {
     pingpong: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub last_ping: Arc<Mutex<i64>>,
     pub message_send_times: Arc<Mutex<HashMap<Uuid, Instant>>>,
-    pub is_connected: Arc<RwLock<bool>>,
+    state: Arc<RwLock<ConnectionState>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum ConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
 }
 
 impl OmegaConnection {
     pub fn new() -> Self {
         OmegaConnection {
-            read: Arc::new(RwLock::new(None)),
-            write: Arc::new(RwLock::new(None)),
+            read: Arc::new(Mutex::new(None)),
+            write: Arc::new(Mutex::new(None)),
             pingpong: Arc::new(Mutex::new(None)),
             last_ping: Arc::new(Mutex::new(-1)),
             message_send_times: Arc::new(Mutex::new(HashMap::new())),
-            is_connected: Arc::new(RwLock::new(false)),
+            state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
         }
     }
-    pub fn connect(self: Arc<OmegaConnection>) {
-        let cloned_self = self.clone();
-        tokio::spawn(async move {
-            cloned_self.connect_internal(0).await;
-        });
-    }
     async fn connect_internal(self: Arc<OmegaConnection>, mut retry: usize) {
+        if self.state.read().await.eq(&ConnectionState::Connected) {
+            return;
+        }
+        if self.state.read().await.eq(&ConnectionState::Connecting) {
+            let start = Instant::now();
+            let timeout = Duration::from_secs(10);
+            while self.state.read().await.eq(&ConnectionState::Connecting)
+                && start.elapsed() < timeout
+            {
+                sleep(Duration::from_millis(100)).await;
+            }
+            return;
+        }
+
+        *self.state.write().await = ConnectionState::Connecting;
+
+        if let Some(handle) = self.pingpong.lock().await.take() {
+            handle.abort();
+        }
+
         loop {
             if retry > 5 {
                 log_err!(
@@ -100,6 +132,7 @@ impl OmegaConnection {
                     PrintType::Omega,
                     "Max retry attempts reached, giving up."
                 );
+                *self.state.write().await = ConnectionState::Disconnected;
                 return;
             }
 
@@ -107,16 +140,17 @@ impl OmegaConnection {
                 env::var("OMEGA_HOST").unwrap_or("wss://omega.tensamin.net/ws/omikron".to_string());
             match connect_async(&url_str).await {
                 Ok((ws_stream, _)) => {
-                    *self.is_connected.write().await = true;
                     log_in!(0, PrintType::Omega, "WebSocket connected to {}", url_str);
                     retry = 0;
                     let (write, read) = ws_stream.split();
-                    *self.read.write().await = Some(read);
-                    *self.write.write().await = Some(write);
+                    *self.read.lock().await = Some(read);
+                    *self.write.lock().await = Some(write);
 
-                    let cloned_self = self.clone();
-                    tokio::spawn(async move {
-                        cloned_self.clone().read_loop().await;
+                    *self.state.write().await = ConnectionState::Connected;
+
+                    let read_loop_self = self.clone();
+                    let read_loop_handle = tokio::spawn(async move {
+                        read_loop_self.read_loop().await;
                     });
 
                     let cloned_self = self.clone();
@@ -137,148 +171,157 @@ impl OmegaConnection {
                                 );
                         WAITING_TASKS.insert(
                             id,
-                            Box::new(|selfc, cv| {
-                                if cv.is_type(CommunicationType::error_not_found) {
-                                    log_err!(0,
-                                        PrintType::Omega,
-                                        "Identification failed: Omikron ID not found on Omega.",
-                                    );
-                                    return false;
-                                }
-                                if !cv.is_type(CommunicationType::challenge) {
-                                    return false;
-                                }
-                                tokio::spawn(async move {
-                                    let task = async move {
-                                        let challenge = cv
-                                            .get_data(DataTypes::challenge)
-                                            .and_then(|v| v.as_str())
-                                            .ok_or_else(|| {
-                                                "Challenge not found or not a string".to_string()
-                                            })?;
-
-                                        let server_pub_key = cv
-                                            .get_data(DataTypes::public_key)
-                                            .and_then(|v| v.as_str())
-                                            .ok_or_else(|| {
-                                                "Public key from server not found or not a string"
-                                                    .to_string()
-                                            })?;
-
-                                        let decrypted_challenge = decrypt_b64(
-                                            &secret_key_to_base64(&get_private_key()),
-                                            server_pub_key,
-                                            challenge,
-                                        )
-                                        .map_err(|e| {
-                                            format!("Failed to decrypt challenge: {:?}", e)
-                                        })?;
-
-                                        let response_msg = CommunicationValue::new(
-                                            CommunicationType::challenge_response,
-                                        )
-                                        .with_id(cv.get_id())
-                                        .add_data(
-                                            DataTypes::challenge,
-                                            JsonValue::String(decrypted_challenge),
+                            WaitingTask {
+                                task: Box::new(|selfc, cv| {
+                                    if cv.is_type(CommunicationType::error_not_found) {
+                                        log_err!(0,
+                                            PrintType::Omega,
+                                            "Identification failed: Omikron ID not found on Omega.",
                                         );
-
-                                        let response_id = response_msg.get_id();
-                                        WAITING_TASKS.insert(
-                                            response_id,
-                                            Box::new(|selfc, final_cv| {
-                                                if !final_cv
-                                                    .is_type(CommunicationType::identification_response)
-                                                {
-                                                    log_err!(0,
-                                                        PrintType::Omega,
-                                                        "Expected identification_response, got something else.",
-                                                    );
-                                                    return false;
-                                                }
-
-                                                if let Some(accepted) = final_cv.get_data(DataTypes::accepted).and_then(|v| v.as_bool()) {
-                                                    if !accepted {
-                                                        log_err!(0, PrintType::Omega, "Omega did not accept identification.");
-                                                        return false;
-                                                    }
-                                                } else {
-                                                    log_err!(0, PrintType::Omega, "Omega response did not contain 'accepted' field.");
-                                                    return false;
-                                                }
-
-                                                tokio::spawn(async move {
-                                                    let mut connected_iota_ids: Vec<JsonValue> = Vec::new();
-                                                    let mut connected_user_ids: Vec<JsonValue> = Vec::new();
-                                                    let rho_connections_reader = RHO_CONNECTIONS.read().await;
-
-                                                    for iota_id in rho_connections_reader.keys() {
-                                                        connected_iota_ids.push(JsonValue::from(*iota_id));
-                                                    }
-
-                                                    for rho in rho_connections_reader.values() {
-                                                        for client_conn in rho.get_client_connections().await {
-                                                            connected_user_ids.push(JsonValue::from(client_conn.get_user_id().await));
-                                                        }
-                                                    }
-
-                                                    drop(rho_connections_reader);
-
-                                                    let sync_msg = CommunicationValue::new(CommunicationType::sync_client_iota_status)
-                                                        .add_data(DataTypes::iota_ids, JsonValue::Array(connected_iota_ids))
-                                                        .add_data(DataTypes::user_ids, JsonValue::Array(connected_user_ids))
-                                                        .add_data(DataTypes::rho_connections, JsonValue::from(connection_count().await));
-
-                                                    selfc.send_message(&sync_msg).await;
-                                                });
-                                                log!(0,
-                                                    PrintType::Omega,
-                                                    "Successfully identified with Omega.",
-                                                );
-                                                true
-                                            }),
-                                        );
-
-                                        selfc.send_message(&response_msg).await;
-
-                                        Ok::<(), String>(())
-                                    };
-
-                                    if let Err(e) = task.await {
-                                        log_err!(0, PrintType::Omega, "{}", &e);
+                                        return false;
                                     }
-                                });
+                                    if !cv.is_type(CommunicationType::challenge) {
+                                        return false;
+                                    }
+                                    tokio::spawn(async move {
+                                        let task = async move {
+                                            let challenge = cv
+                                                .get_data(DataTypes::challenge)
+                                                .and_then(|v| v.as_str())
+                                                .ok_or_else(|| {
+                                                    "Challenge not found or not a string".to_string()
+                                                })?;
 
-                                true
-                            }),
+                                            let server_pub_key = cv
+                                                .get_data(DataTypes::public_key)
+                                                .and_then(|v| v.as_str())
+                                                .ok_or_else(|| {
+                                                    "Public key from server not found or not a string"
+                                                        .to_string()
+                                                })?;
+
+                                            let decrypted_challenge = decrypt_b64(
+                                                &secret_key_to_base64(&get_private_key()),
+                                                server_pub_key,
+                                                challenge,
+                                            )
+                                            .map_err(|e| {
+                                                format!("Failed to decrypt challenge: {:?}", e)
+                                            })?;
+
+                                            let response_msg = CommunicationValue::new(
+                                                CommunicationType::challenge_response,
+                                            )
+                                            .with_id(cv.get_id())
+                                            .add_data(
+                                                DataTypes::challenge,
+                                                JsonValue::String(decrypted_challenge),
+                                            );
+
+                                            let response_id = response_msg.get_id();
+                                            WAITING_TASKS.insert(
+                                                response_id,
+                                                WaitingTask {
+                                                    task: Box::new(|selfc, final_cv| {
+                                                        if !final_cv
+                                                            .is_type(CommunicationType::identification_response)
+                                                        {
+                                                            log_err!(0,
+                                                                PrintType::Omega,
+                                                                "Expected identification_response, got something else.",
+                                                            );
+                                                            return false;
+                                                        }
+
+                                                        if let Some(accepted) = final_cv.get_data(DataTypes::accepted).and_then(|v| v.as_bool()) {
+                                                            if !accepted {
+                                                                log_err!(0, PrintType::Omega, "Omega did not accept identification.");
+                                                                return false;
+                                                            }
+                                                        } else {
+                                                            log_err!(0, PrintType::Omega, "Omega response did not contain 'accepted' field.");
+                                                            return false;
+                                                        }
+
+                                                        tokio::spawn(async move {
+                                                            let mut connected_iota_ids: Vec<JsonValue> = Vec::new();
+                                                            let mut connected_user_ids: Vec<JsonValue> = Vec::new();
+                                                            let rho_connections_reader = RHO_CONNECTIONS.read().await;
+
+                                                            for iota_id in rho_connections_reader.keys() {
+                                                                connected_iota_ids.push(JsonValue::from(*iota_id));
+                                                            }
+
+                                                            for rho in rho_connections_reader.values() {
+                                                                for client_conn in rho.get_client_connections().await {
+                                                                    connected_user_ids.push(JsonValue::from(client_conn.get_user_id().await));
+                                                                }
+                                                            }
+
+                                                            drop(rho_connections_reader);
+
+                                                            let sync_msg = CommunicationValue::new(CommunicationType::sync_client_iota_status)
+                                                                .add_data(DataTypes::iota_ids, JsonValue::Array(connected_iota_ids))
+                                                                .add_data(DataTypes::user_ids, JsonValue::Array(connected_user_ids))
+                                                                .add_data(DataTypes::rho_connections, JsonValue::from(connection_count().await));
+
+                                                            selfc.send_message(&sync_msg).await;
+                                                        });
+                                                        log!(0,
+                                                            PrintType::Omega,
+                                                            "Successfully identified with Omega.",
+                                                        );
+                                                        true
+                                                    }),
+                                                    inserted_at: Instant::now(),
+                                                }
+                                            );
+
+                                            selfc.send_message(&response_msg).await;
+
+                                            Ok::<(), String>(())
+                                        };
+
+                                        if let Err(e) = task.await {
+                                            log_err!(0, PrintType::Omega, "{}", &e);
+                                        }
+                                    });
+
+                                    true
+                                }),
+                                inserted_at: Instant::now(),
+                            }
                         );
                         cloned_self.send_message(&identify_msg).await
                     });
 
-                    let cloned_self = self.clone();
+                    let ping_pong_self = self.clone();
                     let handle = tokio::spawn(async move {
                         loop {
-                            if *cloned_self.is_connected.read().await == false {
+                            if *ping_pong_self.state.read().await != ConnectionState::Connected {
                                 break;
                             }
-                            cloned_self.send_ping().await;
+                            ping_pong_self.send_ping().await;
                             sleep(Duration::from_secs(5)).await;
                         }
                     });
 
-                    *self.is_connected.write().await = true;
                     *self.pingpong.lock().await = Some(handle);
 
-                    while *self.is_connected.read().await {
-                        sleep(Duration::from_secs(2)).await;
-                    }
-                    *self.read.write().await = None;
-                    *self.write.write().await = None;
+                    read_loop_handle.await.unwrap_or_else(|e| {
+                        log_err!(0, PrintType::Omega, "Read loop task failed: {}", e)
+                    });
+
+                    *self.read.lock().await = None;
+                    *self.write.lock().await = None;
+                    *self.state.write().await = ConnectionState::Disconnected;
+
                     log_err!(0, PrintType::Omega, "Connection lost. Retrying...");
                     retry += 1;
                     sleep(Duration::from_secs(2)).await;
                 }
                 Err(e) => {
+                    *self.state.write().await = ConnectionState::Disconnected;
                     log_err!(
                         0,
                         PrintType::Omega,
@@ -295,15 +338,13 @@ impl OmegaConnection {
     }
 
     async fn read_loop(self: Arc<Self>) {
+        let mut reader = match self.read.lock().await.take() {
+            Some(reader) => reader,
+            None => return,
+        };
+
         loop {
-            let msg = {
-                let mut guard = self.read.write().await;
-                let ws = match guard.as_mut() {
-                    Some(ws) => ws,
-                    _ => break,
-                };
-                ws.next().await
-            };
+            let msg = reader.next().await;
 
             match msg {
                 Some(Ok(Message::Text(msg))) => {
@@ -314,9 +355,8 @@ impl OmegaConnection {
                     }
                     let msg_id = cv.get_id();
                     log_in!(0, PrintType::Omega, "{}", &cv.to_json().to_string());
-                    // Handle waiting tasks
                     if let Some(task) = WAITING_TASKS.remove(&msg_id) {
-                        if (task.1)(self.clone(), cv.clone()) {
+                        if (task.1.task)(self.clone(), cv.clone()) {
                             continue;
                         }
                     } else {
@@ -328,21 +368,17 @@ impl OmegaConnection {
                 _ => {}
             }
         }
-
-        *self.is_connected.write().await = false;
-        *self.read.write().await = None;
-        *self.write.write().await = None;
     }
 
     pub async fn send_message(&self, cv: &CommunicationValue) {
-        let mut guard = self.write.write().await;
+        if !cv.is_type(CommunicationType::ping) {
+            log_out!(0, PrintType::Omega, "{}", &cv.to_json().to_string());
+        }
+        let msg = cv.to_json().to_string();
+
+        let mut guard = self.write.lock().await;
         if let Some(ws) = guard.as_mut() {
-            if !cv.is_type(CommunicationType::ping) {
-                log_out!(0, PrintType::Omega, "{}", &cv.to_json().to_string());
-            }
-            let _ = ws
-                .send(Message::Text(cv.to_json().to_string().into()))
-                .await;
+            let _ = ws.send(Message::Text(msg.into())).await;
         }
     }
 
@@ -378,20 +414,22 @@ impl OmegaConnection {
 
         WAITING_TASKS.insert(
             msg_id,
-            Box::new(
-                move |_: Arc<OmegaConnection>, response: CommunicationValue| {
-                    let _ = Box::pin(async move |_: CommunicationValue| {
-                        let rho = rho_manager::get_rho_con_for_user(user_id).await;
-                        if let Some(rho) = rho {
-                            for client in rho.get_client_connections_for_user(user_id).await {
-                                client.send_message(&response).await;
+            WaitingTask {
+                task: Box::new(
+                    move |_: Arc<OmegaConnection>, response: CommunicationValue| {
+                        tokio::spawn(async move {
+                            let rho = rho_manager::get_rho_con_for_user(user_id).await;
+                            if let Some(rho) = rho {
+                                for client in rho.get_client_connections_for_user(user_id).await {
+                                    client.send_message(&response).await;
+                                }
                             }
-                        }
+                        });
                         true
-                    });
-                    true
-                },
-            ),
+                    },
+                ),
+                inserted_at: Instant::now(),
+            },
         );
 
         OmegaConnection::send_global(cv).await;
@@ -402,17 +440,15 @@ impl OmegaConnection {
     }
 
     pub async fn await_connection(&self, timeout_duration: Option<Duration>) -> Result<(), String> {
-        if *self.is_connected.read().await {
+        if *self.state.read().await == ConnectionState::Connected {
             return Ok(());
         }
         let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
 
         let start = Instant::now();
         loop {
-            {
-                if *self.is_connected.read().await {
-                    return Ok(());
-                }
+            if *self.state.read().await == ConnectionState::Connected {
+                return Ok(());
             }
 
             if start.elapsed() >= timeout {
@@ -431,27 +467,29 @@ impl OmegaConnection {
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
-        let _ = self.await_connection(timeout_duration).await;
+        self.await_connection(timeout_duration).await?;
         let (tx, mut rx) = mpsc::channel(1);
         let msg_id = cv.get_id();
 
         let task_tx = tx.clone();
         WAITING_TASKS.insert(
             msg_id,
-            Box::new(move |_, response_cv| {
-                let inner_tx = task_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = inner_tx.send(response_cv).await {
-                        log_err!(
-                            0,
-                            PrintType::Omega,
-                            "Failed to send response back to awaiter: {}",
-                            e
-                        );
-                    }
-                });
-                true
-            }),
+            WaitingTask {
+                task: Box::new(move |_, response_cv| {
+                    let inner_tx = task_tx.clone();
+                    tokio::spawn(async move {
+                        if inner_tx.send(response_cv).await.is_err() {
+                            log_err!(
+                                0,
+                                PrintType::Omega,
+                                "Failed to send response back to awaiter",
+                            );
+                        }
+                    });
+                    true
+                }),
+                inserted_at: Instant::now(),
+            },
         );
 
         self.send_message(cv).await;

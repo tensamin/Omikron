@@ -15,7 +15,7 @@ use uuid::Uuid;
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::anonymous_clients::anonymous_manager;
 use crate::calls::{call_manager, call_util};
-use crate::omega::omega_connection::{WAITING_TASKS, get_omega_connection};
+use crate::omega::omega_connection::get_omega_connection;
 use crate::util::crypto_helper::{load_public_key, public_key_to_base64};
 use crate::util::crypto_util::{DataFormat, SecurePayload};
 use crate::util::logger::PrintType;
@@ -374,19 +374,17 @@ impl ClientConnection {
     }
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
         let client_for_closure = self.clone();
-        WAITING_TASKS.insert(
-            cv.get_id(),
-            Box::new(move |_, response_cv| {
-                let client = client_for_closure.clone();
-                tokio::spawn(async move {
-                    client.send_message(&response_cv).await;
-                });
-                true
-            }),
-        );
-        get_omega_connection()
-            .send_message(&cv.with_sender(*self.user_id.read().await))
-            .await;
+        tokio::spawn(async move {
+            let response_cv = get_omega_connection()
+                .await_response(
+                    &cv.with_sender(*self.user_id.read().await),
+                    Some(Duration::from_secs(20)),
+                )
+                .await;
+            if let Ok(response_cv) = response_cv {
+                client_for_closure.send_message(&response_cv).await;
+            }
+        });
     }
 
     /// Handle ping message

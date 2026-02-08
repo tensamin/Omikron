@@ -19,7 +19,6 @@ use crate::{
         anonymous_client_connection::AnonymousClientConnection, anonymous_manager,
     },
     calls::call_util::garbage_collect_calls,
-    omega::omega_connection::OmegaConnection,
     rho::{client_connection::ClientConnection, iota_connection::IotaConnection},
     util::{
         crypto_helper::{load_public_key, load_secret_key},
@@ -39,9 +38,6 @@ pub fn get_public_key() -> x448::PublicKey {
 #[tokio::main]
 async fn main() {
     dotenv().ok();
-    tokio::spawn(async move {
-        Arc::new(OmegaConnection::new()).connect();
-    });
     startup();
     let address = format!(
         "{}:{}",
