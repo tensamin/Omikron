@@ -1,5 +1,6 @@
 use async_tungstenite::tungstenite::Message;
 use async_tungstenite::{WebSocketReceiver, WebSocketSender};
+use base64::engine::general_purpose::STANDARD;
 use json::JsonValue;
 use json::number::Number;
 use rand::Rng;
@@ -201,11 +202,11 @@ impl ClientConnection {
                         .take(32)
                         .map(char::from)
                         .collect();
-
+                    log_in!(user_id, PrintType::Omikron, "Challenge: {}", &challenge);
                     *self.challenge.write().await = challenge.clone();
 
                     let encrypted_challenge =
-                        SecurePayload::new(challenge, DataFormat::Raw, get_private_key())
+                        SecurePayload::new(&challenge, DataFormat::Base64, get_private_key())
                             .unwrap()
                             .encrypt_x448(pub_key)
                             .unwrap()
