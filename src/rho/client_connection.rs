@@ -1,5 +1,6 @@
 use async_tungstenite::tungstenite::Message;
 use async_tungstenite::{WebSocketReceiver, WebSocketSender};
+use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use json::JsonValue;
 use json::number::Number;
@@ -202,11 +203,11 @@ impl ClientConnection {
                         .take(32)
                         .map(char::from)
                         .collect();
-                    log_in!(user_id, PrintType::Omikron, "Challenge: {}", &challenge);
+
                     *self.challenge.write().await = challenge.clone();
 
                     let encrypted_challenge =
-                        SecurePayload::new(&challenge, DataFormat::Base64, get_private_key())
+                        SecurePayload::new(&challenge, DataFormat::Raw, get_private_key())
                             .unwrap()
                             .encrypt_x448(pub_key)
                             .unwrap()
@@ -240,7 +241,8 @@ impl ClientConnection {
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                if client_response == *self.challenge.read().await {
+                let debase64d = STANDARD.decode(&client_response).unwrap();
+                if String::from_utf8(debase64d.clone()).unwrap() == *self.challenge.read().await {
                     *self.challenged.write().await = true;
 
                     let user_id = self.get_user_id().await;
@@ -410,7 +412,7 @@ impl ClientConnection {
         // Send pong response
         let response = CommunicationValue::new(CommunicationType::pong)
             .with_id(cv.get_id())
-            .add_data_str(DataTypes::ping_iota, iota_ping.to_string());
+            .add_data(DataTypes::ping_iota, JsonValue::from(iota_ping));
 
         self.send_message(&response).await;
     }
