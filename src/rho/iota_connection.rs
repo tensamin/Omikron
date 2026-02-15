@@ -149,7 +149,7 @@ impl IotaConnection {
     pub async fn handle_message(self: Arc<Self>, message: Utf8Bytes) {
         let cv = CommunicationValue::from_json(&message);
         // Handle ping
-        if cv.is_type(CommunicationType::ping) {
+        if cv.is_type(CommunicationType::ping) || cv.is_type(CommunicationType::pong) {
             self.handle_ping(cv).await;
             return;
         }

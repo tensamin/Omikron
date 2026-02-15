@@ -60,7 +60,7 @@ async fn main() {
             let mut path: String = "/".to_string();
 
             let callback = |req: &Request, response: Response| {
-                path = req.uri().path().to_string(); // Extract URI path
+                path = req.uri().path().to_string();
                 Ok(response)
             };
             let ws_stream = match accept_hdr_async(stream.compat(), callback).await {
@@ -71,7 +71,7 @@ async fn main() {
                 }
             };
             let (sender, receiver) = ws_stream.split();
-            if path == "/ws/client/" {
+            if path.starts_with("/ws/client") {
                 log_in!(0, PrintType::Client, "New Client connection");
                 let client_conn: Arc<ClientConnection> =
                     Arc::from(ClientConnection::new(sender, receiver));
@@ -117,7 +117,7 @@ async fn main() {
                         }
                     }
                 }
-            } else if path == "/ws/anonymous_client/" {
+            } else if path.starts_with("/ws/anonymous_client") {
                 log_in!(0, PrintType::Client, "New Anonymous Client connection");
                 let client_conn: Arc<AnonymousClientConnection> =
                     Arc::from(AnonymousClientConnection::new(sender, receiver));
@@ -176,7 +176,7 @@ async fn main() {
                         }
                     }
                 }
-            } else if path == "/ws/iota/" {
+            } else if path.starts_with("/ws/iota") {
                 log_in!(0, PrintType::Iota, "New Iota connection");
                 let iota_conn: Arc<IotaConnection> =
                     Arc::from(IotaConnection::new(sender, receiver));

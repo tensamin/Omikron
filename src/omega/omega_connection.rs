@@ -349,7 +349,7 @@ impl OmegaConnection {
             match msg {
                 Some(Ok(Message::Text(msg))) => {
                     let cv = CommunicationValue::from_json(&msg);
-                    if cv.is_type(CommunicationType::pong) {
+                    if cv.is_type(CommunicationType::pong) || cv.is_type(CommunicationType::ping) {
                         self.handle_pong(&cv, true).await;
                         continue;
                     }

@@ -109,7 +109,7 @@ impl ClientConnection {
             );
             return;
         }
-        if !cv.is_type(CommunicationType::pong) {
+        if !cv.is_type(CommunicationType::pong) && !cv.is_type(CommunicationType::ping) {
             log_out!(
                 self.get_user_id().await,
                 PrintType::Client,
