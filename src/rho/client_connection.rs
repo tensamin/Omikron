@@ -421,7 +421,7 @@ impl ClientConnection {
     async fn handle_client_changed(self: Arc<Self>, cv: CommunicationValue) {
         let user_id = self.get_user_id().await;
         if let Some(_status_str) = cv.get_data(DataTypes::user_state) {
-            let user_status = UserStatus::online;
+            let user_status = UserStatus::user_online;
             if let Some(rho_conn) = self.get_rho_connection().await {
                 OmegaConnection::client_changed(rho_conn.get_iota_id().await, user_id, user_status)
                     .await;
