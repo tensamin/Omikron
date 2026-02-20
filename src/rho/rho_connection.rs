@@ -76,7 +76,7 @@ impl RhoConnection {
         OmegaConnection::client_changed(
             self.get_iota_id().await,
             connection.get_user_id().await,
-            UserStatus::online,
+            UserStatus::user_online,
         )
         .await;
     }
