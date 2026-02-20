@@ -440,7 +440,8 @@ impl IotaConnection {
             || cv.is_type(CommunicationType::complete_register_user)
             || cv.is_type(CommunicationType::delete_iota)
         {
-            self.handle_omega_forward(cv).await;
+            let sender = self.get_iota_id().await;
+            self.handle_omega_forward(cv.with_sender(sender)).await;
             return;
         }
         // Forward to client

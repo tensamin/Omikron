@@ -8,7 +8,8 @@ use rand::Rng;
 use rand::distributions::Alphanumeric;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use sysinfo::System;
 use tokio::sync::RwLock;
 use tokio_util::compat::Compat;
 use tungstenite::Utf8Bytes;
@@ -370,7 +371,8 @@ impl ClientConnection {
                 || cv.is_type(CommunicationType::get_iota_data)
                 || cv.is_type(CommunicationType::delete_user)
             {
-                self.handle_omega_forward(cv).await;
+                let sender = self.get_user_id().await;
+                self.handle_omega_forward(cv.with_sender(sender)).await;
                 return;
             }
             // Forward other messages to Iota
@@ -396,10 +398,12 @@ impl ClientConnection {
     async fn handle_ping(self: Arc<Self>, cv: CommunicationValue) {
         // Update our ping if provided
         if let Some(last_ping) = cv.get_data(DataTypes::last_ping) {
-            if let Ok(ping_val) = last_ping.to_string().parse::<i64>() {
-                let mut ping_guard = self.ping.write().await;
-                *ping_guard = ping_val;
-            }
+            let current = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let mut ping_guard = self.ping.write().await;
+            *ping_guard = current as i64 - last_ping.as_i64().unwrap();
         }
 
         // Get Iota ping from RhoConnection
