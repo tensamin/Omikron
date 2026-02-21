@@ -29,7 +29,7 @@ use crate::{
     },
     omega::omega_connection::OmegaConnection,
 };
-use crate::{get_private_key, get_public_key, log_in, log_out};
+use crate::{get_private_key, get_public_key, log_cv_in, log_in, log_out};
 
 pub struct ClientConnection {
     pub sender: Arc<RwLock<WebSocketSender<Compat<tokio::net::TcpStream>>>>,
@@ -131,12 +131,7 @@ impl ClientConnection {
                 self.handle_ping(cv).await;
                 return;
             }
-            log_in!(
-                self.get_user_id().await,
-                PrintType::Client,
-                "{}",
-                &cv.to_json().to_string()
-            );
+            log_cv_in!(PrintType::Client, cv);
             let identified = *self.identified.read().await;
             let challenged = *self.challenged.read().await;
 

@@ -8,6 +8,9 @@ use std::{
 };
 
 use ansi_term::Color;
+use json::JsonValue;
+
+use crate::data::communication::CommunicationValue;
 
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 
@@ -136,5 +139,86 @@ macro_rules! log_out {
 macro_rules! log_err {
     ($sender:expr, $kind:expr, $($arg:tt)*) => {
         $crate::util::logger::log_internal($sender, $kind, ">>", true, format!($($arg)*))
+    };
+}
+
+// ******** COMMUNICATION VALUES ********
+pub fn log_cv_internal(
+    prefix: &'static str,
+    cv: &CommunicationValue,
+    print_type: Option<PrintType>,
+) {
+    let formatted = format_cv(cv);
+
+    log_internal(
+        cv.get_sender(),
+        print_type.unwrap_or(PrintType::General),
+        prefix,
+        false,
+        formatted,
+    );
+}
+
+pub fn format_cv(cv: &CommunicationValue) -> String {
+    let mut parts = Vec::new();
+
+    let sender = cv.get_sender();
+    let receiver = cv.get_receiver();
+
+    if sender > 0 && receiver > 0 {
+        parts.push(format!("{} > {}", sender, receiver));
+    } else if sender > 0 {
+        parts.push(format!("{}", sender));
+    } else if receiver > 0 {
+        parts.push(format!("> {}", receiver));
+    }
+
+    let comm_type = cv.get_type().to_string();
+    parts.push(format!("{}", comm_type));
+
+    let mut data_parts = Vec::new();
+    if let JsonValue::Object(data) = &cv.clone().to_json()["data"] {
+        for (key, value) in data.iter() {
+            let val_string = match value {
+                JsonValue::String(s) => s.clone(),
+                _ => value.dump(),
+            };
+
+            data_parts.push(format!("{} {}", key, val_string));
+        }
+    }
+
+    if !data_parts.is_empty() {
+        parts.push(format!("{}", data_parts.join(", ")));
+    }
+
+    parts.join(": ")
+}
+#[macro_export]
+macro_rules! log_cv {
+    ($kind:expr, $cv:expr) => {
+        $crate::util::logger::log_cv_internal("", &$cv, Some($kind))
+    };
+    ($cv:expr) => {
+        $crate::util::logger::log_cv_internal("", &$cv, None)
+    };
+}
+
+#[macro_export]
+macro_rules! log_cv_in {
+    ($kind:expr, $cv:expr) => {
+        $crate::util::logger::log_cv_internal("> ", &$cv, Some($kind))
+    };
+    ($cv:expr) => {
+        $crate::util::logger::log_cv_internal("> ", &$cv, None)
+    };
+}
+#[macro_export]
+macro_rules! log_cv_out {
+    ($kind:expr, $cv:expr) => {
+        $crate::util::logger::log_cv_internal("< ", &$cv, Some($kind))
+    };
+    ($cv:expr) => {
+        $crate::util::logger::log_cv_internal("< ", &$cv, None)
     };
 }

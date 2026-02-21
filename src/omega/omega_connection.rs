@@ -4,6 +4,7 @@ use async_tungstenite::{
     tokio::{TokioAdapter, connect_async},
     tungstenite::protocol::Message,
 };
+use crossterm::style::Print;
 use dashmap::DashMap;
 use futures::prelude::*;
 use json::{JsonValue, number::Number};
@@ -17,19 +18,19 @@ use tokio::{
 use tokio_native_tls::TlsStream;
 use uuid::Uuid;
 
-use crate::log_err;
 use crate::{
     data::{
         communication::{CommunicationType, CommunicationValue, DataTypes},
         user::UserStatus,
     },
-    get_private_key, log, log_in, log_out,
+    get_private_key, log, log_cv_out, log_in, log_out,
     rho::rho_manager::{self, RHO_CONNECTIONS, connection_count},
     util::{
         crypto_helper::{decrypt_b64, secret_key_to_base64},
         logger::PrintType,
     },
 };
+use crate::{log_cv_in, log_err};
 
 pub struct WaitingTask {
     pub task: Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>,
@@ -349,12 +350,12 @@ impl OmegaConnection {
             match msg {
                 Some(Ok(Message::Text(msg))) => {
                     let cv = CommunicationValue::from_json(&msg);
+                    log_cv_in!(PrintType::Omega, cv);
                     if cv.is_type(CommunicationType::pong) || cv.is_type(CommunicationType::ping) {
                         self.handle_pong(&cv, true).await;
                         continue;
                     }
                     let msg_id = cv.get_id();
-                    log_in!(0, PrintType::Omega, "{}", &cv.to_json().to_string());
                     if let Some(task) = WAITING_TASKS.remove(&msg_id) {
                         if (task.1.task)(self.clone(), cv.clone()) {
                             continue;
@@ -371,9 +372,7 @@ impl OmegaConnection {
     }
 
     pub async fn send_message(&self, cv: &CommunicationValue) {
-        if !cv.is_type(CommunicationType::ping) {
-            log_out!(0, PrintType::Omega, "{}", &cv.to_json().to_string());
-        }
+        log_cv_out!(PrintType::Omega, cv);
         let msg = cv.to_json().to_string();
 
         let mut guard = self.write.lock().await;

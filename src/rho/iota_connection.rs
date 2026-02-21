@@ -2,6 +2,7 @@ use crate::calls::call_group::CallGroup;
 use crate::calls::call_manager;
 use crate::get_private_key;
 use crate::get_public_key;
+use crate::log_cv_in;
 use crate::log_err;
 use crate::log_in;
 use crate::log_out;
@@ -154,12 +155,7 @@ impl IotaConnection {
             return;
         }
 
-        log_in!(
-            self.get_iota_id().await,
-            PrintType::Iota,
-            "{}",
-            cv.to_json().to_string()
-        );
+        log_cv_in!(PrintType::Iota, cv);
 
         let identified = *self.identified.read().await;
         let challenged = *self.challenged.read().await;
