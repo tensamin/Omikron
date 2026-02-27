@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
@@ -8,9 +9,7 @@ use std::{
 };
 
 use ansi_term::Color;
-use json::JsonValue;
-
-use crate::data::communication::CommunicationValue;
+use epsilon_core::{CommunicationValue, DataTypes, DataValue};
 
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 
@@ -151,7 +150,7 @@ pub fn log_cv_internal(
     let formatted = format_cv(cv);
 
     log_internal(
-        cv.get_sender(),
+        cv.get_sender() as i64,
         print_type.unwrap_or(PrintType::General),
         prefix,
         false,
@@ -176,24 +175,80 @@ pub fn format_cv(cv: &CommunicationValue) -> String {
     let comm_type = cv.get_type().to_string();
     parts.push(format!("{}", comm_type));
 
-    let mut data_parts = Vec::new();
-    if let JsonValue::Object(data) = &cv.clone().to_json()["data"] {
-        for (key, value) in data.iter() {
-            let val_string = match value {
-                JsonValue::String(s) => s.clone(),
-                _ => value.dump(),
-            };
+    let data: &HashMap<DataTypes, DataValue> = cv.get_data_container();
 
-            data_parts.push(format!("{} {}", key, val_string));
-        }
-    }
+    let formated_data =
+        format_data_container(data.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
 
-    if !data_parts.is_empty() {
-        parts.push(format!("{}", data_parts.join(", ")));
-    }
+    parts.push(format!("{}", formated_data));
 
     parts.join(": ")
 }
+
+fn format_data_container(data: Vec<(DataTypes, DataValue)>) -> String {
+    let parts: Vec<String> = data
+        .into_iter()
+        .map(|(key, value)| {
+            let key_str = key.to_string();
+
+            match value {
+                DataValue::Str(s) => format!("{}=\"{}\"", key_str, s),
+
+                DataValue::Container(inner) => {
+                    let inner_formatted = format_data_container(inner);
+                    format!("{}={{ {} }}", key_str, inner_formatted)
+                }
+
+                DataValue::Array(arr) => {
+                    let arr_formatted = format_array(arr);
+                    format!("{}=[{}]", key_str, arr_formatted)
+                }
+
+                DataValue::Bool(b) => format!("{}={}", key_str, b),
+
+                DataValue::BoolTrue => format!("{}=true", key_str),
+                DataValue::BoolFalse => format!("{}=false", key_str),
+
+                DataValue::Number(num) => format!("{}={}", key_str, num),
+
+                _ => "".to_string(),
+            }
+        })
+        .collect();
+
+    parts.join(", ")
+}
+
+fn format_array(arr: Vec<DataValue>) -> String {
+    let parts: Vec<String> = arr
+        .into_iter()
+        .map(|value| match value {
+            DataValue::Str(s) => format!("\"{}\"", s),
+
+            DataValue::Container(inner) => {
+                let inner_formatted = format_data_container(inner);
+                format!("{{ {} }}", inner_formatted)
+            }
+
+            DataValue::Array(inner_arr) => {
+                let formatted = format_array(inner_arr);
+                format!("[{}]", formatted)
+            }
+
+            DataValue::Bool(b) => b.to_string(),
+
+            DataValue::BoolTrue => "true".to_string(),
+            DataValue::BoolFalse => "false".to_string(),
+
+            DataValue::Number(num) => num.to_string(),
+
+            _ => String::new(),
+        })
+        .collect();
+
+    parts.join(", ")
+}
+
 #[macro_export]
 macro_rules! log_cv {
     ($kind:expr, $cv:expr) => {

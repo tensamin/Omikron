@@ -7,7 +7,7 @@ use crate::calls::{call_group::CallGroup, caller::Caller};
 
 pub static CALL_GROUPS: Lazy<DashMap<Uuid, Arc<CallGroup>>> = Lazy::new(|| DashMap::new());
 
-pub async fn get_call_invites(user_id: i64) -> Vec<Arc<Caller>> {
+pub async fn get_call_invites(user_id: u64) -> Vec<Arc<Caller>> {
     let mut callers = Vec::new();
     for (_, cg) in CALL_GROUPS.clone().into_iter() {
         let members = cg.members.read().await;
@@ -28,7 +28,7 @@ pub async fn get_call(call_id: Uuid) -> Option<Arc<CallGroup>> {
     }
 }
 
-pub async fn get_call_groups(user_id: i64) -> Vec<Arc<CallGroup>> {
+pub async fn get_call_groups(user_id: u64) -> Vec<Arc<CallGroup>> {
     let mut call_groups = Vec::new();
     for (_, cg) in CALL_GROUPS.clone().into_iter() {
         let is_member = {
@@ -43,7 +43,7 @@ pub async fn get_call_groups(user_id: i64) -> Vec<Arc<CallGroup>> {
     call_groups
 }
 
-pub async fn get_call_token(user_id: i64, call_id: Uuid) -> Option<String> {
+pub async fn get_call_token(user_id: u64, call_id: Uuid) -> Option<String> {
     if let Some(cg) = CALL_GROUPS.get(&call_id) {
         let mut members = cg.members.write().await;
 
@@ -80,7 +80,7 @@ pub async fn get_call_token(user_id: i64, call_id: Uuid) -> Option<String> {
     Some(caller.create_token())
 }
 
-pub async fn add_invite(call_id: Uuid, inviter_id: i64, invitee_id: i64) -> bool {
+pub async fn add_invite(call_id: Uuid, inviter_id: u64, invitee_id: u64) -> bool {
     if let Some(cg) = CALL_GROUPS.get(&call_id) {
         let mut members = cg.members.write().await;
 

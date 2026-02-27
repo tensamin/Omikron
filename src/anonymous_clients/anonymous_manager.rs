@@ -6,18 +6,18 @@ use std::sync::Arc;
 
 use crate::anonymous_clients::anonymous_client_connection::AnonymousClientConnection;
 
-static ANONYMOUS_USERS: Lazy<DashMap<i64, Arc<AnonymousClientConnection>>> =
+static ANONYMOUS_USERS: Lazy<DashMap<u64, Arc<AnonymousClientConnection>>> =
     Lazy::new(|| DashMap::new());
 
 pub async fn add_anonymous_user(connection: Arc<AnonymousClientConnection>) {
-    ANONYMOUS_USERS.insert(connection.get_user_id().await, connection);
+    ANONYMOUS_USERS.insert(connection.get_user_id(), connection);
 }
 
-pub async fn remove_anonymous_user(user_id: i64) {
+pub async fn remove_anonymous_user(user_id: u64) {
     ANONYMOUS_USERS.remove(&user_id);
 }
 
-pub async fn get_anonymous_user(user_id: i64) -> Option<Arc<AnonymousClientConnection>> {
+pub async fn get_anonymous_user(user_id: u64) -> Option<Arc<AnonymousClientConnection>> {
     ANONYMOUS_USERS.get(&user_id).map(|c| c.clone())
 }
 

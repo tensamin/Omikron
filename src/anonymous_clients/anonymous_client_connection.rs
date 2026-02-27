@@ -1,27 +1,24 @@
-use async_tungstenite::tungstenite::Message;
-use async_tungstenite::{WebSocketReceiver, WebSocketSender};
-use json::JsonValue;
-use json::number::Number;
+use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
+use epsilon_native::{Receiver, Sender};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::RwLock;
-use tokio_util::compat::Compat;
-use tungstenite::Utf8Bytes;
 use uuid::Uuid;
 
 use crate::anonymous_clients::anonymous_manager::{self, generate_username};
 use crate::calls::call_manager;
-use crate::data::communication::{CommunicationType, CommunicationValue, DataTypes};
 use crate::omega::omega_connection::get_omega_connection;
+use crate::rho::connection::GeneralConnection;
 use crate::rho::rho_manager;
 use crate::util::logger::PrintType;
-use crate::{log_in, log_out};
+use crate::{log_cv_in, log_cv_out, log_out};
 
 pub struct AnonymousClientConnection {
-    pub sender: Arc<RwLock<WebSocketSender<Compat<tokio::net::TcpStream>>>>,
-    pub receiver: Arc<RwLock<WebSocketReceiver<Compat<tokio::net::TcpStream>>>>,
-    pub user_id: Arc<RwLock<i64>>,
+    user_id: u64,
+
+    pub sender: Arc<Sender>,
+    pub receiver: Arc<Receiver>,
     pub ping: Arc<RwLock<i64>>,
     pub interested_users: Arc<RwLock<Vec<i64>>>,
     is_open: Arc<RwLock<bool>>,
@@ -31,33 +28,33 @@ pub struct AnonymousClientConnection {
 }
 
 impl AnonymousClientConnection {
-    /// Create a new AnonymousClientConnection
-    pub fn new(
-        sender: WebSocketSender<Compat<tokio::net::TcpStream>>,
-        receiver: WebSocketReceiver<Compat<tokio::net::TcpStream>>,
-    ) -> Arc<Self> {
+    pub async fn from_general(general: Arc<GeneralConnection>, user_id: u64) -> Arc<Self> {
         let username: String = generate_username();
         Arc::new(Self {
-            sender: Arc::new(RwLock::new(sender)),
-            receiver: Arc::new(RwLock::new(receiver)),
-            user_id: Arc::new(RwLock::new(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64,
-            )),
-            ping: Arc::new(RwLock::new(-1)),
+            user_id: user_id,
+
+            ping: Arc::new(RwLock::new(0)),
             interested_users: Arc::new(RwLock::new(Vec::new())),
             is_open: Arc::new(RwLock::new(true)),
+            sender: general.sender.clone(),
+            receiver: general.receiver.clone(),
             user_name: Arc::new(RwLock::new(username.to_lowercase())),
             display_name: Arc::new(RwLock::new(username)),
             avatar: Arc::new(RwLock::new(String::new())),
         })
     }
+    pub fn start(self: Arc<Self>) {
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            while let Ok(cv) = self_clone.receiver.receive().await {
+                self_clone.clone().handle_message(cv).await;
+            }
+        });
+    }
 
     /// Get the user ID
-    pub async fn get_user_id(&self) -> i64 {
-        *self.user_id.read().await
+    pub fn get_user_id(&self) -> u64 {
+        self.user_id
     }
 
     /// Get the user name
@@ -79,66 +76,35 @@ impl AnonymousClientConnection {
         self.avatar.read().await.clone()
     }
 
-    /// Send a string message to the client
-    pub async fn send_message_str(self: Arc<Self>, message: &str) {
-        let mut session = self.sender.write().await;
-        if let Err(e) = session
-            .send(Message::Text(Utf8Bytes::from(message.to_string())))
-            .await
-        {
-            log_out!(
-                self.get_user_id().await,
-                PrintType::Client,
-                "Failed to send message to anonymous client: {}",
-                e,
-            );
-        }
-    }
-
     /// Send a CommunicationValue to the client
     pub async fn send_message(self: Arc<Self>, cv: &CommunicationValue) {
         if !*self.is_open.read().await {
             log_out!(
-                self.get_user_id().await,
+                self.user_id as i64,
                 PrintType::Client,
                 "Attempted to send message to a closed connection."
             );
             return;
         }
         if !cv.is_type(CommunicationType::pong) {
-            log_out!(
-                self.get_user_id().await,
-                PrintType::Client,
-                "{}",
-                &cv.to_json().to_string()
-            );
+            log_cv_out!(PrintType::Client, &cv);
         }
-        self.send_message_str(&cv.to_json().to_string()).await;
+        self.sender.send(&cv).await;
     }
 
     /// Handle incoming message from client
-    pub async fn handle_message(self: Arc<Self>, message: Utf8Bytes) {
+    pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
         tokio::spawn(async move {
-            let cv = CommunicationValue::from_json(&message);
             if cv.is_type(CommunicationType::ping) {
                 self.handle_ping(cv).await;
                 return;
             }
-            log_in!(
-                self.get_user_id().await,
-                PrintType::Client,
-                "Anonymous: {}",
-                &cv.to_json().to_string()
-            );
+            log_cv_in!(PrintType::Client, &cv);
 
             if cv.is_type(CommunicationType::identification) {
-                let call_id = Uuid::parse_str(
-                    cv.get_data(DataTypes::call_id)
-                        .unwrap_or(&JsonValue::Null)
-                        .as_str()
-                        .unwrap_or(""),
-                )
-                .unwrap_or(Uuid::new_v4());
+                let call_id =
+                    Uuid::parse_str(cv.get_data(DataTypes::call_id).as_str().unwrap_or(""))
+                        .unwrap_or(Uuid::new_v4());
 
                 let call = if let Some(call) = call_manager::get_call(call_id).await {
                     if call.is_anonymous().await {
@@ -160,79 +126,62 @@ impl AnonymousClientConnection {
                     return;
                 };
 
-                let mut invited = JsonValue::new_array();
+                let mut invited = Vec::new();
                 for call_invitee in call.members.read().await.clone() {
                     let call_invitee_cv = get_omega_connection()
                         .await_response(
                             &CommunicationValue::new(CommunicationType::get_user_data).add_data(
                                 DataTypes::user_id,
-                                JsonValue::from(call_invitee.user_id),
+                                DataValue::Number(call_invitee.user_id as i64),
                             ),
                             Some(Duration::from_secs(2)),
                         )
                         .await
                         .unwrap();
-                    let mut json_invitee = JsonValue::new_object();
-                    let _ = json_invitee.insert(
-                        "user_id",
-                        call_invitee_cv
-                            .get_data(DataTypes::user_id)
-                            .unwrap_or(&JsonValue::Null)
-                            .clone(),
-                    );
-                    let _ = json_invitee.insert(
-                        "username",
-                        call_invitee_cv
-                            .get_data(DataTypes::username)
-                            .unwrap_or(&JsonValue::Null)
-                            .clone(),
-                    );
-                    let _ = json_invitee.insert(
-                        "display",
-                        call_invitee_cv
-                            .get_data(DataTypes::display)
-                            .unwrap_or(&JsonValue::Null)
-                            .clone(),
-                    );
-                    let _ = json_invitee.insert(
-                        "avatar",
-                        call_invitee_cv
-                            .get_data(DataTypes::avatar)
-                            .unwrap_or(&JsonValue::Null)
-                            .clone(),
-                    );
+                    let mut json_invitee = Vec::new();
+                    let _ = json_invitee.push((
+                        DataTypes::user_id,
+                        call_invitee_cv.get_data(DataTypes::user_id).clone(),
+                    ));
+                    let _ = json_invitee.push((
+                        DataTypes::username,
+                        call_invitee_cv.get_data(DataTypes::username).clone(),
+                    ));
+                    let _ = json_invitee.push((
+                        DataTypes::display,
+                        call_invitee_cv.get_data(DataTypes::display).clone(),
+                    ));
+                    let _ = json_invitee.push((
+                        DataTypes::avatar,
+                        call_invitee_cv.get_data(DataTypes::avatar).clone(),
+                    ));
 
-                    let _ = invited.push(json_invitee);
+                    let _ = invited.push(DataValue::Container(json_invitee));
                 }
 
-                let token = call.create_anonymous_token(self.get_user_id().await).await;
+                let token = call.create_anonymous_token(self.get_user_id()).await;
 
-                let mut serialized = JsonValue::new_object();
-                let _ = serialized.insert("call_id", JsonValue::String(call_id.to_string()));
-                let _ = serialized.insert("call_invited", invited.clone());
-                let _ = serialized.insert("call_members", invited);
-                let _ = serialized.insert("call_token", JsonValue::String(token.unwrap()));
+                let mut serialized = Vec::new();
+                let _ = serialized.push((DataTypes::call_id, DataValue::Str(call_id.to_string())));
+                let _ =
+                    serialized.push((DataTypes::call_invited, DataValue::Array(invited.clone())));
+                let _ = serialized.push((DataTypes::call_members, DataValue::Array(invited)));
+                let _ = serialized.push((DataTypes::call_token, DataValue::Str(token.unwrap())));
                 self.clone()
                     .send_message(
                         &&CommunicationValue::new(CommunicationType::identification_response)
                             .with_id(cv.get_id())
-                            .add_data(
-                                DataTypes::user_id,
-                                JsonValue::from(self.get_user_id().await),
-                            )
+                            .add_data(DataTypes::user_id, DataValue::Number(self.user_id as i64))
                             .add_data(
                                 DataTypes::username,
-                                JsonValue::String(self.clone().get_user_name().await),
+                                DataValue::Str(self.clone().get_user_name().await),
                             )
                             .add_data(
                                 DataTypes::display,
-                                JsonValue::String(self.get_display_name().await),
+                                DataValue::Str(self.get_display_name().await),
                             )
-                            .add_data(
-                                DataTypes::avatar,
-                                JsonValue::String(self.get_avatar().await),
-                            )
-                            .add_data(DataTypes::call_state, serialized),
+                            .add_data(DataTypes::avatar, DataValue::Str(self.get_avatar().await))
+                            .add_data(DataTypes::call_state, DataValue::Container(serialized)),
                     )
                     .await;
             }
@@ -271,11 +220,7 @@ impl AnonymousClientConnection {
             }
 
             if cv.is_type(CommunicationType::change_user_data) {
-                if let Some(display_name) = cv
-                    .get_data(DataTypes::display)
-                    .unwrap_or(&JsonValue::Null)
-                    .as_str()
-                {
+                if let Some(display_name) = cv.get_data(DataTypes::display).as_str() {
                     let _ = self.set_display_name(display_name.to_string()).await;
                 }
 
@@ -284,17 +229,9 @@ impl AnonymousClientConnection {
 
             if cv.is_type(CommunicationType::get_user_data) {
                 if let Some(anonymous) = {
-                    if let Some(user_id) = cv
-                        .get_data(DataTypes::user_id)
-                        .unwrap_or(&JsonValue::Null)
-                        .as_i64()
-                    {
-                        anonymous_manager::get_anonymous_user(user_id).await
-                    } else if let Some(username) = cv
-                        .get_data(DataTypes::username)
-                        .unwrap_or(&JsonValue::Null)
-                        .as_str()
-                    {
+                    if let Some(user_id) = cv.get_data(DataTypes::user_id).as_number() {
+                        anonymous_manager::get_anonymous_user(user_id as u64).await
+                    } else if let Some(username) = cv.get_data(DataTypes::username).as_str() {
                         anonymous_manager::get_anonymous_user_by_name(username.to_string()).await
                     } else {
                         None
@@ -302,14 +239,23 @@ impl AnonymousClientConnection {
                 } {
                     let response = CommunicationValue::new(CommunicationType::get_user_data)
                         .with_id(cv.get_id())
-                        .add_data_str(DataTypes::username, anonymous.get_user_name().await)
+                        .add_data(
+                            DataTypes::username,
+                            DataValue::Str(anonymous.get_user_name().await),
+                        )
                         .add_data(
                             DataTypes::user_id,
-                            JsonValue::Number(Number::from(anonymous.get_user_id().await)),
+                            DataValue::Number(anonymous.user_id as i64),
                         )
-                        .add_data_str(DataTypes::display, anonymous.get_display_name().await)
-                        .add_data_str(DataTypes::user_state, "online".to_string())
-                        .add_data_str(DataTypes::avatar, anonymous.get_avatar().await);
+                        .add_data(
+                            DataTypes::display,
+                            DataValue::Str(anonymous.get_display_name().await),
+                        )
+                        .add_data(DataTypes::user_state, DataValue::Str("online".to_string()))
+                        .add_data(
+                            DataTypes::avatar,
+                            DataValue::Str(anonymous.get_avatar().await),
+                        );
 
                     self.send_message(&response).await;
 
@@ -330,10 +276,7 @@ impl AnonymousClientConnection {
         let client_for_closure = self.clone();
         tokio::spawn(async move {
             let response_cv = get_omega_connection()
-                .await_response(
-                    &cv.with_sender(*self.user_id.read().await),
-                    Some(Duration::from_secs(20)),
-                )
+                .await_response(&cv.with_sender(self.user_id), Some(Duration::from_secs(20)))
                 .await;
             if let Ok(response_cv) = response_cv {
                 client_for_closure.send_message(&response_cv).await;
@@ -344,7 +287,7 @@ impl AnonymousClientConnection {
     /// Handle ping message
     async fn handle_ping(self: Arc<Self>, cv: CommunicationValue) {
         // Update our ping if provided
-        if let Some(last_ping) = cv.get_data(DataTypes::last_ping) {
+        if let DataValue::Number(last_ping) = cv.get_data(DataTypes::last_ping) {
             if let Ok(ping_val) = last_ping.to_string().parse::<i64>() {
                 let mut ping_guard = self.ping.write().await;
                 *ping_guard = ping_val;
@@ -367,11 +310,7 @@ impl AnonymousClientConnection {
 
     /// Handle call invite
     async fn handle_call_invite(self: Arc<Self>, cv: CommunicationValue) {
-        let receiver_id: i64 = cv
-            .get_data(DataTypes::receiver_id)
-            .unwrap_or(&json::JsonValue::Number(Number::from(0)))
-            .as_i64()
-            .unwrap_or(0);
+        let receiver_id: i64 = cv.get_data(DataTypes::receiver_id).as_number().unwrap_or(0);
         if receiver_id == 0 {
             self.send_error_response(&cv.get_id(), CommunicationType::error_no_user_id)
                 .await;
@@ -379,7 +318,7 @@ impl AnonymousClientConnection {
         }
 
         let call_id = match cv.get_data(DataTypes::call_id) {
-            Some(id_str) => match Uuid::parse_str(&id_str.to_string()) {
+            DataValue::Str(id_str) => match Uuid::parse_str(&id_str.to_string()) {
                 Ok(id) => id,
                 Err(_) => {
                     self.send_error_response(
@@ -397,8 +336,7 @@ impl AnonymousClientConnection {
             }
         };
 
-        let invited =
-            call_manager::add_invite(call_id, *self.user_id.read().await, receiver_id).await;
+        let invited = call_manager::add_invite(call_id, self.user_id, receiver_id as u64).await;
         if !invited {
             self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_call_id)
                 .await;
@@ -416,15 +354,18 @@ impl AnonymousClientConnection {
         };
 
         // Get sender user ID
-        let sender_id = self.get_user_id().await;
+        let sender_id = self.get_user_id();
 
         // Create and send call distribution message
         let forward = CommunicationValue::new(CommunicationType::call_invite)
-            .with_receiver(receiver_id)
+            .with_receiver(receiver_id as u64)
             .with_sender(sender_id)
-            .add_data_str(DataTypes::call_id, call_id.to_string())
-            .add_data_str(DataTypes::receiver_id, receiver_id.to_string())
-            .add_data_str(DataTypes::sender_id, sender_id.to_string());
+            .add_data(DataTypes::call_id, DataValue::Str(call_id.to_string()))
+            .add_data(
+                DataTypes::receiver_id,
+                DataValue::Str(receiver_id.to_string()),
+            )
+            .add_data(DataTypes::sender_id, DataValue::Str(sender_id.to_string()));
 
         target_rho.message_to_client(forward).await;
 
@@ -434,10 +375,10 @@ impl AnonymousClientConnection {
 
     /// Handle get call request
     async fn handle_get_call(self: Arc<Self>, cv: CommunicationValue) {
-        let user_id = self.get_user_id().await;
+        let user_id = self.get_user_id();
 
         let call_id = match cv.get_data(DataTypes::call_id) {
-            Some(id_str) => match Uuid::parse_str(&id_str.to_string()) {
+            DataValue::Str(id_str) => match Uuid::parse_str(&id_str.to_string()) {
                 Ok(id) => id,
                 Err(_) => {
                     self.send_error_response(&cv.get_id(), CommunicationType::error)
@@ -456,7 +397,7 @@ impl AnonymousClientConnection {
             let response = CommunicationValue::new(CommunicationType::call_token)
                 .with_id(cv.get_id())
                 .with_receiver(user_id)
-                .add_data_str(DataTypes::call_token, token);
+                .add_data(DataTypes::call_token, DataValue::Str(token.to_string()));
             self.send_message(&response).await;
         } else {
             self.send_error_response(&cv.get_id(), CommunicationType::error)
@@ -465,33 +406,20 @@ impl AnonymousClientConnection {
         }
     }
     async fn handle_call_timeout_user(self: Arc<Self>, cv: CommunicationValue) {
-        let call_id = Uuid::from_str(
-            cv.get_data(DataTypes::call_id)
-                .unwrap_or(&JsonValue::Null)
-                .as_str()
-                .unwrap_or(""),
-        )
-        .unwrap();
-        let user_id = cv
-            .get_data(DataTypes::user_id)
-            .unwrap_or(&JsonValue::Null)
-            .as_i64()
-            .unwrap_or(0);
-        let untill = cv
-            .get_data(DataTypes::untill)
-            .unwrap_or(&JsonValue::Null)
-            .as_i64()
-            .unwrap_or(0);
+        let call_id =
+            Uuid::from_str(cv.get_data(DataTypes::call_id).as_str().unwrap_or("")).unwrap();
+        let user_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0);
+        let untill = cv.get_data(DataTypes::untill).as_number().unwrap_or(0);
 
         let call = call_manager::get_call(call_id).await;
         if let Some(call) = call {
             if call
-                .get_caller(self.get_user_id().await)
+                .get_caller(self.get_user_id())
                 .await
                 .unwrap()
                 .has_admin()
             {
-                call.get_caller(user_id)
+                call.get_caller(user_id as u64)
                     .await
                     .unwrap()
                     .set_timeout(untill)
@@ -500,38 +428,25 @@ impl AnonymousClientConnection {
         }
     }
     async fn handle_call_disconnect_user(self: Arc<Self>, cv: CommunicationValue) {
-        let call_id = Uuid::from_str(
-            cv.get_data(DataTypes::call_id)
-                .unwrap_or(&JsonValue::Null)
-                .as_str()
-                .unwrap_or(""),
-        )
-        .unwrap();
-        let user_id = cv
-            .get_data(DataTypes::user_id)
-            .unwrap_or(&JsonValue::Null)
-            .as_i64()
-            .unwrap_or(0);
+        let call_id =
+            Uuid::from_str(cv.get_data(DataTypes::call_id).as_str().unwrap_or("")).unwrap();
+        let user_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0);
 
         let call = call_manager::get_call(call_id).await;
         if let Some(call) = call {
             if call
-                .get_caller(self.get_user_id().await)
+                .get_caller(self.get_user_id())
                 .await
                 .unwrap()
                 .has_admin()
             {
-                call.remove_caller(user_id).await;
+                call.remove_caller(user_id as u64).await;
             }
         }
     }
 
     /// Send error response
-    async fn send_error_response(
-        self: Arc<Self>,
-        message_id: &Uuid,
-        error_type: CommunicationType,
-    ) {
+    async fn send_error_response(self: Arc<Self>, message_id: &u32, error_type: CommunicationType) {
         let error = CommunicationValue::new(error_type).with_id(*message_id);
         self.send_message(&error).await;
     }
@@ -544,8 +459,7 @@ impl AnonymousClientConnection {
         }
         *is_open_guard = false;
 
-        let mut session = self.sender.write().await;
-        let _ = session.close(None).await;
+        let _ = self.sender.close();
     }
 
     /// Set interested users list
@@ -563,8 +477,8 @@ impl AnonymousClientConnection {
         let interested_guard = self.clone().get_interested_users().await;
         if interested_guard.contains(&user_id) {
             let notification = CommunicationValue::new(CommunicationType::client_changed)
-                .add_data_str(DataTypes::user_id, user_id.to_string())
-                .add_data_str(DataTypes::user_state, format!("online"));
+                .add_data(DataTypes::user_id, DataValue::Str(user_id.to_string()))
+                .add_data(DataTypes::user_state, DataValue::Str("online".to_string()));
 
             self.send_message(&notification).await;
         }
@@ -583,7 +497,7 @@ impl Clone for AnonymousClientConnection {
         Self {
             sender: Arc::clone(&self.sender),
             receiver: Arc::clone(&self.receiver),
-            user_id: Arc::clone(&self.user_id),
+            user_id: self.user_id,
             ping: Arc::clone(&self.ping),
             interested_users: Arc::clone(&self.interested_users),
             is_open: Arc::clone(&self.is_open),

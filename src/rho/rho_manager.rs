@@ -41,7 +41,7 @@ pub async fn remove_rho(iota_id: i64) -> Option<Arc<RhoConnection>> {
 pub async fn add_rho(rho_connection: Arc<RhoConnection>) {
     let mut connections = RHO_CONNECTIONS.write().await;
     let iota_id = rho_connection.get_iota_id().await;
-    connections.insert(iota_id, rho_connection);
+    connections.insert(iota_id as i64, rho_connection);
 }
 
 /// Get a RhoConnection by Iota ID directly

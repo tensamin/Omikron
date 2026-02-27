@@ -1,10 +1,8 @@
 use super::{client_connection::ClientConnection, iota_connection::IotaConnection, rho_manager};
-use crate::data::{
-    communication::{CommunicationType, CommunicationValue, DataTypes},
-    user::UserStatus,
-};
+
+use crate::data::user::UserStatus;
 use crate::omega::omega_connection::OmegaConnection;
-use json::{JsonValue, number::Number};
+use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -27,8 +25,8 @@ impl RhoConnection {
         rho_connection
     }
 
-    pub async fn get_iota_id(&self) -> i64 {
-        self.iota_connection.get_iota_id().await
+    pub async fn get_iota_id(&self) -> u64 {
+        self.iota_connection.iota_id
     }
 
     pub fn get_user_ids(&self) -> &Vec<i64> {
@@ -52,7 +50,7 @@ impl RhoConnection {
         let connections = self.client_connections.read().await;
         let mut collections = Vec::new();
         for con in connections.iter() {
-            if con.get_user_id().await == user_id {
+            if con.get_user_id().await == user_id as u64 {
                 collections.push(con.clone());
             }
         }
@@ -63,7 +61,7 @@ impl RhoConnection {
     pub async fn add_client_connection(&self, connection: Arc<ClientConnection>) {
         let notification = CommunicationValue::new(CommunicationType::client_connected).add_data(
             DataTypes::user_id,
-            JsonValue::Number(Number::from(connection.get_user_id().await)),
+            DataValue::Number(connection.get_user_id().await as i64),
         );
 
         self.iota_connection.send_message(&notification).await;
@@ -74,8 +72,8 @@ impl RhoConnection {
         }
 
         OmegaConnection::client_changed(
-            self.get_iota_id().await,
-            connection.get_user_id().await,
+            self.get_iota_id().await as i64,
+            connection.get_user_id().await as i64,
             UserStatus::user_online,
         )
         .await;
@@ -93,8 +91,8 @@ impl RhoConnection {
 
         // Notify OmegaConnection
         OmegaConnection::client_changed(
-            self.get_iota_id().await,
-            connection.get_user_id().await,
+            self.get_iota_id().await as i64,
+            connection.get_user_id().await as i64,
             UserStatus::user_offline,
         )
         .await;
@@ -109,10 +107,10 @@ impl RhoConnection {
         }
 
         // Remove from manager
-        rho_manager::remove_rho(self.get_iota_id().await).await;
+        rho_manager::remove_rho(self.get_iota_id().await as i64).await;
 
         // Notify OmegaConnection
-        OmegaConnection::close_iota(self.get_iota_id().await).await;
+        OmegaConnection::close_iota(self.get_iota_id().await as i64).await;
     }
 
     /// Send message from Iota to specific client
@@ -136,7 +134,7 @@ impl RhoConnection {
         let connections = self.client_connections.read().await;
         for connection in connections.iter() {
             let conn_user_id = connection.get_user_id().await;
-            if conn_user_id == user_id {
+            if conn_user_id == user_id as u64 {
                 connection
                     .clone()
                     .set_interested_users(interested_ids.clone())

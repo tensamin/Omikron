@@ -1,11 +1,11 @@
-use json::JsonValue;
+use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
+
 use std::{env, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
     calls::{call_util, caller::Caller},
-    data::communication::{CommunicationType, CommunicationValue, DataTypes},
     omega::omega_connection::get_omega_connection,
 };
 
@@ -28,7 +28,7 @@ impl CallGroup {
         }
     }
 
-    pub async fn get_caller(&self, user_id: i64) -> Option<Arc<Caller>> {
+    pub async fn get_caller(&self, user_id: u64) -> Option<Arc<Caller>> {
         self.members
             .read()
             .await
@@ -62,7 +62,7 @@ impl CallGroup {
             let response_cv = get_omega_connection()
                 .await_response(
                     &CommunicationValue::new(CommunicationType::shorten_link)
-                        .add_data(DataTypes::link, JsonValue::from(long_link)),
+                        .add_data(DataTypes::link, DataValue::Str(long_link)),
                     Some(Duration::from_secs(20)),
                 )
                 .await;
@@ -70,7 +70,6 @@ impl CallGroup {
                 *self.short_link.write().await = Some(
                     response
                         .get_data(DataTypes::link)
-                        .unwrap()
                         .as_str()
                         .unwrap()
                         .to_string(),
@@ -84,7 +83,7 @@ impl CallGroup {
         }
     }
 
-    pub async fn create_anonymous_token(&self, user_id: i64) -> Option<String> {
+    pub async fn create_anonymous_token(&self, user_id: u64) -> Option<String> {
         if self.is_anonymous().await {
             if let Ok(token) = call_util::create_token(user_id, self.call_id, false) {
                 return Some(token);
@@ -93,7 +92,7 @@ impl CallGroup {
         None
     }
 
-    pub async fn remove_caller(&self, user_id: i64) {
+    pub async fn remove_caller(&self, user_id: u64) {
         let _ = call_util::remove_participant(self.call_id, user_id).await;
         self.members
             .write()

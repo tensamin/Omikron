@@ -1,24 +1,18 @@
 use crate::calls::call_group::CallGroup;
 use crate::calls::call_manager;
-use crate::get_private_key;
-use crate::get_public_key;
 use crate::log_cv_in;
+use crate::log_cv_out;
 use crate::log_err;
-use crate::log_in;
-use crate::log_out;
 use crate::omega::omega_connection::get_omega_connection;
-use crate::util::crypto_helper::load_public_key;
-use crate::util::crypto_helper::public_key_to_base64;
-use crate::util::crypto_util::DataFormat;
-use crate::util::crypto_util::SecurePayload;
+use crate::rho::connection::GeneralConnection;
 use crate::util::logger::PrintType;
-use async_tungstenite::WebSocketReceiver;
-use async_tungstenite::WebSocketSender;
-use async_tungstenite::tungstenite::Message;
 use dashmap::DashMap;
-use json::JsonValue;
-use rand::Rng;
-use rand::distributions::Alphanumeric;
+use epsilon_core::CommunicationType;
+use epsilon_core::CommunicationValue;
+use epsilon_core::DataTypes;
+use epsilon_core::DataValue;
+use epsilon_native::Receiver;
+use epsilon_native::Sender;
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
@@ -26,56 +20,48 @@ use std::{
 };
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
-use tokio_util::compat::Compat;
-use tungstenite::Utf8Bytes;
-use uuid::Uuid;
 use x448::PublicKey;
 
 use super::{rho_connection::RhoConnection, rho_manager};
-use crate::{
-    data::communication::{CommunicationType, CommunicationValue, DataTypes},
-    omega::omega_connection::OmegaConnection,
-};
+use crate::omega::omega_connection::OmegaConnection;
 
 pub struct IotaConnection {
-    pub sender: Arc<RwLock<WebSocketSender<Compat<tokio::net::TcpStream>>>>,
-    pub receiver: Arc<RwLock<WebSocketReceiver<Compat<tokio::net::TcpStream>>>>,
-    pub iota_id: Arc<RwLock<i64>>,
-    pub user_ids: Arc<RwLock<Vec<i64>>>,
-    identified: Arc<RwLock<bool>>,
-    challenged: Arc<RwLock<bool>>,
-    challenge: Arc<RwLock<String>>,
+    pub iota_id: u64,
+    pub sender: Arc<Sender>,
+    pub receiver: Arc<Receiver>,
+    pub user_ids: Arc<RwLock<Vec<u64>>>,
     pub ping: Arc<RwLock<i64>>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub waiting_tasks:
-        DashMap<Uuid, Box<dyn Fn(Arc<IotaConnection>, CommunicationValue) -> bool + Send + Sync>>,
+        DashMap<u32, Box<dyn Fn(Arc<IotaConnection>, CommunicationValue) -> bool + Send + Sync>>,
     pub rho_connection: Arc<RwLock<Option<Weak<RhoConnection>>>>,
 }
 
 impl IotaConnection {
-    /// Create a new IotaConnection
-    pub fn new(
-        sender: WebSocketSender<Compat<tokio::net::TcpStream>>,
-        receiver: WebSocketReceiver<Compat<tokio::net::TcpStream>>,
-    ) -> Arc<Self> {
+    pub async fn from_general(general: Arc<GeneralConnection>, iota_id: u64) -> Arc<Self> {
         Arc::new(Self {
-            sender: Arc::new(RwLock::new(sender)),
-            receiver: Arc::new(RwLock::new(receiver)),
-            iota_id: Arc::new(RwLock::new(0)),
-            user_ids: Arc::new(RwLock::new(Vec::new())),
-            identified: Arc::new(RwLock::new(false)),
-            challenged: Arc::new(RwLock::new(false)),
-            challenge: Arc::new(RwLock::new(String::new())),
             ping: Arc::new(RwLock::new(0)),
             pub_key: Arc::new(RwLock::new(None)),
-            waiting_tasks: DashMap::new(),
             rho_connection: Arc::new(RwLock::new(None)),
+            user_ids: Arc::new(RwLock::new(Vec::new())),
+            sender: general.sender.clone(),
+            receiver: general.receiver.clone(),
+            iota_id: iota_id,
+            waiting_tasks: DashMap::new(),
         })
+    }
+    pub fn start(self: Arc<Self>) {
+        let self_clone = self.clone();
+        tokio::spawn(async move {
+            while let Ok(cv) = self_clone.receiver.receive().await {
+                self_clone.clone().handle_message(cv).await;
+            }
+        });
     }
 
     /// Get the Iota ID
-    pub async fn get_iota_id(&self) -> i64 {
-        *self.iota_id.read().await
+    pub async fn get_iota_id(&self) -> u64 {
+        self.iota_id
     }
 
     pub async fn get_public_key(&self) -> Option<PublicKey> {
@@ -87,13 +73,8 @@ impl IotaConnection {
     }
 
     /// Get the user IDs
-    pub async fn get_user_ids(&self) -> Vec<i64> {
+    pub async fn get_user_ids(&self) -> Vec<u64> {
         self.user_ids.read().await.clone()
-    }
-
-    /// Check if connection is identified
-    pub async fn is_identified(&self) -> bool {
-        *self.identified.read().await
     }
 
     /// Get current ping
@@ -117,38 +98,16 @@ impl IotaConnection {
         }
     }
 
-    /// Send a message to the Iota
-    pub async fn send_message_str(&self, message: &str) {
-        let mut session = self.sender.write().await;
-        if let Err(e) = session
-            .send(Message::Text(Utf8Bytes::from(message.to_string())))
-            .await
-        {
-            log_err!(
-                self.get_iota_id().await,
-                PrintType::Iota,
-                "Failed to send WebSocket message: {:?}",
-                e,
-            );
-        }
-    }
-
     /// Send a CommunicationValue to the Iota
     pub async fn send_message(&self, cv: &CommunicationValue) {
         if !cv.is_type(CommunicationType::pong) {
-            log_out!(
-                self.get_iota_id().await,
-                PrintType::Iota,
-                "{}",
-                cv.to_json().to_string()
-            );
+            log_cv_out!(PrintType::Iota, cv);
         }
-        self.send_message_str(&cv.to_json().to_string()).await;
+        self.sender.send(&cv).await;
     }
 
     /// Handle incoming message from Iota
-    pub async fn handle_message(self: Arc<Self>, message: Utf8Bytes) {
-        let cv = CommunicationValue::from_json(&message);
+    pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
         // Handle ping
         if cv.is_type(CommunicationType::ping) || cv.is_type(CommunicationType::pong) {
             self.handle_ping(cv).await;
@@ -157,261 +116,6 @@ impl IotaConnection {
 
         log_cv_in!(PrintType::Iota, cv);
 
-        let identified = *self.identified.read().await;
-        let challenged = *self.challenged.read().await;
-
-        if !identified && cv.is_type(CommunicationType::identification) {
-            let iota_id = cv
-                .get_data(DataTypes::iota_id)
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            if iota_id == 0 {
-                log_out!(self.get_iota_id().await, PrintType::Iota, "Invalid IOTA ID");
-                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_data)
-                    .await;
-                self.close().await;
-                return;
-            }
-
-            *self.iota_id.write().await = iota_id;
-
-            let get_pub_key_msg = CommunicationValue::new(CommunicationType::get_iota_data)
-                .with_id(cv.get_id())
-                .add_data(DataTypes::iota_id, JsonValue::from(iota_id));
-
-            let response_cv = get_omega_connection()
-                .await_response(&get_pub_key_msg, Some(Duration::from_secs(20)))
-                .await;
-
-            if let Ok(response_cv) = response_cv {
-                if !response_cv.is_type(CommunicationType::get_iota_data) {
-                    self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
-                        .await;
-                    self.close().await;
-                    return;
-                }
-
-                let base64_pub = response_cv
-                    .get_data(DataTypes::public_key)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                let pub_key = match load_public_key(base64_pub) {
-                    Some(pk) => pk,
-                    _ => {
-                        self.send_error_response(
-                            &cv.get_id(),
-                            CommunicationType::error_invalid_public_key,
-                        )
-                        .await;
-                        self.close().await;
-                        return;
-                    }
-                };
-
-                *self.pub_key.write().await = Some(pub_key.as_bytes().to_vec());
-
-                let challenge: String = rand::thread_rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(32)
-                    .map(char::from)
-                    .collect();
-
-                *self.challenge.write().await = challenge.clone();
-
-                let encrypted_challenge =
-                    SecurePayload::new(&challenge, DataFormat::Base64, get_private_key())
-                        .unwrap()
-                        .encrypt_x448(pub_key)
-                        .unwrap()
-                        .export(DataFormat::Base64);
-
-                *self.identified.write().await = true;
-
-                let challenge_msg = CommunicationValue::new(CommunicationType::challenge)
-                    .with_id(cv.get_id())
-                    .add_data_str(
-                        DataTypes::public_key,
-                        public_key_to_base64(&get_public_key()),
-                    )
-                    .add_data_str(DataTypes::challenge, encrypted_challenge);
-
-                self.send_message(&challenge_msg).await;
-            } else {
-                self.send_error_response(&cv.get_id(), CommunicationType::error_internal)
-                    .await;
-                self.close().await;
-                return;
-            }
-
-            return;
-        } else if !identified && cv.is_type(CommunicationType::register_iota) {
-            let base64_pub = cv
-                .get_data(DataTypes::public_key)
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            if base64_pub.is_empty() {
-                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_public_key)
-                    .await;
-                self.close().await;
-                return;
-            }
-
-            let register_msg = CommunicationValue::new(CommunicationType::complete_register_iota)
-                .with_id(cv.get_id())
-                .add_data(
-                    DataTypes::public_key,
-                    JsonValue::String(base64_pub.to_string()),
-                );
-
-            let iota_conn_clone = self.clone();
-            let register_response: Result<CommunicationValue, _> = get_omega_connection()
-                .await_response(&register_msg, Some(Duration::from_secs(20)))
-                .await;
-            let iota_conn_for_task = iota_conn_clone.clone();
-            if let Ok(register_response) = register_response {
-                if !register_response.is_type(CommunicationType::complete_register_iota) {
-                    iota_conn_for_task
-                        .send_error_response(&cv.get_id(), CommunicationType::error_internal)
-                        .await;
-                    iota_conn_for_task.close().await;
-                    return;
-                }
-
-                let new_iota_id = register_response
-                    .get_data(DataTypes::iota_id)
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-
-                if new_iota_id == 0 {
-                    iota_conn_for_task
-                        .send_error_response(&cv.get_id(), CommunicationType::error_internal)
-                        .await;
-                    iota_conn_for_task.close().await;
-                    return;
-                }
-
-                *iota_conn_for_task.iota_id.write().await = new_iota_id;
-                *iota_conn_for_task.identified.write().await = true;
-
-                let success_msg = CommunicationValue::new(CommunicationType::success)
-                    .with_id(cv.get_id())
-                    .add_data(DataTypes::iota_id, JsonValue::from(new_iota_id));
-
-                iota_conn_for_task.send_message(&success_msg).await;
-            } else {
-                iota_conn_for_task
-                    .send_error_response(&cv.get_id(), CommunicationType::error_internal)
-                    .await;
-                iota_conn_for_task.close().await;
-            }
-            return;
-        }
-
-        if identified && !challenged && cv.is_type(CommunicationType::challenge_response) {
-            let client_response = cv
-                .get_data(DataTypes::challenge)
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            if client_response == *self.challenge.read().await {
-                *self.challenged.write().await = true;
-
-                let iota_id = self.get_iota_id().await;
-
-                if rho_manager::contains_iota(iota_id).await {
-                    if let Some(existing_rho) = rho_manager::get_rho_by_iota(iota_id).await {
-                        existing_rho.close_iota_connection().await;
-                    }
-                }
-
-                // Inform Omega & Verify Users
-                let iota_users_cv = get_omega_connection()
-                    .await_response(
-                        &CommunicationValue::new(CommunicationType::iota_connected).add_data(
-                            DataTypes::iota_id,
-                            JsonValue::from(self.get_iota_id().await),
-                        ),
-                        Some(Duration::from_secs(20)),
-                    )
-                    .await;
-
-                let mut user_ids: Vec<i64> = Vec::new();
-                if let Ok(iota_users_cv) = iota_users_cv {
-                    if !iota_users_cv.is_type(CommunicationType::iota_user_data) {
-                        log_err!(
-                            self.get_iota_id().await,
-                            PrintType::Omikron,
-                            "Invalid communication type {:?}",
-                            iota_users_cv.get_type()
-                        );
-                        return;
-                    }
-                    let val_user_ids = iota_users_cv.get_data(DataTypes::user_ids).unwrap().clone();
-
-                    match val_user_ids {
-                        JsonValue::Array(arr) => {
-                            for item in arr {
-                                if let JsonValue::Number(_) = item {
-                                    user_ids.push(item.as_i64().unwrap_or(0));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                } else {
-                    log_err!(
-                        self.get_iota_id().await,
-                        PrintType::Omikron,
-                        "Failed to retrieve user IDs"
-                    );
-                }
-                log_in!(
-                    self.get_iota_id().await,
-                    PrintType::General,
-                    "User IDs: {:?}",
-                    user_ids.clone()
-                );
-
-                *self.user_ids.write().await = user_ids.clone();
-                let rho_connection =
-                    Arc::new(RhoConnection::new(self.clone(), user_ids.clone()).await);
-
-                self.set_rho_connection(Arc::downgrade(&rho_connection))
-                    .await;
-
-                rho_manager::add_rho(rho_connection).await;
-
-                let mut str = String::new();
-                for id in &user_ids {
-                    str.push_str(&format!(",{}", id));
-                }
-                if !str.is_empty() {
-                    str.remove(0);
-                }
-
-                self.send_message(
-                    &CommunicationValue::new(CommunicationType::identification_response)
-                        .with_id(cv.get_id())
-                        .add_data_str(DataTypes::accepted_ids, str)
-                        .add_data_str(DataTypes::accepted, user_ids.len().to_string()),
-                )
-                .await;
-            } else {
-                self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_challenge)
-                    .await;
-                self.close().await;
-            }
-            return;
-        }
-
-        if !self.is_identified().await {
-            self.send_error_response(&cv.get_id(), CommunicationType::error_not_authenticated)
-                .await;
-            self.close().await;
-            return;
-        }
         // Handle GET_CHATS
         if cv.is_type(CommunicationType::get_chats) {
             self.handle_get_chats(cv).await;
@@ -420,7 +124,7 @@ impl IotaConnection {
 
         // Handle forwarding to other Iotas or clients
         let receiver_id = cv.get_receiver();
-        if (receiver_id != 0 && !self.get_user_ids().await.contains(&receiver_id))
+        if (receiver_id != 0 && !self.get_user_ids().await.contains(&(receiver_id as u64)))
             || cv.is_type(CommunicationType::message_other_iota)
             || cv.is_type(CommunicationType::send_chat)
         {
@@ -437,31 +141,28 @@ impl IotaConnection {
             || cv.is_type(CommunicationType::delete_iota)
         {
             let sender = self.get_iota_id().await;
-            self.handle_omega_forward(cv.with_sender(sender)).await;
+            self.handle_omega_forward(cv.with_sender(sender as u64))
+                .await;
             return;
         }
         // Forward to client
         self.forward_to_client(cv).await;
     }
 
-    async fn send_error_response(&self, message_id: &Uuid, error_type: CommunicationType) {
-        let error = CommunicationValue::new(error_type).with_id(*message_id);
+    async fn send_error_response(&self, message_id: u32, error_type: CommunicationType) {
+        let error = CommunicationValue::new(error_type).with_id(message_id);
         self.send_message(&error).await;
     }
 
     async fn close(&self) {
-        let mut sender = self.sender.write().await;
-        let _ = sender.close(None).await;
+        let _ = self.sender.close();
     }
 
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
         let iota_for_closure = self.clone();
         tokio::spawn(async move {
             let response_cv = get_omega_connection()
-                .await_response(
-                    &cv.with_sender(*self.iota_id.read().await),
-                    Some(Duration::from_secs(20)),
-                )
+                .await_response(&cv.with_sender(self.iota_id), Some(Duration::from_secs(20)))
                 .await;
             if let Ok(response_cv) = response_cv {
                 iota_for_closure.send_message(&response_cv).await;
@@ -470,7 +171,7 @@ impl IotaConnection {
     }
     /// Handle ping message
     async fn handle_ping(&self, cv: CommunicationValue) {
-        if let Some(last_ping) = cv.get_data(DataTypes::last_ping) {
+        if let DataValue::Number(last_ping) = cv.get_data(DataTypes::last_ping) {
             if let Ok(ping_val) = last_ping.to_string().parse::<i64>() {
                 let mut ping_guard = self.ping.write().await;
                 *ping_guard = ping_val;
@@ -483,13 +184,13 @@ impl IotaConnection {
             HashMap::new()
         };
 
-        let pings = client_pings
+        let pings: Vec<(DataTypes, DataValue)> = client_pings
             .into_iter()
-            .map(|(k, v)| (k, JsonValue::String(v.to_string())))
+            .map(|(k, v)| (DataTypes::parse(k), DataValue::Number(v)))
             .collect();
         let response = CommunicationValue::new(CommunicationType::pong)
             .with_id(cv.get_id())
-            .add_data(DataTypes::ping_clients, JsonValue::Object(pings));
+            .add_data(DataTypes::ping_clients, DataValue::Container(pings));
         self.send_message(&response).await;
     }
 
@@ -498,8 +199,8 @@ impl IotaConnection {
         let receiver_id = cv.get_receiver();
         let sender_id = cv.get_sender();
 
-        if self.get_user_ids().await.contains(&sender_id) {
-            if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id).await {
+        if self.get_user_ids().await.contains(&(sender_id as u64)) {
+            if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id as i64).await {
                 target_rho.message_to_iota(cv).await;
             } else {
                 let error = CommunicationValue::new(CommunicationType::error_no_iota)
@@ -511,7 +212,7 @@ impl IotaConnection {
             self.send_message(
                 &CommunicationValue::new(CommunicationType::error_invalid_user_id).add_data(
                     DataTypes::error_type,
-                    JsonValue::String(
+                    DataValue::Str(
                         "You are sending to another User without authority.".to_string(),
                     ),
                 ),
@@ -525,77 +226,98 @@ impl IotaConnection {
         let receiver_id = cv.get_receiver();
         let mut interested_ids: Vec<i64> = Vec::new();
 
-        // loading Calls
+        // ============================
+        // Load Calls
+        // ============================
         let calls: Vec<Arc<CallGroup>> = call_manager::get_call_groups(receiver_id).await;
-        let mut invites: HashMap<i64, Vec<JsonValue>> = HashMap::new();
-        let empty = &calls.is_empty();
+
+        let mut invites: HashMap<i64, Vec<DataValue>> = HashMap::new();
+        let empty = calls.is_empty();
+
         for call in calls {
             for inviter in call.members.read().await.iter() {
                 let call_self = call.get_caller(receiver_id).await.unwrap();
-                let admin = call_self.has_admin();
+
                 let inviter_id = inviter.user_id;
                 let timeout = *call_self.timeout.read().await;
+                let admin = call_self.has_admin();
 
-                let mut call_obj = JsonValue::new_object();
-                let _ = call_obj.insert("call_id", JsonValue::String(call.call_id.to_string()));
+                // Build call container
+                let mut call_map: HashMap<DataTypes, DataValue> = HashMap::new();
+
+                call_map.insert(DataTypes::call_id, DataValue::Str(call.call_id.to_string()));
+
                 if timeout > 0 {
-                    let _ = call_obj.insert("timeout", JsonValue::from(timeout));
-                }
-                if admin {
-                    let _ = call_obj.insert("admin", JsonValue::Boolean(admin));
+                    call_map.insert(DataTypes::timeout, DataValue::Number(timeout as i64));
                 }
 
-                if let Some(call_ids) = invites.get_mut(&inviter_id) {
-                    call_ids.push(call_obj);
-                } else {
-                    invites.insert(inviter_id, vec![call_obj]);
+                if admin {
+                    call_map.insert(DataTypes::has_admin, DataValue::Bool(true));
                 }
+
+                let call_container = DataValue::container_from_map(&call_map);
+
+                invites
+                    .entry(inviter_id as i64)
+                    .or_insert_with(Vec::new)
+                    .push(call_container);
             }
         }
 
-        // Process contacts and add call information
-        let enriched_contacts = if *empty {
-            if let Some(contacts_data) = cv.get_data(DataTypes::user_ids) {
-                log_in!(self.get_iota_id().await, PrintType::Call, "Call empty");
-                contacts_data.clone()
-            } else {
-                log_in!(
-                    self.get_iota_id().await,
-                    PrintType::Call,
-                    "Call empty No Data"
-                );
-                JsonValue::new_array()
+        // ============================
+        // Enrich Contacts
+        // ============================
+        let enriched_contacts = if empty {
+            match cv.get_data(DataTypes::user_ids) {
+                DataValue::Array(arr) => DataValue::Array(arr.clone()),
+                _ => DataValue::Array(vec![]),
             }
         } else {
-            let mut enrc_contacts = JsonValue::new_array();
-            if let Some(contacts_data) = cv.get_data(DataTypes::user_ids) {
-                if let JsonValue::Array(user_ids) = contacts_data {
-                    for user_json in user_ids {
-                        let user_id = user_json["user_id"].as_i64().unwrap_or(0);
-                        interested_ids.push(user_id);
-                        let mut enriched_contact = user_json.clone();
-                        if let Some(calls) = invites.get(&user_id) {
-                            let _ =
-                                enriched_contact.insert("calls", JsonValue::Array(calls.clone()));
+            let mut enriched: Vec<DataValue> = Vec::new();
+
+            if let DataValue::Array(users) = cv.get_data(DataTypes::user_ids) {
+                for user_val in users {
+                    if let DataValue::Container(entries) = user_val {
+                        let mut user_map: HashMap<DataTypes, DataValue> =
+                            entries.iter().cloned().collect();
+
+                        // extract user_id
+                        if let Some(DataValue::Number(user_id)) = user_map.get(&DataTypes::user_id)
+                        {
+                            interested_ids.push(*user_id);
+
+                            // attach calls if exists
+                            if let Some(call_list) = invites.get(user_id) {
+                                user_map
+                                    .insert(DataTypes::calls, DataValue::Array(call_list.clone()));
+                            }
                         }
-                        let _ = enrc_contacts.push(enriched_contact);
+
+                        enriched.push(DataValue::container_from_map(&user_map));
                     }
-                } else {
-                    enrc_contacts = contacts_data.clone();
                 }
             }
-            enrc_contacts
+
+            DataValue::Array(enriched)
         };
 
-        // Notify OmegaConnection about user states
-        OmegaConnection::user_states(receiver_id, interested_ids.clone()).await;
+        // ============================
+        // Notify Omega
+        // ============================
+        OmegaConnection::user_states(receiver_id as i64, interested_ids.clone()).await;
 
-        // Set interested users in RhoConnection
+        // ============================
+        // Notify Rho
+        // ============================
         if let Some(rho_conn) = self.get_rho_connection().await {
-            rho_conn.set_interested(receiver_id, interested_ids).await;
+            rho_conn
+                .set_interested(receiver_id as i64, interested_ids)
+                .await;
         }
 
+        // ============================
         // Forward to client
+        // ============================
         self.forward_to_client(cv.add_data(DataTypes::user_ids, enriched_contacts))
             .await;
     }
@@ -607,7 +329,7 @@ impl IotaConnection {
             rho_conn.message_to_client(updated_cv).await;
         } else {
             log_err!(
-                self.get_iota_id().await,
+                self.get_iota_id().await as i64,
                 PrintType::General,
                 "Failed to forward message to client"
             );
@@ -615,10 +337,8 @@ impl IotaConnection {
     }
 
     pub async fn handle_close(&self) {
-        if self.is_identified().await {
-            if let Some(rho_conn) = self.get_rho_connection().await {
-                rho_conn.close_iota_connection().await;
-            }
+        if let Some(rho_conn) = self.get_rho_connection().await {
+            rho_conn.close_iota_connection().await;
         }
     }
 
@@ -638,7 +358,7 @@ impl IotaConnection {
                 tokio::spawn(async move {
                     if let Err(e) = inner_tx.send(response_cv).await {
                         log_err!(
-                            io.get_iota_id().await,
+                            io.get_iota_id().await as i64,
                             PrintType::Iota,
                             "Failed to send response back to awaiter: {}",
                             e

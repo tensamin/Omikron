@@ -6,14 +6,14 @@ use uuid::Uuid;
 use crate::calls::call_util;
 
 pub struct Caller {
-    pub user_id: i64,
+    pub user_id: u64,
     pub call_id: Uuid,
     pub has_admin: bool,
     pub timeout: RwLock<i64>,
 }
 
 impl Caller {
-    pub fn new(user_id: i64, call_id: Uuid, has_admin: bool) -> Self {
+    pub fn new(user_id: u64, call_id: Uuid, has_admin: bool) -> Self {
         Caller {
             user_id,
             call_id,

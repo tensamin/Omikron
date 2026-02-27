@@ -35,7 +35,7 @@ pub fn get_livekit() -> Result<(String, String, String), ()> {
     Ok((hostname, api_key, api_secret))
 }
 
-pub fn create_token(user_id: i64, call_id: Uuid, has_admin: bool) -> Result<String, ()> {
+pub fn create_token(user_id: u64, call_id: Uuid, has_admin: bool) -> Result<String, ()> {
     let (_, api_key, api_secret) = get_livekit()?;
 
     let token = access_token::AccessToken::with_api_key(&api_key, &api_secret)
@@ -69,7 +69,7 @@ pub async fn get_room(call_id: Uuid) -> Result<(RoomClient, Room), ()> {
     return Err(());
 }
 
-pub async fn remove_participant(call_id: Uuid, user_id: i64) -> Result<(), ()> {
+pub async fn remove_participant(call_id: Uuid, user_id: u64) -> Result<(), ()> {
     if let Ok((hostname, api_key, api_secret)) = get_livekit() {
         let room_service = RoomClient::with_api_key(&hostname, &api_key, &api_secret);
         if let Ok(_) = room_service
