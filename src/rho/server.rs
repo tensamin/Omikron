@@ -1,11 +1,23 @@
-use crate::{rho::connection::GeneralConnection, util::file_util::load_file_buf};
+use crate::{
+    log,
+    rho::connection::GeneralConnection,
+    util::file_util::{load_file_buf, load_file_vec},
+};
 use epsilon_native::Host;
 use quinn::ServerConfig;
-use rustls::pki_types::PrivateKeyDer;
+use rustls::{
+    ServerConfig as CryptoConfig,
+    crypto::{CryptoProvider, aws_lc_rs},
+    pki_types::{
+        CertificateDer, PrivateKeyDer,
+        pem::{PemObject, SectionKind},
+    },
+};
 use std::sync::Arc;
-use tokio::io::unix::AsyncFd;
 
 pub async fn start(port: u16) {
+    let _ = aws_lc_rs::default_provider().install_default();
+
     let tls_cfg = load_tls().expect("TLS config failed");
 
     let server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg)
@@ -23,34 +35,20 @@ pub async fn start(port: u16) {
     });
 }
 
-fn load_tls() -> Option<rustls::ServerConfig> {
-    let mut cert_file_buf = load_file_buf("certs", "cert.pem").ok()?;
-    let mut key_file_buf = load_file_buf("certs", "cert.key").ok()?;
+fn load_tls() -> Option<CryptoConfig> {
+    let _ = aws_lc_rs::default_provider().install_default();
 
-    let cert_chain = rustls_pemfile::certs(&mut cert_file_buf)
+    let mut cert_pem = load_file_buf("certs", "cert.pem").ok()?;
+    let cert_chain = rustls_pemfile::certs(&mut cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
 
-    let mut keys: Vec<PrivateKeyDer> = rustls_pemfile::pkcs8_private_keys(&mut key_file_buf)
-        .map(|k| k.map(Into::into))
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
+    let key_pem = load_file_vec("certs", "key.pem").ok()?;
+    let key_der = rustls_pemfile::private_key(&mut &*key_pem).ok()??;
 
-    if keys.is_empty() {
-        let mut key_file_buf = load_file_buf("certs", "cert.key").ok()?;
-        keys = rustls_pemfile::rsa_private_keys(&mut key_file_buf)
-            .map(|k| k.map(Into::into))
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?;
-    }
-
-    if keys.is_empty() {
-        return None;
-    }
-
-    let cfg = rustls::ServerConfig::builder()
+    let cfg = CryptoConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(cert_chain, keys.remove(0))
+        .with_single_cert(cert_chain, key_der)
         .ok()?;
 
     Some(cfg)

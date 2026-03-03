@@ -12,6 +12,7 @@ use once_cell::sync::Lazy;
 
 use crate::{
     calls::call_util::garbage_collect_calls,
+    omega::omega_connection::get_omega_connection,
     rho::server::start,
     util::{
         crypto_helper::{load_public_key, load_secret_key},
@@ -36,4 +37,8 @@ async fn main() {
     start(959).await;
 
     garbage_collect_calls();
+
+    get_omega_connection();
+
+    tokio::signal::ctrl_c().await.unwrap();
 }
