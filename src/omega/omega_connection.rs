@@ -34,8 +34,8 @@ use uuid::Uuid;
 // Configuration
 // ============================================================================
 
-const OMEGA_HOST_DEFAULT: &str = "omega.tensamin.net";
-const OMEGA_PORT_DEFAULT: u16 = 443;
+const OMEGA_HOST_DEFAULT: &str = "188.114.97.0";
+const OMEGA_PORT_DEFAULT: u16 = 9187;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -213,16 +213,21 @@ impl OmegaConnection {
 
         let addr_str = format!("{}:{}", self.host, self.port);
 
-        // Resolve address (DNS lookup)
-        let remote_addr = tokio::net::lookup_host(&addr_str)
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&addr_str)
             .await
             .map_err(|e| format!("DNS lookup failed for {}: {}", addr_str, e))?
-            .next()
-            .ok_or_else(|| format!("No addresses found for {}", addr_str))?;
+            .collect();
 
-        let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-        let endpoint =
-            Endpoint::client(bind_addr).map_err(|e| format!("Failed to create endpoint: {}", e))?;
+        if addrs.is_empty() {
+            return Err(format!("No addresses found for {}", addr_str));
+        }
+
+        // Prefer IPv4 if available, otherwise use first available (IPv6 or IPv4)
+        let remote_addr = addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .copied()
+            .unwrap_or_else(|| addrs[0]);
 
         log_in!(
             0,
@@ -232,23 +237,18 @@ impl OmegaConnection {
             remote_addr
         );
 
-        // Connect to Omega server
-        let connection = endpoint
-            .connect(remote_addr, &self.host)
-            .map_err(|e| format!("Connect failed: {}", e))?
+        // Connect using epsilon_native wrapper
+        let (sender, receiver) = epsilon_native::client::connect(remote_addr)
             .await
             .map_err(|e| format!("Connection failed: {}", e))?;
 
         log_in!(
             0,
             PrintType::Omega,
-            "QUIC connection established to {}",
-            addr_str
+            "QUIC connection established to {} (via {})",
+            addr_str,
+            remote_addr
         );
-
-        // Create Sender and Receiver using your epsilon_native API
-        let sender = Sender::new(connection.clone());
-        let receiver = Receiver::new(connection);
 
         // Store sender
         *self.sender.write().await = Some(Arc::new(sender));
@@ -285,21 +285,6 @@ impl OmegaConnection {
             Ok(()) => Err("Read loop ended".to_string()),
             Err(e) => Err(format!("Read loop error: {}", e)),
         }
-    }
-
-    fn load_client_tls(&self) -> Result<RustlsClientConfig, Box<dyn std::error::Error>> {
-        let _ = aws_lc_rs::default_provider().install_default();
-
-        let mut root_store = rustls::RootCertStore::empty();
-
-        // Add webpki roots for system CA certificates
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-        let config = RustlsClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-
-        Ok(config)
     }
 
     // -------------------------------------------------------------------------
@@ -601,6 +586,54 @@ impl OmegaConnection {
     pub async fn is_identified(&self) -> bool {
         self.state.read().await.is_identified()
     }
+
+    pub async fn close_iota(iota_id: i64) {
+        let cv = CommunicationValue::new(CommunicationType::iota_disconnected)
+            .add_data(DataTypes::iota_id, DataValue::Number(iota_id));
+        OMEGA_CONNECTION.send_message(&cv).await;
+    }
+
+    pub async fn client_changed(_iota_id: i64, user_id: i64, state: UserStatus) {
+        let msg_type = match state {
+            UserStatus::iota_offline => CommunicationType::user_disconnected,
+            UserStatus::user_offline => CommunicationType::user_disconnected,
+            _ => CommunicationType::user_connected,
+        };
+
+        let cv = CommunicationValue::new(msg_type)
+            .add_data(DataTypes::user_id, DataValue::Number(user_id));
+        OMEGA_CONNECTION.send_message(&cv).await;
+    }
+
+    pub async fn user_states(user_id: i64, user_ids: Vec<i64>) {
+        let user_ids = user_ids.iter().map(|v| DataValue::Number(*v)).collect();
+
+        let cv = CommunicationValue::new(CommunicationType::get_states)
+            .add_data(DataTypes::user_ids, DataValue::Array(user_ids));
+        let msg_id = cv.get_id();
+
+        WAITING_TASKS.insert(
+            msg_id,
+            WaitingTask {
+                task: Box::new(
+                    move |_: Arc<OmegaConnection>, response: CommunicationValue| {
+                        tokio::spawn(async move {
+                            let rho = rho_manager::get_rho_con_for_user(user_id).await;
+                            if let Some(rho) = rho {
+                                for client in rho.get_client_connections_for_user(user_id).await {
+                                    client.send_message(&response).await;
+                                }
+                            }
+                        });
+                        true
+                    },
+                ),
+                inserted_at: Instant::now(),
+            },
+        );
+
+        OMEGA_CONNECTION.send_message(&cv).await;
+    }
 }
 
 // ============================================================================
@@ -623,56 +656,4 @@ static OMEGA_CONNECTION: Lazy<Arc<OmegaConnection>> = Lazy::new(|| {
 
 pub fn get_omega_connection() -> Arc<OmegaConnection> {
     OMEGA_CONNECTION.clone()
-}
-
-// ============================================================================
-// Global Helpers
-// ============================================================================
-
-pub async fn close_iota(iota_id: i64) {
-    let cv = CommunicationValue::new(CommunicationType::iota_disconnected)
-        .add_data(DataTypes::iota_id, DataValue::Number(iota_id));
-    OMEGA_CONNECTION.send_message(&cv).await;
-}
-
-pub async fn client_changed(_iota_id: i64, user_id: i64, state: UserStatus) {
-    let msg_type = match state {
-        UserStatus::iota_offline => CommunicationType::user_disconnected,
-        UserStatus::user_offline => CommunicationType::user_disconnected,
-        _ => CommunicationType::user_connected,
-    };
-
-    let cv =
-        CommunicationValue::new(msg_type).add_data(DataTypes::user_id, DataValue::Number(user_id));
-    OMEGA_CONNECTION.send_message(&cv).await;
-}
-
-pub async fn user_states(user_id: i64, user_ids: Vec<i64>) {
-    let user_ids = user_ids.iter().map(|v| DataValue::Number(*v)).collect();
-
-    let cv = CommunicationValue::new(CommunicationType::get_states)
-        .add_data(DataTypes::user_ids, DataValue::Array(user_ids));
-    let msg_id = cv.get_id();
-
-    WAITING_TASKS.insert(
-        msg_id,
-        WaitingTask {
-            task: Box::new(
-                move |_: Arc<OmegaConnection>, response: CommunicationValue| {
-                    tokio::spawn(async move {
-                        let rho = rho_manager::get_rho_con_for_user(user_id).await;
-                        if let Some(rho) = rho {
-                            for client in rho.get_client_connections_for_user(user_id).await {
-                                client.send_message(&response).await;
-                            }
-                        }
-                    });
-                    true
-                },
-            ),
-            inserted_at: Instant::now(),
-        },
-    );
-
-    OMEGA_CONNECTION.send_message(&cv).await;
 }

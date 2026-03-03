@@ -9,6 +9,7 @@ use std::env;
 
 use dotenv::dotenv;
 use once_cell::sync::Lazy;
+use rustls::crypto::aws_lc_rs;
 
 use crate::{
     calls::call_util::garbage_collect_calls,
@@ -31,6 +32,7 @@ pub fn get_public_key() -> x448::PublicKey {
 
 #[tokio::main]
 async fn main() {
+    aws_lc_rs::default_provider().install_default();
     dotenv().ok();
     startup();
 
