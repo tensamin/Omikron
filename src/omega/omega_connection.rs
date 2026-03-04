@@ -1,28 +1,18 @@
 use crate::{
     data::user::UserStatus,
-    get_private_key, log, log_cv_in, log_cv_out, log_err, log_in, log_out,
-    rho::{
-        connection::GeneralConnection,
-        rho_manager::{self, RHO_CONNECTIONS, connection_count},
-    },
+    get_private_key, log, log_cv_in, log_cv_out, log_err, log_in,
+    rho::rho_manager::{self, RHO_CONNECTIONS, connection_count},
     util::{
         crypto_helper::{decrypt_b64, secret_key_to_base64},
-        file_util::{load_file_buf, load_file_vec},
+        file_util::load_file_vec,
         logger::PrintType,
     },
 };
 use dashmap::DashMap;
 use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
 use epsilon_native::{Receiver, Sender}; // Your existing types
-use futures::prelude::*;
 use once_cell::sync::Lazy;
-use quinn::{ClientConfig, Endpoint};
-use rustls::{
-    ClientConfig as RustlsClientConfig,
-    crypto::{CryptoProvider, aws_lc_rs},
-    pki_types::ServerName,
-};
-use std::{collections::HashMap, env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, env, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, RwLock, mpsc, watch},
     task::JoinHandle,
@@ -34,7 +24,7 @@ use uuid::Uuid;
 // Configuration
 // ============================================================================
 
-const OMEGA_HOST_DEFAULT: &str = "188.114.97.0";
+const OMEGA_HOST_DEFAULT: &str = "tensamin.net";
 const OMEGA_PORT_DEFAULT: u16 = 9187;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
@@ -93,13 +83,13 @@ impl ConnectionState {
 // ============================================================================
 // Omega Connection (Client-side with auto-reconnect)
 // ============================================================================
-
 pub struct OmegaConnection {
     state: Arc<RwLock<ConnectionState>>,
     sender: Arc<RwLock<Option<Arc<Sender>>>>,
     connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     host: String,
     port: u16,
+    server_cert: Vec<u8>,
     last_ping: Arc<Mutex<i64>>,
     heartbeat_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     message_send_times: Arc<Mutex<HashMap<Uuid, Instant>>>,
@@ -113,6 +103,15 @@ impl OmegaConnection {
     }
 
     pub fn with_host(host: &str, port: u16) -> Self {
+        // Load server certificate from default location
+        let server_cert =
+            load_file_vec("certs", "cert.pem").expect("Failed to load server certificate");
+
+        Self::with_host_and_cert(host, port, server_cert)
+    }
+
+    // New constructor that accepts certificate directly
+    pub fn with_host_and_cert(host: &str, port: u16, server_cert: Vec<u8>) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
 
         OmegaConnection {
@@ -121,6 +120,7 @@ impl OmegaConnection {
             connection_loop_handle: Arc::new(Mutex::new(None)),
             host: host.to_string(),
             port,
+            server_cert, // Store certificate for connection
             last_ping: Arc::new(Mutex::new(-1)),
             heartbeat_handle: Arc::new(Mutex::new(None)),
             message_send_times: Arc::new(Mutex::new(HashMap::new())),
@@ -211,43 +211,26 @@ impl OmegaConnection {
     async fn connect_once(self: Arc<Self>) -> Result<(), String> {
         *self.state.write().await = ConnectionState::Connecting;
 
-        let addr_str = format!("{}:{}", self.host, self.port);
-
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&addr_str)
-            .await
-            .map_err(|e| format!("DNS lookup failed for {}: {}", addr_str, e))?
-            .collect();
-
-        if addrs.is_empty() {
-            return Err(format!("No addresses found for {}", addr_str));
-        }
-
-        // Prefer IPv4 if available, otherwise use first available (IPv6 or IPv4)
-        let remote_addr = addrs
-            .iter()
-            .find(|a| a.is_ipv4())
-            .copied()
-            .unwrap_or_else(|| addrs[0]);
+        // Build WebTransport URL
+        let url = format!("https://{}:{}", self.host, self.port);
 
         log_in!(
             0,
             PrintType::Omega,
-            "Connecting to {} ({})...",
-            self.host,
-            remote_addr
+            "Connecting to {}...", // WebTransport uses URLs, not socket addresses
+            url
         );
 
-        // Connect using epsilon_native wrapper
-        let (sender, receiver) = epsilon_native::client::connect(remote_addr)
+        // Connect using new epsilon_native API with certificate verification
+        let (sender, receiver) = epsilon_native::connect(&url, self.server_cert.clone())
             .await
             .map_err(|e| format!("Connection failed: {}", e))?;
 
         log_in!(
             0,
             PrintType::Omega,
-            "QUIC connection established to {} (via {})",
-            addr_str,
-            remote_addr
+            "WebTransport connection established to {}", // Updated protocol name
+            url
         );
 
         // Store sender
@@ -571,7 +554,7 @@ impl OmegaConnection {
 
         match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(response_cv)) => Ok(response_cv),
-            Ok(None) => Err("Channel closed".to_string()),
+            Ok(_) => Err("Channel closed".to_string()),
             Err(_) => {
                 WAITING_TASKS.remove(&msg_id);
                 Err("Request timed out".to_string())

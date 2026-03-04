@@ -9,7 +9,7 @@ use std::env;
 
 use dotenv::dotenv;
 use once_cell::sync::Lazy;
-use rustls::crypto::aws_lc_rs;
+use rustls::crypto::aws_lc_rs::default_provider;
 
 use crate::{
     calls::call_util::garbage_collect_calls,
@@ -32,15 +32,18 @@ pub fn get_public_key() -> x448::PublicKey {
 
 #[tokio::main]
 async fn main() {
-    aws_lc_rs::default_provider().install_default();
+    if let Err(_) = default_provider().install_default() {
+        println!("Error loading Provider");
+        return;
+    }
     dotenv().ok();
     startup();
 
-    start(959).await;
-
-    garbage_collect_calls();
-
     get_omega_connection();
+    tokio::spawn(async move {
+        let _ = start(959).await;
+    });
+    garbage_collect_calls();
 
     tokio::signal::ctrl_c().await.unwrap();
 }
