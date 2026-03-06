@@ -1,27 +1,17 @@
 use crate::{
     data::user::UserStatus,
-    get_private_key, log, log_cv_in, log_cv_out, log_err, log_in, log_out,
-    rho::{
-        connection::GeneralConnection,
-        rho_manager::{self, RHO_CONNECTIONS, connection_count},
-    },
+    get_private_key, log, log_cv_in, log_cv_out, log_err, log_in,
+    rho::rho_manager::{self, RHO_CONNECTIONS, connection_count},
     util::{
         crypto_helper::{decrypt_b64, secret_key_to_base64},
-        file_util::{load_file_buf, load_file_vec},
+        file_util::load_file_vec,
         logger::PrintType,
     },
 };
 use dashmap::DashMap;
 use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
-use epsilon_native::{Receiver, Sender}; // Your existing types
-use futures::prelude::*;
+use epsilon_native::{Receiver, Sender};
 use once_cell::sync::Lazy;
-use quinn::{ClientConfig, Endpoint};
-use rustls::{
-    ClientConfig as RustlsClientConfig,
-    crypto::{CryptoProvider, aws_lc_rs},
-    pki_types::ServerName,
-};
 use std::{collections::HashMap, env, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, RwLock, mpsc, watch},
@@ -34,7 +24,7 @@ use uuid::Uuid;
 // Configuration
 // ============================================================================
 
-const OMEGA_HOST_DEFAULT: &str = "188.114.97.0";
+const OMEGA_HOST_DEFAULT: &str = "omega.tensamin.net";
 const OMEGA_PORT_DEFAULT: u16 = 9187;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
@@ -211,43 +201,17 @@ impl OmegaConnection {
     async fn connect_once(self: Arc<Self>) -> Result<(), String> {
         *self.state.write().await = ConnectionState::Connecting;
 
-        let addr_str = format!("{}:{}", self.host, self.port);
+        let addr_str = format!("https://{}:{}", self.host, self.port);
 
-        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&addr_str)
-            .await
-            .map_err(|e| format!("DNS lookup failed for {}: {}", addr_str, e))?
-            .collect();
-
-        if addrs.is_empty() {
-            return Err(format!("No addresses found for {}", addr_str));
-        }
-
-        // Prefer IPv4 if available, otherwise use first available (IPv6 or IPv4)
-        let remote_addr = addrs
-            .iter()
-            .find(|a| a.is_ipv4())
-            .copied()
-            .unwrap_or_else(|| addrs[0]);
-
-        log_in!(
-            0,
-            PrintType::Omega,
-            "Connecting to {} ({})...",
-            self.host,
-            remote_addr
-        );
-
-        // Connect using epsilon_native wrapper
-        let (sender, receiver) = epsilon_native::client::connect(remote_addr)
+        let (sender, receiver) = epsilon_native::client::connect(&addr_str, None)
             .await
             .map_err(|e| format!("Connection failed: {}", e))?;
 
         log_in!(
             0,
             PrintType::Omega,
-            "QUIC connection established to {} (via {})",
-            addr_str,
-            remote_addr
+            "QUIC connection established to {}",
+            addr_str
         );
 
         // Store sender
