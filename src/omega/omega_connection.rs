@@ -83,13 +83,13 @@ impl ConnectionState {
 // ============================================================================
 // Omega Connection (Client-side with auto-reconnect)
 // ============================================================================
-
 pub struct OmegaConnection {
     state: Arc<RwLock<ConnectionState>>,
     sender: Arc<RwLock<Option<Arc<Sender>>>>,
     connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     host: String,
     port: u16,
+    server_cert: Vec<u8>,
     last_ping: Arc<Mutex<i64>>,
     heartbeat_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     message_send_times: Arc<Mutex<HashMap<Uuid, Instant>>>,
@@ -103,6 +103,15 @@ impl OmegaConnection {
     }
 
     pub fn with_host(host: &str, port: u16) -> Self {
+        // Load server certificate from default location
+        let server_cert =
+            load_file_vec("certs", "cert.pem").expect("Failed to load server certificate");
+
+        Self::with_host_and_cert(host, port, server_cert)
+    }
+
+    // New constructor that accepts certificate directly
+    pub fn with_host_and_cert(host: &str, port: u16, server_cert: Vec<u8>) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
 
         OmegaConnection {
@@ -111,6 +120,7 @@ impl OmegaConnection {
             connection_loop_handle: Arc::new(Mutex::new(None)),
             host: host.to_string(),
             port,
+            server_cert, // Store certificate for connection
             last_ping: Arc::new(Mutex::new(-1)),
             heartbeat_handle: Arc::new(Mutex::new(None)),
             message_send_times: Arc::new(Mutex::new(HashMap::new())),
@@ -535,7 +545,7 @@ impl OmegaConnection {
 
         match tokio::time::timeout(timeout, rx.recv()).await {
             Ok(Some(response_cv)) => Ok(response_cv),
-            Ok(None) => Err("Channel closed".to_string()),
+            Ok(_) => Err("Channel closed".to_string()),
             Err(_) => {
                 WAITING_TASKS.remove(&msg_id);
                 Err("Request timed out".to_string())
