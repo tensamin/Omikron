@@ -213,7 +213,7 @@ impl OmegaConnection {
 
         let addr_str = format!("https://{}:{}", self.host, self.port);
 
-        let (sender, receiver) = epsilon_native::client::connect(&addr_str, None)
+        let (sender, mut receiver) = epsilon_native::client::connect(&addr_str, None)
             .await
             .map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -231,7 +231,7 @@ impl OmegaConnection {
         // Start read loop
         let read_self = self.clone();
         let read_handle = tokio::spawn(async move {
-            read_self.read_loop(receiver).await;
+            read_self.read_loop(&mut receiver).await;
         });
 
         // Send identification
@@ -275,7 +275,7 @@ impl OmegaConnection {
 
         let identify_msg = CommunicationValue::new(CommunicationType::identification)
             .with_id(id)
-            .add_data(DataTypes::omikron, DataValue::Number(omikron_id));
+            .add_data(DataTypes::omikron_id, DataValue::Number(omikron_id));
 
         WAITING_TASKS.insert(
             id,
@@ -404,16 +404,16 @@ impl OmegaConnection {
     // Read Loop & Heartbeat
     // -------------------------------------------------------------------------
 
-    async fn read_loop(self: Arc<Self>, receiver: Receiver) {
+    async fn read_loop(self: Arc<Self>, receiver: &mut Receiver) {
         loop {
             match receiver.receive().await {
                 Ok(cv) => {
+                    log_cv_in!(&cv);
+
                     if cv.is_type(CommunicationType::pong) || cv.is_type(CommunicationType::ping) {
                         self.handle_pong(&cv).await;
                         continue;
                     }
-
-                    log_cv_in!(&cv);
 
                     let msg_id = cv.get_id();
                     if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
@@ -474,9 +474,7 @@ impl OmegaConnection {
     // -------------------------------------------------------------------------
 
     pub async fn send_message(&self, cv: &CommunicationValue) {
-        if !cv.is_type(CommunicationType::ping) {
-            log_cv_out!(cv);
-        }
+        log_cv_out!(cv);
 
         let sender_guard = self.sender.read().await;
         if let Some(sender) = sender_guard.as_ref() {

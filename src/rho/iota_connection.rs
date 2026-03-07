@@ -13,6 +13,7 @@ use epsilon_core::DataTypes;
 use epsilon_core::DataValue;
 use epsilon_native::Receiver;
 use epsilon_native::Sender;
+use std::collections::BTreeMap;
 use std::{
     collections::HashMap,
     sync::{Arc, Weak},
@@ -53,9 +54,9 @@ impl IotaConnection {
     pub fn start(self: Arc<Self>) {
         let self_clone = self.clone();
         tokio::spawn(async move {
-            while let Ok(cv) = self_clone.receiver.receive().await {
+            /*while let Ok(cv) = self_clone.receiver.receive().await {
                 self_clone.clone().handle_message(cv).await;
-            }
+            }*/
         });
     }
 
@@ -243,7 +244,7 @@ impl IotaConnection {
                 let admin = call_self.has_admin();
 
                 // Build call container
-                let mut call_map: HashMap<DataTypes, DataValue> = HashMap::new();
+                let mut call_map: BTreeMap<DataTypes, DataValue> = BTreeMap::new();
 
                 call_map.insert(DataTypes::call_id, DataValue::Str(call.call_id.to_string()));
 
@@ -278,7 +279,7 @@ impl IotaConnection {
             if let DataValue::Array(users) = cv.get_data(DataTypes::user_ids) {
                 for user_val in users {
                     if let DataValue::Container(entries) = user_val {
-                        let mut user_map: HashMap<DataTypes, DataValue> =
+                        let mut user_map: BTreeMap<DataTypes, DataValue> =
                             entries.iter().cloned().collect();
 
                         // extract user_id

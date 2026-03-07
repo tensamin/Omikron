@@ -46,9 +46,9 @@ impl AnonymousClientConnection {
     pub fn start(self: Arc<Self>) {
         let self_clone = self.clone();
         tokio::spawn(async move {
-            while let Ok(cv) = self_clone.receiver.receive().await {
+            /*while let Ok(cv) = self_clone.receiver.receive().await {
                 self_clone.clone().handle_message(cv).await;
-            }
+            }*/
         });
     }
 

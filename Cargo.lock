@@ -1090,7 +1090,7 @@ dependencies = [
 [[package]]
 name = "epsilon-core"
 version = "0.1.0"
-source = "git+https://github.com/Tensamin/Epsilon.git#44e3a3ec0ee6ac4c00f8cfb7c20c3299c7ae89c5"
+source = "git+https://github.com/Tensamin/Epsilon.git#a175705a731a124bca7507ea897d29f536bb15dc"
 dependencies = [
  "byteorder",
  "quinn",
@@ -1102,7 +1102,7 @@ dependencies = [
 [[package]]
 name = "epsilon-native"
 version = "0.1.0"
-source = "git+https://github.com/Tensamin/Epsilon.git#44e3a3ec0ee6ac4c00f8cfb7c20c3299c7ae89c5"
+source = "git+https://github.com/Tensamin/Epsilon.git#a175705a731a124bca7507ea897d29f536bb15dc"
 dependencies = [
  "anyhow",
  "async-trait",
