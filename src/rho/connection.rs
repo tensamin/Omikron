@@ -53,7 +53,7 @@ impl GeneralConnection {
 impl GeneralConnection {
     pub async fn handle(self: Arc<Self>) {
         loop {
-            /*let cv = match self.receiver.receive().await {
+            let cv = match self.receiver.receive().await {
                 Ok(v) => v,
                 Err(_) => break,
             };
@@ -70,7 +70,7 @@ impl GeneralConnection {
 
             if self.migrate().await {
                 break;
-            }*/
+            }
         }
     }
     async fn handle_identification(self: &Arc<Self>, cv: CommunicationValue) {

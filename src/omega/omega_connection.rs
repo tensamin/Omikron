@@ -95,6 +95,8 @@ pub struct OmegaConnection {
     message_send_times: Arc<Mutex<HashMap<Uuid, Instant>>>,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
+    // Track if we should reconnect on close
+    reconnect_on_close: Arc<RwLock<bool>>,
 }
 
 impl OmegaConnection {
@@ -120,12 +122,13 @@ impl OmegaConnection {
             connection_loop_handle: Arc::new(Mutex::new(None)),
             host: host.to_string(),
             port,
-            server_cert, // Store certificate for connection
+            server_cert,
             last_ping: Arc::new(Mutex::new(-1)),
             heartbeat_handle: Arc::new(Mutex::new(None)),
             message_send_times: Arc::new(Mutex::new(HashMap::new())),
             connection_id: Uuid::new_v4(),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+            reconnect_on_close: Arc::new(RwLock::new(true)),
         }
     }
 
@@ -139,6 +142,9 @@ impl OmegaConnection {
             handle.abort();
         }
 
+        // Set reconnect flag
+        *self.reconnect_on_close.write().await = true;
+
         let self_clone = self.clone();
         let handle = tokio::spawn(async move {
             self_clone.connection_loop().await;
@@ -148,6 +154,9 @@ impl OmegaConnection {
     }
 
     pub async fn stop(&self) {
+        // Disable reconnection
+        *self.reconnect_on_close.write().await = false;
+
         if let Some(tx) = self.shutdown_tx.lock().await.take() {
             let _ = tx.send(true);
         }
@@ -158,6 +167,11 @@ impl OmegaConnection {
 
         if let Some(handle) = self.heartbeat_handle.lock().await.take() {
             handle.abort();
+        }
+
+        // Close sender if connected
+        if let Some(sender) = self.sender.read().await.as_ref() {
+            sender.close();
         }
 
         *self.state.write().await = ConnectionState::Disconnected;
@@ -175,14 +189,26 @@ impl OmegaConnection {
                 break;
             }
 
+            // Check if reconnection is enabled
+            if !*self.reconnect_on_close.read().await {
+                log_in!(0, PrintType::Omega, "Reconnection disabled, exiting loop");
+                break;
+            }
+
             match self.clone().connect_once().await {
                 Ok(()) => {
-                    log_err!(
-                        0,
-                        PrintType::Omega,
-                        "Connection lost, reconnecting in {:?}...",
-                        reconnect_delay
-                    );
+                    // Connection closed gracefully, check if we should reconnect
+                    if *self.reconnect_on_close.read().await {
+                        log_err!(
+                            0,
+                            PrintType::Omega,
+                            "Connection lost, reconnecting in {:?}...",
+                            reconnect_delay
+                        );
+                    } else {
+                        log_in!(0, PrintType::Omega, "Connection closed, not reconnecting");
+                        break;
+                    }
                 }
                 Err(e) => {
                     log_err!(
@@ -224,14 +250,21 @@ impl OmegaConnection {
             addr_str
         );
 
+        // Reset reconnect delay on successful connection
+        let reconnect_delay = RECONNECT_DELAY;
+
         // Store sender
-        *self.sender.write().await = Some(Arc::new(sender));
+        let sender_arc = Arc::new(sender);
+        *self.sender.write().await = Some(sender_arc.clone());
         *self.state.write().await = ConnectionState::Connected { identified: false };
+
+        // Get handle for close monitoring
+        let sender_handle = sender_arc.handle().clone();
 
         // Start read loop
         let read_self = self.clone();
         let read_handle = tokio::spawn(async move {
-            read_self.read_loop(&mut receiver).await;
+            read_self.read_loop(&mut receiver, sender_handle).await;
         });
 
         // Send identification
@@ -244,7 +277,7 @@ impl OmegaConnection {
         });
         *self.heartbeat_handle.lock().await = Some(heartbeat_handle);
 
-        // Wait for read loop to complete
+        // Wait for read loop to complete (connection closed)
         let result = read_handle.await;
 
         // Cleanup
@@ -256,7 +289,14 @@ impl OmegaConnection {
         }
 
         match result {
-            Ok(()) => Err("Read loop ended".to_string()),
+            Ok(()) => {
+                // Check if we should reconnect
+                if *self.reconnect_on_close.read().await {
+                    Err("Connection closed, will reconnect".to_string())
+                } else {
+                    Ok(())
+                }
+            }
             Err(e) => Err(format!("Read loop error: {}", e)),
         }
     }
@@ -404,26 +444,46 @@ impl OmegaConnection {
     // Read Loop & Heartbeat
     // -------------------------------------------------------------------------
 
-    async fn read_loop(self: Arc<Self>, receiver: &mut Receiver) {
+    async fn read_loop(
+        self: Arc<Self>,
+        receiver: &mut Receiver,
+        sender_handle: Arc<epsilon_native::ConnectionHandle>,
+    ) {
+        // Monitor both receiver and sender handle for close
+        let mut close_rx = sender_handle.subscribe_close();
+
         loop {
-            match receiver.receive().await {
-                Ok(cv) => {
-                    log_cv_in!(&cv);
+            tokio::select! {
+                result = receiver.receive() => {
+                    match result {
+                        Ok(cv) => {
+                            log_cv_in!(&cv);
 
-                    if cv.is_type(CommunicationType::pong) || cv.is_type(CommunicationType::ping) {
-                        self.handle_pong(&cv).await;
-                        continue;
-                    }
+                            if cv.is_type(CommunicationType::pong) || cv.is_type(CommunicationType::ping) {
+                                self.handle_pong(&cv).await;
+                                continue;
+                            }
 
-                    let msg_id = cv.get_id();
-                    if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
-                        if (task.task)(self.clone(), cv) {
-                            continue;
+                            let msg_id = cv.get_id();
+                            if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
+                                if (task.task)(self.clone(), cv) {
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log_err!(0, PrintType::Omega, "Receive error: {}", e);
+                            break;
                         }
                     }
                 }
-                Err(e) => {
-                    log_err!(0, PrintType::Omega, "Receive error: {}", e);
+                _ = close_rx.changed() => {
+                    // Connection was closed by either side
+                    if let Some(reason) = close_rx.borrow().clone() {
+                        log_err!(0, PrintType::Omega, "Connection closed: {:?}", reason);
+                    } else {
+                        log_in!(0, PrintType::Omega, "Connection closed cleanly");
+                    }
                     break;
                 }
             }
@@ -434,7 +494,18 @@ impl OmegaConnection {
         loop {
             sleep(HEARTBEAT_INTERVAL).await;
 
+            // Check if still connected
             if !self.state.read().await.is_connected() {
+                break;
+            }
+
+            // Check if sender is closed
+            if let Some(sender) = self.sender.read().await.as_ref() {
+                if sender.is_closed() {
+                    log_err!(0, PrintType::Omega, "Sender closed, stopping heartbeat");
+                    break;
+                }
+            } else {
                 break;
             }
 
@@ -478,6 +549,17 @@ impl OmegaConnection {
 
         let sender_guard = self.sender.read().await;
         if let Some(sender) = sender_guard.as_ref() {
+            // Check if closed before sending
+            if sender.is_closed() {
+                log_err!(0, PrintType::Omega, "Cannot send: connection closed");
+                drop(sender_guard);
+                // Trigger reconnection by closing the connection state
+                if let Some(sender) = self.sender.write().await.take() {
+                    sender.close();
+                }
+                return;
+            }
+
             let sender_clone = Arc::clone(sender);
             drop(sender_guard);
 

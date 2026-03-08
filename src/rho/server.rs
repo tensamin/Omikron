@@ -19,6 +19,7 @@ pub async fn start(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             conn.handle().await;
         });
     }
+    log!(0, PrintType::General, "Server stopped");
 
     Ok(())
 }

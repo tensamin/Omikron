@@ -54,9 +54,9 @@ impl IotaConnection {
     pub fn start(self: Arc<Self>) {
         let self_clone = self.clone();
         tokio::spawn(async move {
-            /*while let Ok(cv) = self_clone.receiver.receive().await {
+            while let Ok(cv) = self_clone.receiver.receive().await {
                 self_clone.clone().handle_message(cv).await;
-            }*/
+            }
         });
     }
 
@@ -104,7 +104,14 @@ impl IotaConnection {
         if !cv.is_type(CommunicationType::pong) {
             log_cv_out!(PrintType::Iota, cv);
         }
-        self.sender.send(&cv).await;
+        if let Err(e) = self.sender.send(&cv).await {
+            log_err!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Failed to send message: {:?}",
+                e
+            );
+        }
     }
 
     /// Handle incoming message from Iota
