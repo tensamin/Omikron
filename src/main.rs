@@ -41,7 +41,9 @@ async fn main() {
 
     get_omega_connection();
     tokio::spawn(async move {
-        let _ = start(959).await;
+        if let Err(e) = start(959).await {
+            log_err!(0, util::logger::PrintType::General, "{}", e);
+        }
     });
     garbage_collect_calls();
 

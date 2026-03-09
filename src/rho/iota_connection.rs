@@ -3,6 +3,8 @@ use crate::calls::call_manager;
 use crate::log_cv_in;
 use crate::log_cv_out;
 use crate::log_err;
+use crate::log_in;
+use crate::log_out;
 use crate::omega::omega_connection::get_omega_connection;
 use crate::rho::connection::GeneralConnection;
 use crate::util::logger::PrintType;
@@ -54,9 +56,41 @@ impl IotaConnection {
     pub fn start(self: Arc<Self>) {
         let self_clone = self.clone();
         tokio::spawn(async move {
-            while let Ok(cv) = self_clone.receiver.receive().await {
-                self_clone.clone().handle_message(cv).await;
+            log_in!(
+                self_clone.iota_id as i64,
+                PrintType::Iota,
+                "Upgraded IotaConnection read loop started"
+            );
+
+            loop {
+                match self_clone.receiver.receive().await {
+                    Ok(cv) => {
+                        log_in!(
+                            self_clone.iota_id as i64,
+                            PrintType::Iota,
+                            "Upgraded IotaConnection received message type={:?} id={}",
+                            cv.get_type(),
+                            cv.get_id()
+                        );
+                        self_clone.clone().handle_message(cv).await;
+                    }
+                    Err(e) => {
+                        log_err!(
+                            self_clone.iota_id as i64,
+                            PrintType::Iota,
+                            "Upgraded IotaConnection read loop stopped due to receive error: {:?}",
+                            e
+                        );
+                        break;
+                    }
+                }
             }
+
+            log_out!(
+                self_clone.iota_id as i64,
+                PrintType::Iota,
+                "Upgraded IotaConnection read loop exited"
+            );
         });
     }
 
@@ -116,8 +150,23 @@ impl IotaConnection {
 
     /// Handle incoming message from Iota
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
+        log_in!(
+            self.iota_id as i64,
+            PrintType::Iota,
+            "Handling upgraded Iota message type={:?} id={} sender={} receiver={}",
+            cv.get_type(),
+            cv.get_id(),
+            cv.get_sender(),
+            cv.get_receiver()
+        );
+
         // Handle ping
         if cv.is_type(CommunicationType::ping) || cv.is_type(CommunicationType::pong) {
+            log_in!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Routing upgraded Iota message to ping handler"
+            );
             self.handle_ping(cv).await;
             return;
         }
@@ -126,6 +175,11 @@ impl IotaConnection {
 
         // Handle GET_CHATS
         if cv.is_type(CommunicationType::get_chats) {
+            log_in!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Routing upgraded Iota message to get_chats handler"
+            );
             self.handle_get_chats(cv).await;
             return;
         }
@@ -136,6 +190,12 @@ impl IotaConnection {
             || cv.is_type(CommunicationType::message_other_iota)
             || cv.is_type(CommunicationType::send_chat)
         {
+            log_in!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Routing upgraded Iota message to forward_message handler receiver_id={}",
+                receiver_id
+            );
             self.handle_forward_message(cv).await;
             return;
         }
@@ -149,11 +209,22 @@ impl IotaConnection {
             || cv.is_type(CommunicationType::delete_iota)
         {
             let sender = self.get_iota_id().await;
+            log_in!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Routing upgraded Iota message to Omega forwarder with sender={}",
+                sender
+            );
             self.handle_omega_forward(cv.with_sender(sender as u64))
                 .await;
             return;
         }
         // Forward to client
+        log_in!(
+            self.iota_id as i64,
+            PrintType::Iota,
+            "Routing upgraded Iota message to client forwarder"
+        );
         self.forward_to_client(cv).await;
     }
 
@@ -169,16 +240,45 @@ impl IotaConnection {
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
         let iota_for_closure = self.clone();
         tokio::spawn(async move {
+            log_out!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Forwarding upgraded Iota message to Omega type={:?} id={}",
+                cv.get_type(),
+                cv.get_id()
+            );
+
             let response_cv = get_omega_connection()
                 .await_response(&cv.with_sender(self.iota_id), Some(Duration::from_secs(20)))
                 .await;
             if let Ok(response_cv) = response_cv {
+                log_in!(
+                    self.iota_id as i64,
+                    PrintType::Iota,
+                    "Received Omega response for upgraded Iota type={:?} id={}",
+                    response_cv.get_type(),
+                    response_cv.get_id()
+                );
                 iota_for_closure.send_message(&response_cv).await;
+            } else if let Err(e) = response_cv {
+                log_err!(
+                    self.iota_id as i64,
+                    PrintType::Iota,
+                    "Omega forward failed for upgraded Iota connection: {}",
+                    e
+                );
             }
         });
     }
     /// Handle ping message
     async fn handle_ping(&self, cv: CommunicationValue) {
+        log_in!(
+            self.iota_id as i64,
+            PrintType::Iota,
+            "Handling ping/pong for upgraded Iota connection message_id={}",
+            cv.get_id()
+        );
+
         if let DataValue::Number(last_ping) = cv.get_data(DataTypes::last_ping) {
             if let Ok(ping_val) = last_ping.to_string().parse::<i64>() {
                 let mut ping_guard = self.ping.write().await;
@@ -199,6 +299,14 @@ impl IotaConnection {
         let response = CommunicationValue::new(CommunicationType::pong)
             .with_id(cv.get_id())
             .add_data(DataTypes::ping_clients, DataValue::Container(pings));
+
+        log_out!(
+            self.iota_id as i64,
+            PrintType::Iota,
+            "Sending pong from upgraded Iota connection message_id={}",
+            cv.get_id()
+        );
+
         self.send_message(&response).await;
     }
 
@@ -207,16 +315,43 @@ impl IotaConnection {
         let receiver_id = cv.get_receiver();
         let sender_id = cv.get_sender();
 
+        log_in!(
+            self.iota_id as i64,
+            PrintType::Iota,
+            "Handling cross-routing message sender={} receiver={} type={:?}",
+            sender_id,
+            receiver_id,
+            cv.get_type()
+        );
+
         if self.get_user_ids().await.contains(&(sender_id as u64)) {
             if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id as i64).await {
+                log_out!(
+                    self.iota_id as i64,
+                    PrintType::Iota,
+                    "Forwarding upgraded Iota message to target rho receiver={}",
+                    receiver_id
+                );
                 target_rho.message_to_iota(cv).await;
             } else {
+                log_err!(
+                    self.iota_id as i64,
+                    PrintType::Iota,
+                    "No target rho found for receiver={}",
+                    receiver_id
+                );
                 let error = CommunicationValue::new(CommunicationType::error_no_iota)
                     .with_id(cv.get_id())
                     .with_sender(cv.get_sender());
                 self.send_message(&error).await;
             }
         } else {
+            log_err!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Unauthorized sender attempted cross-routing sender={}",
+                sender_id
+            );
             self.send_message(
                 &CommunicationValue::new(CommunicationType::error_invalid_user_id).add_data(
                     DataTypes::error_type,
@@ -334,19 +469,39 @@ impl IotaConnection {
     async fn forward_to_client(&self, cv: CommunicationValue) {
         if let Some(rho_conn) = self.get_rho_connection().await {
             let updated_cv = cv.with_sender(self.get_iota_id().await);
+            log_out!(
+                self.get_iota_id().await as i64,
+                PrintType::Iota,
+                "Forwarding upgraded Iota message to client type={:?} id={} receiver={}",
+                updated_cv.get_type(),
+                updated_cv.get_id(),
+                updated_cv.get_receiver()
+            );
             rho_conn.message_to_client(updated_cv).await;
         } else {
             log_err!(
                 self.get_iota_id().await as i64,
                 PrintType::General,
-                "Failed to forward message to client"
+                "Failed to forward message to client because rho connection is missing"
             );
         }
     }
 
     pub async fn handle_close(&self) {
+        log_out!(
+            self.get_iota_id().await as i64,
+            PrintType::Iota,
+            "Handling upgraded Iota connection close"
+        );
+
         if let Some(rho_conn) = self.get_rho_connection().await {
             rho_conn.close_iota_connection().await;
+        } else {
+            log_err!(
+                self.get_iota_id().await as i64,
+                PrintType::Iota,
+                "No rho connection available during upgraded Iota close"
+            );
         }
     }
 

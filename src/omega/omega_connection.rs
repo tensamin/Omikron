@@ -457,7 +457,9 @@ impl OmegaConnection {
                 result = receiver.receive() => {
                     match result {
                         Ok(cv) => {
-                            log_cv_in!(&cv);
+                            if !cv.is_type(CommunicationType::pong) && !cv.is_type(CommunicationType::ping) {
+                                log_cv_in!(PrintType::Omega, &cv);
+                            }
 
                             if cv.is_type(CommunicationType::pong) || cv.is_type(CommunicationType::ping) {
                                 self.handle_pong(&cv).await;
@@ -545,7 +547,9 @@ impl OmegaConnection {
     // -------------------------------------------------------------------------
 
     pub async fn send_message(&self, cv: &CommunicationValue) {
-        log_cv_out!(cv);
+        if !cv.is_type(CommunicationType::pong) && !cv.is_type(CommunicationType::ping) {
+            log_cv_out!(PrintType::Omega, &cv);
+        }
 
         let sender_guard = self.sender.read().await;
         if let Some(sender) = sender_guard.as_ref() {
