@@ -24,7 +24,7 @@ use uuid::Uuid;
 // Configuration
 // ============================================================================
 
-const OMEGA_HOST_DEFAULT: &str = "omega.tensamin.net";
+const OMEGA_HOST_DEFAULT: &str = "methanium.net";
 const OMEGA_PORT_DEFAULT: u16 = 9187;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
