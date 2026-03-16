@@ -3,8 +3,6 @@ use crate::calls::call_manager;
 use crate::log_cv_in;
 use crate::log_cv_out;
 use crate::log_err;
-use crate::log_in;
-use crate::log_out;
 use crate::omega::omega_connection::get_omega_connection;
 use crate::rho::connection::GeneralConnection;
 use crate::util::logger::PrintType;

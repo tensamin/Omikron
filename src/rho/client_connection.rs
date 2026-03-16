@@ -76,7 +76,7 @@ impl ClientConnection {
         if !cv.is_type(CommunicationType::pong) && !cv.is_type(CommunicationType::ping) {
             log_cv_out!(PrintType::Client, &cv);
         }
-        self.sender.send(&cv).await;
+        let _ = self.sender.send(&cv).await;
     }
 
     /// Handle incoming message from client

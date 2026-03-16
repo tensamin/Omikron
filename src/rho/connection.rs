@@ -61,7 +61,7 @@ impl GeneralConnection {
         loop {
             let cv = match self.receiver.receive().await {
                 Ok(v) => v,
-                Err(e) => {
+                Err(_) => {
                     break;
                 }
             };
@@ -104,7 +104,7 @@ impl GeneralConnection {
 
             let response_cv = match response_cv {
                 Ok(r) => r,
-                Err(e) => {
+                Err(_) => {
                     return;
                 }
             };
@@ -140,6 +140,64 @@ impl GeneralConnection {
                     .export(DataFormat::Base64);
 
             let response = CommunicationValue::new(CommunicationType::challenge)
+                .with_id(cv.get_id())
+                .add_data(
+                    DataTypes::public_key,
+                    DataValue::Str(public_key_to_base64(&get_public_key())),
+                )
+                .add_data(DataTypes::challenge, DataValue::Str(encrypted_challenge));
+
+            let _ = self.sender.send(&response).await;
+        } else if let DataValue::Number(user_id) = cv.get_data(DataTypes::user_id) {
+            *self.id.write().await = *user_id as u64;
+            *self.connection_kind.write().await = Some(ConnectionKind::Client);
+
+            let get_pub_key_msg = CommunicationValue::new(CommunicationType::get_user_data)
+                .add_data(DataTypes::user_id, DataValue::Number(*user_id));
+
+            let response_cv = get_omega_connection()
+                .await_response(&get_pub_key_msg, Some(Duration::from_secs(20)))
+                .await;
+
+            let response_cv = match response_cv {
+                Ok(r) => r,
+                Err(_) => {
+                    return;
+                }
+            };
+
+            let base64_pub = response_cv
+                .get_data(DataTypes::public_key)
+                .as_str()
+                .unwrap_or("");
+
+            let pub_key = match load_public_key(base64_pub) {
+                Some(pk) => pk,
+                None => {
+                    return;
+                }
+            };
+
+            *self.pub_key.write().await = Some(pub_key.as_bytes().to_vec());
+
+            let challenge: String = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
+
+            *self.challenge.write().await = challenge.clone();
+            *self.identified.write().await = true;
+
+            let encrypted_challenge =
+                SecurePayload::new(challenge.as_bytes(), DataFormat::Raw, get_private_key())
+                    .unwrap()
+                    .encrypt_x448(pub_key)
+                    .unwrap()
+                    .export(DataFormat::Base64);
+
+            let response = CommunicationValue::new(CommunicationType::challenge)
+                .with_id(cv.get_id())
                 .add_data(
                     DataTypes::public_key,
                     DataValue::Str(public_key_to_base64(&get_public_key())),
@@ -202,10 +260,18 @@ impl GeneralConnection {
 
         match kind {
             ConnectionKind::Client => {
+                let notify = CommunicationValue::new(CommunicationType::user_connected)
+                    .add_data(DataTypes::user_id, DataValue::Number(id as i64));
+                get_omega_connection().send_message(&notify).await;
+
                 let client = ClientConnection::from_general(self.clone(), id).await;
                 client.start();
             }
             ConnectionKind::Iota => {
+                let notify = CommunicationValue::new(CommunicationType::iota_connected)
+                    .add_data(DataTypes::iota_id, DataValue::Number(id as i64));
+                get_omega_connection().send_message(&notify).await;
+
                 let iota = IotaConnection::from_general(self.clone(), id).await;
 
                 let rho = Arc::new(RhoConnection::new(iota.clone(), Vec::new()).await);

@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
 use epsilon_native::{Receiver, Sender};
 use once_cell::sync::Lazy;
-use std::{collections::HashMap, env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, env, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, RwLock, mpsc, watch},
     task::JoinHandle,
@@ -249,9 +249,6 @@ impl OmegaConnection {
             "QUIC connection established to {}",
             addr_str
         );
-
-        // Reset reconnect delay on successful connection
-        let reconnect_delay = RECONNECT_DELAY;
 
         // Store sender
         let sender_arc = Arc::new(sender);
