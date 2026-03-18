@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     anonymous_clients::anonymous_client_connection::AnonymousClientConnection,
-    get_private_key, get_public_key, log_err, log_in, log_out,
+    get_private_key, get_public_key, log_cv_in, log_cv_out, log_err, log_in, log_out,
     omega::omega_connection::get_omega_connection,
     rho::{
         client_connection::ClientConnection, iota_connection::IotaConnection,
@@ -65,6 +65,8 @@ impl GeneralConnection {
                     break;
                 }
             };
+
+            log_cv_in!(cv);
 
             if !*self.identified.read().await {
                 self.handle_identification(cv).await;
@@ -147,6 +149,7 @@ impl GeneralConnection {
                 )
                 .add_data(DataTypes::challenge, DataValue::Str(encrypted_challenge));
 
+            log_cv_out!(response);
             let _ = self.sender.send(&response).await;
         } else if let DataValue::Number(user_id) = cv.get_data(DataTypes::user_id) {
             *self.id.write().await = *user_id as u64;
@@ -204,6 +207,7 @@ impl GeneralConnection {
                 )
                 .add_data(DataTypes::challenge, DataValue::Str(encrypted_challenge));
 
+            log_cv_out!(response);
             let _ = self.sender.send(&response).await;
         }
     }
@@ -224,6 +228,7 @@ impl GeneralConnection {
                     .with_id(cv.get_id())
                     .add_data(DataTypes::accepted, DataValue::Bool(true));
 
+                log_cv_out!(response);
                 if let Err(_) = self.sender.send(&response).await {
                     return;
                 }
