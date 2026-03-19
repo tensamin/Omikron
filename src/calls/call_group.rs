@@ -1,4 +1,4 @@
-use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 
 use std::{env, sync::Arc, time::Duration};
 use tokio::sync::RwLock;

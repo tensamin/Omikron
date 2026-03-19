@@ -21,12 +21,14 @@ impl Caller {
             timeout: RwLock::new(0),
         }
     }
+    #[allow(dead_code)]
     pub fn set_admin(&mut self, has_admin: bool) {
         self.has_admin = has_admin;
     }
     pub fn has_admin(&self) -> bool {
         self.has_admin
     }
+    #[allow(dead_code)]
     pub async fn is_timeouted(&self) -> bool {
         *self.timeout.read().await
             > SystemTime::now()

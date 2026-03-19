@@ -1,8 +1,8 @@
-use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
-use epsilon_native::{Receiver, Sender};
 use rand::{Rng, distributions::Alphanumeric};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
+use ttp_native::{Receiver, Sender};
 
 use crate::{
     anonymous_clients::anonymous_client_connection::AnonymousClientConnection,
@@ -20,6 +20,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ConnectionKind {
     Client,
     Iota,

@@ -9,8 +9,6 @@ use crate::{
     },
 };
 use dashmap::DashMap;
-use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
-use epsilon_native::{Receiver, Sender};
 use once_cell::sync::Lazy;
 use std::{collections::HashMap, env, sync::Arc, time::Duration};
 use tokio::{
@@ -18,6 +16,8 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, sleep},
 };
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
+use ttp_native::{Receiver, Sender};
 use uuid::Uuid;
 
 // ============================================================================
@@ -64,6 +64,7 @@ pub enum ConnectionState {
     Connected { identified: bool },
 }
 
+#[allow(unused_variables)]
 impl ConnectionState {
     pub fn is_connected(&self) -> bool {
         match self {
@@ -72,6 +73,7 @@ impl ConnectionState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_identified(&self) -> bool {
         match self {
             ConnectionState::Connected { identified: true } => true,
@@ -83,6 +85,7 @@ impl ConnectionState {
 // ============================================================================
 // Omega Connection (Client-side with auto-reconnect)
 // ============================================================================
+#[allow(dead_code)]
 pub struct OmegaConnection {
     state: Arc<RwLock<ConnectionState>>,
     sender: Arc<RwLock<Option<Arc<Sender>>>>,
@@ -153,6 +156,7 @@ impl OmegaConnection {
         *self.connection_loop_handle.lock().await = Some(handle);
     }
 
+    #[allow(dead_code)]
     pub async fn stop(&self) {
         // Disable reconnection
         *self.reconnect_on_close.write().await = false;
@@ -239,7 +243,7 @@ impl OmegaConnection {
 
         let addr_str = format!("https://{}:{}", self.host, self.port);
 
-        let (sender, mut receiver) = epsilon_native::client::connect(&addr_str, None)
+        let (sender, mut receiver) = ttp_native::client::connect(&addr_str, None)
             .await
             .map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -444,7 +448,7 @@ impl OmegaConnection {
     async fn read_loop(
         self: Arc<Self>,
         receiver: &mut Receiver,
-        sender_handle: Arc<epsilon_native::ConnectionHandle>,
+        sender_handle: Arc<ttp_native::ConnectionHandle>,
     ) {
         // Monitor both receiver and sender handle for close
         let mut close_rx = sender_handle.subscribe_close();
@@ -634,14 +638,16 @@ impl OmegaConnection {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn is_connected(&self) -> bool {
         self.state.read().await.is_connected()
     }
-
+    #[allow(dead_code)]
     pub async fn is_identified(&self) -> bool {
         self.state.read().await.is_identified()
     }
 
+    #[allow(dead_code)]
     pub async fn close_iota(iota_id: i64) {
         let cv = CommunicationValue::new(CommunicationType::iota_disconnected)
             .add_data(DataTypes::iota_id, DataValue::Number(iota_id));

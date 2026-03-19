@@ -37,6 +37,7 @@ pub fn delete_user_directory(user_id: i64) {
     let _ = delete_dir_recursive(&user_dir);
 }
 
+#[allow(dead_code)]
 pub fn load_file_buf(path: &str, name: &str) -> io::Result<BufReader<File>> {
     let dir = Path::new(&get_directory()).join(path);
     let file_path = dir.join(name);
@@ -63,6 +64,7 @@ pub fn load_file_buf(path: &str, name: &str) -> io::Result<BufReader<File>> {
     let file = File::open(&file_path)?;
     Ok(BufReader::new(file))
 }
+#[allow(dead_code)]
 pub fn has_file(path: &str, name: &str) -> bool {
     let dir = Path::new(&get_directory()).join(path);
     let file_path = dir.join(name);
@@ -77,6 +79,7 @@ pub fn has_file(path: &str, name: &str) -> bool {
 
     true
 }
+#[allow(dead_code)]
 pub fn has_dir(path: &str) -> bool {
     let dir = Path::new(&get_directory()).join(path);
 
@@ -87,6 +90,7 @@ pub fn has_dir(path: &str) -> bool {
     true
 }
 
+#[allow(dead_code)]
 pub fn load_file(path: &str, name: &str) -> String {
     let dir = Path::new(&get_directory()).join(path);
     let file_path = dir.join(name);
@@ -130,6 +134,7 @@ pub fn load_file_vec(path: &str, name: &str) -> Result<Vec<u8>, std::io::Error> 
     std::fs::read(file_path)
 }
 
+#[allow(dead_code)]
 pub fn save_file(path: &str, name: &str, value: &str) {
     let dir = Path::new(&get_directory()).join(path);
     let file_path = dir.join(name);
@@ -157,6 +162,7 @@ pub fn save_file(path: &str, name: &str, value: &str) {
     }
 }
 
+#[allow(dead_code)]
 pub fn get_children(path: &str) -> Vec<String> {
     let dir = Path::new(&get_directory()).join(path);
     let mut children = Vec::new();

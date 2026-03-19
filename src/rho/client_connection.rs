@@ -6,12 +6,12 @@ use crate::rho::{rho_connection::RhoConnection, rho_manager};
 use crate::util::logger::PrintType;
 use crate::{data::user::UserStatus, omega::omega_connection::OmegaConnection};
 use crate::{log_cv_in, log_cv_out, log_out};
-use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
-use epsilon_native::{Receiver, Sender};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
+use ttp_native::{Receiver, Sender};
 use uuid::Uuid;
 
 pub struct ClientConnection {
@@ -455,6 +455,7 @@ impl ClientConnection {
     }
 
     /// Close the connection
+    #[allow(dead_code)]
     pub async fn close(&self) {
         let mut is_open_guard = self.is_open.write().await;
         if *is_open_guard {
@@ -470,12 +471,14 @@ impl ClientConnection {
         let mut interested_guard = self.interested_users.write().await;
         *interested_guard = interested_ids;
     }
+    #[allow(dead_code)]
     pub async fn get_interested_users(self: Arc<Self>) -> Vec<i64> {
         let interested_guard = self.interested_users.read().await;
         interested_guard.clone()
     }
 
     /// Check if interested in a user and send notification
+    #[allow(dead_code)]
     pub async fn are_you_interested(self: Arc<Self>, user_id: i64) {
         let interested_guard = self.clone().get_interested_users().await;
         if interested_guard.contains(&user_id) {
@@ -488,6 +491,7 @@ impl ClientConnection {
     }
 
     /// Handle connection close
+    #[allow(dead_code)]
     pub async fn handle_close(&self) {
         let user_id = self.get_user_id().await;
         if let Some(rho_conn) = rho_manager::get_rho_con_for_user(user_id as i64).await {

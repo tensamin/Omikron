@@ -54,6 +54,7 @@ pub fn create_token(user_id: u64, call_id: Uuid, has_admin: bool) -> Result<Stri
         Err(())
     }
 }
+#[allow(dead_code)]
 pub async fn get_room(call_id: Uuid) -> Result<(RoomClient, Room), ()> {
     if let Ok((hostname, api_key, api_secret)) = get_livekit() {
         let room_service = RoomClient::with_api_key(&hostname, &api_key, &api_secret);
@@ -82,6 +83,7 @@ pub async fn remove_participant(call_id: Uuid, user_id: u64) -> Result<(), ()> {
     return Err(());
 }
 
+#[allow(dead_code)]
 pub async fn get_room_metadata(call_id: Uuid) -> Result<String, ()> {
     if let Ok((_, room)) = get_room(call_id).await {
         Ok(room.metadata)

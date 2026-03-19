@@ -9,10 +9,12 @@ use crate::anonymous_clients::anonymous_client_connection::AnonymousClientConnec
 static ANONYMOUS_USERS: Lazy<DashMap<u64, Arc<AnonymousClientConnection>>> =
     Lazy::new(|| DashMap::new());
 
+#[allow(dead_code)]
 pub async fn add_anonymous_user(connection: Arc<AnonymousClientConnection>) {
     ANONYMOUS_USERS.insert(connection.get_user_id(), connection);
 }
 
+#[allow(dead_code)]
 pub async fn remove_anonymous_user(user_id: u64) {
     ANONYMOUS_USERS.remove(&user_id);
 }

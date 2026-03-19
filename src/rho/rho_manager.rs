@@ -26,6 +26,7 @@ pub async fn get_rho_con_for_user(user_id: i64) -> Option<Arc<RhoConnection>> {
     None
 }
 
+#[allow(dead_code)]
 pub async fn contains_iota(iota_id: i64) -> bool {
     let connections = RHO_CONNECTIONS.read().await;
     connections.contains_key(&iota_id)
@@ -45,6 +46,7 @@ pub async fn add_rho(rho_connection: Arc<RhoConnection>) {
 }
 
 /// Get a RhoConnection by Iota ID directly
+#[allow(dead_code)]
 pub async fn get_rho_by_iota(iota_id: i64) -> Option<Arc<RhoConnection>> {
     let connections = RHO_CONNECTIONS.read().await;
     connections.get(&iota_id).map(Arc::clone)

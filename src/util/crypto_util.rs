@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use x448::{PublicKey, Secret};
 
 // --- Custom Errors ---
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum SecurePayloadError {
     InvalidBase64,
@@ -18,6 +19,7 @@ pub enum SecurePayloadError {
 }
 
 // --- Data Format Enum ---
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub enum DataFormat {
     Raw,
@@ -66,6 +68,7 @@ impl SecurePayload {
     }
 
     /// Helper to get the public key associated with this instance's private key.
+    #[allow(dead_code)]
     pub fn get_public_key(&self) -> [u8; 56] {
         *PublicKey::from(&self.private_key).as_bytes()
     }
@@ -80,11 +83,13 @@ impl SecurePayload {
     }
 
     /// Access raw bytes directly
+    #[allow(dead_code)]
     pub fn get_bytes(&self) -> &[u8] {
         &self.inner_data
     }
 
     /// Returns the SHA-256 Hash of the data in the requested format
+    #[allow(dead_code)]
     pub fn get_hash(&self, format: DataFormat) -> String {
         let mut hasher = Sha256::new();
         hasher.update(&self.inner_data);
@@ -134,6 +139,7 @@ impl SecurePayload {
     }
 
     /// Decrypts the held data providing the sender's public key manually.
+    #[allow(dead_code)]
     pub fn decrypt_to_format(
         &self,
         peer_public_key_bytes: &[u8; 56],
