@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ttp-core = { git = "https://github.com/t3kkm0tt/TTP.git", package = "ttp-core" }
-ttp-native = { git = "https://github.com/t3kkm0tt/TTP.git", package = "ttp-native" }
+ttp-core = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-core" }
+ttp-native = { git = "https://github.com/Tensamin/TTP.git", package = "ttp-native" }
 
 ansi_term = "*"
 uuid = { version = "*", features = ["v4"] }
