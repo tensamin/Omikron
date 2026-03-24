@@ -1,6 +1,6 @@
-use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
 use std::time::Duration;
 use tokio::time::Instant;
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
 
 use crate::omega::omega_connection::OmegaConnection;
 

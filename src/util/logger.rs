@@ -9,10 +9,11 @@ use std::{
 };
 
 use ansi_term::Color;
-use epsilon_core::{CommunicationValue, DataTypes, DataValue};
+use ttp_core::{CommunicationValue, DataTypes, DataValue};
 
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum PrintType {
     Call,

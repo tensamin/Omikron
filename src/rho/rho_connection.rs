@@ -2,10 +2,10 @@ use super::{client_connection::ClientConnection, iota_connection::IotaConnection
 
 use crate::data::user::UserStatus;
 use crate::omega::omega_connection::OmegaConnection;
-use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 
 pub struct RhoConnection {
     iota_connection: Arc<IotaConnection>,
@@ -58,6 +58,7 @@ impl RhoConnection {
     }
 
     /// Add a client connection
+    #[allow(dead_code)]
     pub async fn add_client_connection(&self, connection: Arc<ClientConnection>) {
         let notification = CommunicationValue::new(CommunicationType::client_connected).add_data(
             DataTypes::user_id,
@@ -145,6 +146,7 @@ impl RhoConnection {
     }
 
     /// Check if clients are interested in a user
+    #[allow(dead_code)]
     pub async fn are_they_interested(&self, user_id: i64) {
         let connections = self.client_connections.read().await;
         for connection in connections.iter() {
@@ -166,11 +168,13 @@ impl RhoConnection {
     }
 
     /// Check if this RhoConnection contains a specific user ID
+    #[allow(dead_code)]
     pub fn contains_user(&self, user_id: &i64) -> bool {
         self.user_ids.contains(user_id)
     }
 
     /// Get count of active client connections
+    #[allow(dead_code)]
     pub async fn client_count(&self) -> usize {
         let connections = self.client_connections.read().await;
         connections.len()

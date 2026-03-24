@@ -1,9 +1,9 @@
-use epsilon_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
-use epsilon_native::{Receiver, Sender};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
+use ttp_native::{Receiver, Sender};
 use uuid::Uuid;
 
 use crate::anonymous_clients::anonymous_manager::{self, generate_username};
@@ -457,7 +457,7 @@ impl AnonymousClientConnection {
         let error = CommunicationValue::new(error_type).with_id(*message_id);
         self.send_message(&error).await;
     }
-
+    #[allow(dead_code)]
     /// Close the connection
     pub async fn close(&self) {
         let mut is_open_guard = self.is_open.write().await;
@@ -469,16 +469,19 @@ impl AnonymousClientConnection {
         let _ = self.sender.close();
     }
 
+    #[allow(dead_code)]
     /// Set interested users list
     pub async fn set_interested_users(self: Arc<Self>, interested_ids: Vec<i64>) {
         let mut interested_guard = self.interested_users.write().await;
         *interested_guard = interested_ids;
     }
+    #[allow(dead_code)]
     pub async fn get_interested_users(self: Arc<Self>) -> Vec<i64> {
         let interested_guard = self.interested_users.read().await;
         interested_guard.clone()
     }
 
+    #[allow(dead_code)]
     /// Check if interested in a user and send notification
     pub async fn are_you_interested(self: Arc<Self>, user_id: i64) {
         let interested_guard = self.clone().get_interested_users().await;
@@ -491,6 +494,7 @@ impl AnonymousClientConnection {
         }
     }
 
+    #[allow(dead_code)]
     /// Handle connection close
     pub async fn handle_close(&self) {
 

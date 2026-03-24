@@ -7,12 +7,6 @@ use crate::omega::omega_connection::get_omega_connection;
 use crate::rho::connection::GeneralConnection;
 use crate::util::logger::PrintType;
 use dashmap::DashMap;
-use epsilon_core::CommunicationType;
-use epsilon_core::CommunicationValue;
-use epsilon_core::DataTypes;
-use epsilon_core::DataValue;
-use epsilon_native::Receiver;
-use epsilon_native::Sender;
 use std::collections::BTreeMap;
 use std::{
     collections::HashMap,
@@ -21,11 +15,18 @@ use std::{
 };
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
+use ttp_core::CommunicationType;
+use ttp_core::CommunicationValue;
+use ttp_core::DataTypes;
+use ttp_core::DataValue;
+use ttp_native::Receiver;
+use ttp_native::Sender;
 use x448::PublicKey;
 
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::omega::omega_connection::OmegaConnection;
 
+#[allow(dead_code)]
 pub struct IotaConnection {
     pub iota_id: u64,
     pub sender: Arc<Sender>,
@@ -72,6 +73,7 @@ impl IotaConnection {
         self.iota_id
     }
 
+    #[allow(dead_code)]
     pub async fn get_public_key(&self) -> Option<PublicKey> {
         if let Some(public_key) = self.pub_key.read().await.clone() {
             PublicKey::from_bytes(&public_key)
@@ -163,11 +165,13 @@ impl IotaConnection {
         self.forward_to_client(cv).await;
     }
 
+    #[allow(dead_code)]
     async fn send_error_response(&self, message_id: u32, error_type: CommunicationType) {
         let error = CommunicationValue::new(error_type).with_id(message_id);
         self.send_message(&error).await;
     }
 
+    #[allow(dead_code)]
     async fn close(&self) {
         let _ = self.sender.close();
     }
@@ -346,12 +350,14 @@ impl IotaConnection {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn handle_close(&self) {
         if let Some(rho_conn) = self.get_rho_connection().await {
             rho_conn.close_iota_connection().await;
         }
     }
 
+    #[allow(dead_code)]
     pub async fn await_response(
         self: Arc<IotaConnection>,
         cv: &CommunicationValue,

@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::calls::{call_group::CallGroup, caller::Caller};
 
 pub static CALL_GROUPS: Lazy<DashMap<Uuid, Arc<CallGroup>>> = Lazy::new(|| DashMap::new());
-
+#[allow(dead_code)]
 pub async fn get_call_invites(user_id: u64) -> Vec<Arc<Caller>> {
     let mut callers = Vec::new();
     for (_, cg) in CALL_GROUPS.clone().into_iter() {
