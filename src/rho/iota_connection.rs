@@ -94,7 +94,7 @@ impl IotaConnection {
 
         if let Some(rho_conn) = self.get_rho_connection().await {
             let user_ids_i64: Vec<i64> = user_ids.into_iter().map(|u| u as i64).collect();
-            rho_conn.set_user_ids(user_ids_i64);
+            rho_conn.set_user_ids(user_ids_i64).await;
         }
     }
 

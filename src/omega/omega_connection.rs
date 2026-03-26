@@ -469,8 +469,29 @@ impl OmegaConnection {
 
                             let msg_id = cv.get_id();
                             if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
-                                if (task.task)(self.clone(), cv) {
+                                if (task.task)(self.clone(), cv.clone()) {
                                     continue;
+                                }
+                            }
+
+                            if cv.is_type(CommunicationType::iota_user_data) {
+                                if let DataValue::Array(users) = cv.get_data(DataTypes::user_ids) {
+                                    let mut user_ids: Vec<u64> = Vec::new();
+                                    for value in users {
+                                        if let DataValue::Number(user_id) = value {
+                                            user_ids.push(*user_id as u64);
+                                        }
+                                    }
+                                    let connections = crate::rho::rho_manager::RHO_CONNECTIONS.read().await;
+                                    if let Some(iota_id) = cv.get_data(DataTypes::iota_id).as_number() {
+                                        if let Some(rho) = connections.get(&iota_id) {
+                                            rho.get_iota_connection().set_user_ids(user_ids).await;
+                                        }
+                                    } else {
+                                        for rho in connections.values() {
+                                            rho.get_iota_connection().set_user_ids(user_ids.clone()).await;
+                                        }
+                                    }
                                 }
                             }
                         }

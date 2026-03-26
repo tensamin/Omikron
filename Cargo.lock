@@ -438,9 +438,9 @@ dependencies = [
 
 [[package]]
 name = "cmake"
-version = "0.1.57"
+version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75443c44cd6b379beb8c5b45d85d0773baf31cce901fe7bb252f4eff3008ef7d"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
 dependencies = [
  "cc",
 ]
@@ -3131,7 +3131,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "ttp-core"
 version = "0.1.0"
-source = "git+https://github.com/Tensamin/TTP.git#c127d196082401f37b51ca5417b341ecbdb74318"
+source = "git+https://github.com/Tensamin/TTP.git#9c0ed7a5b6c8735e4b674d4503bd7b936ee3656b"
 dependencies = [
  "base64 0.22.1",
  "byteorder",
@@ -3143,7 +3143,7 @@ dependencies = [
 [[package]]
 name = "ttp-native"
 version = "0.1.0"
-source = "git+https://github.com/Tensamin/TTP.git#c127d196082401f37b51ca5417b341ecbdb74318"
+source = "git+https://github.com/Tensamin/TTP.git#9c0ed7a5b6c8735e4b674d4503bd7b936ee3656b"
 dependencies = [
  "quinn",
  "rustls",

@@ -412,7 +412,7 @@ impl ClientConnection {
             && cv
                 .get_data(DataTypes::chat_partner_id)
                 .as_number()
-                .is_some()
+                .is_none()
         {
             let chat_partner_name = cv
                 .get_data(DataTypes::chat_partner_name)
