@@ -5,7 +5,7 @@ use crate::rho::connection::GeneralConnection;
 use crate::rho::{rho_connection::RhoConnection, rho_manager};
 use crate::util::logger::PrintType;
 use crate::{data::user::UserStatus, omega::omega_connection::OmegaConnection};
-use crate::{log_cv_in, log_cv_out, log_out};
+use crate::{log_cv_in, log_cv_out, log_err, log_in, log_out};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,7 +31,7 @@ impl ClientConnection {
         Arc::new(Self {
             ping: Arc::new(RwLock::new(0)),
             pub_key: Arc::new(RwLock::new(None)),
-            rho_connection: Arc::new(RwLock::new(None)),
+            rho_connection: general.rho_connection.clone(),
             interested_users: Arc::new(RwLock::new(Vec::new())),
             is_open: Arc::new(RwLock::new(true)),
             sender: general.sender.clone(),
@@ -45,6 +45,7 @@ impl ClientConnection {
             while let Ok(cv) = self_clone.receiver.receive().await {
                 self_clone.clone().handle_message(cv).await;
             }
+            self_clone.handle_close().await;
         });
     }
 
@@ -393,6 +394,20 @@ impl ClientConnection {
 
     /// Forward message to Iota
     async fn forward_to_iota(self: Arc<Self>, cv: CommunicationValue) {
+        let sender_user_id = self.get_user_id().await;
+        let msg_id = cv.get_id();
+        let msg_type = cv.get_type();
+
+        log_in!(
+            sender_user_id as i64,
+            PrintType::Client,
+            "Forwarding client->iota: sender={} type={:?} id={} receiver={}",
+            sender_user_id,
+            msg_type,
+            msg_id,
+            cv.get_receiver()
+        );
+
         if cv.is_type(CommunicationType::add_conversation)
             && cv
                 .get_data(DataTypes::chat_partner_id)
@@ -434,17 +449,56 @@ impl ClientConnection {
             };
 
             if let Some(rho_conn) = self.get_rho_connection().await {
+                let iota_id = rho_conn.get_iota_id().await;
+                log_in!(
+                    sender_user_id as i64,
+                    PrintType::Client,
+                    "Resolved rho for add_conversation: sender={} -> iota_id={} id={}",
+                    sender_user_id,
+                    iota_id,
+                    msg_id
+                );
+
                 let updated_cv = cv
-                    .with_sender(self.get_user_id().await as u64)
+                    .with_sender(sender_user_id as u64)
                     .add_data(DataTypes::chat_partner_id, chat_partner_id);
                 rho_conn.message_to_iota(updated_cv).await;
+            } else {
+                log_err!(
+                    sender_user_id as i64,
+                    PrintType::Client,
+                    "No rho/iota mapping found for add_conversation sender={} type={:?} id={}",
+                    sender_user_id,
+                    msg_type,
+                    msg_id
+                );
             }
             return;
         }
 
         if let Some(rho_conn) = self.get_rho_connection().await {
-            let updated_cv = cv.with_sender(self.get_user_id().await as u64);
+            let iota_id = rho_conn.get_iota_id().await;
+            log_in!(
+                sender_user_id as i64,
+                PrintType::Client,
+                "Resolved rho for forward: sender={} -> iota_id={} type={:?} id={}",
+                sender_user_id,
+                iota_id,
+                msg_type,
+                msg_id
+            );
+
+            let updated_cv = cv.with_sender(sender_user_id as u64);
             rho_conn.message_to_iota(updated_cv).await;
+        } else {
+            log_err!(
+                sender_user_id as i64,
+                PrintType::Client,
+                "No rho/iota mapping found for sender={} type={:?} id={}",
+                sender_user_id,
+                msg_type,
+                msg_id
+            );
         }
     }
 
@@ -455,10 +509,9 @@ impl ClientConnection {
     }
 
     /// Close the connection
-    #[allow(dead_code)]
     pub async fn close(&self) {
         let mut is_open_guard = self.is_open.write().await;
-        if *is_open_guard {
+        if !*is_open_guard {
             return;
         }
         *is_open_guard = false;
@@ -491,7 +544,6 @@ impl ClientConnection {
     }
 
     /// Handle connection close
-    #[allow(dead_code)]
     pub async fn handle_close(&self) {
         let user_id = self.get_user_id().await;
         if let Some(rho_conn) = rho_manager::get_rho_con_for_user(user_id as i64).await {

@@ -37,6 +37,7 @@ pub struct GeneralConnection {
     challenge: Arc<RwLock<String>>,
 
     connection_kind: Arc<RwLock<Option<ConnectionKind>>>,
+    pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     id: Arc<RwLock<u64>>,
 
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
@@ -50,6 +51,7 @@ impl GeneralConnection {
             challenged: Arc::new(RwLock::new(false)),
             challenge: Arc::new(RwLock::new(String::new())),
             connection_kind: Arc::new(RwLock::new(None)),
+            rho_connection: Arc::new(RwLock::new(None)),
             id: Arc::new(RwLock::new(0)),
             pub_key: Arc::new(RwLock::new(None)),
         })
@@ -76,13 +78,13 @@ impl GeneralConnection {
 
             if !*self.challenged.read().await {
                 self.handle_challenge_response(cv).await;
-                if *self.challenged.read().await {
-                    break;
-                }
-                continue;
             }
 
-            if self.migrate().await {
+            if *self.challenged.read().await {
+                let self_clone = self.clone();
+                tokio::spawn(async move {
+                    self_clone.migrate().await;
+                });
                 break;
             }
         }
@@ -233,10 +235,6 @@ impl GeneralConnection {
                 if let Err(_) = self.sender.send(&response).await {
                     return;
                 }
-
-                if self.migrate().await {
-                    log_out!(id, PrintType::Iota, "Immediate migration");
-                }
             } else {
                 log_err!(
                     id,
@@ -270,7 +268,48 @@ impl GeneralConnection {
                     .add_data(DataTypes::user_id, DataValue::Number(id as i64));
                 get_omega_connection().send_message(&notify).await;
 
+                let user_id = id as i64;
+
+                let mut rho = rho_manager::get_rho_con_for_user(user_id).await;
+
+                if rho.is_none() {
+                    let get_user_msg = CommunicationValue::new(CommunicationType::get_user_data)
+                        .add_data(DataTypes::user_id, DataValue::Number(user_id));
+
+                    if let Ok(user_data_cv) = get_omega_connection()
+                        .await_response(&get_user_msg, Some(Duration::from_secs(20)))
+                        .await
+                    {
+                        if let DataValue::Number(iota_id) =
+                            user_data_cv.get_data(DataTypes::iota_id)
+                        {
+                            if let Some(bound_rho) =
+                                rho_manager::bind_user_to_iota(user_id, *iota_id).await
+                            {
+                                bound_rho.bind_user_id(user_id).await;
+                                rho = Some(bound_rho);
+                            }
+                        }
+                    }
+                }
+
+                *self.rho_connection.write().await = rho.clone();
+
                 let client = ClientConnection::from_general(self.clone(), id).await;
+
+                if let Some(rho_conn) = rho {
+                    // Make sure user is bound before the client starts forwarding
+                    rho_conn.bind_user_id(user_id).await;
+                    rho_conn.add_client_connection(client.clone()).await;
+                } else {
+                    log_err!(
+                        user_id,
+                        PrintType::Client,
+                        "No RhoConnection found for user {}, client not attached to iota",
+                        id
+                    );
+                }
+
                 client.start();
             }
             ConnectionKind::Iota => {
@@ -282,7 +321,25 @@ impl GeneralConnection {
 
                 let rho = Arc::new(RhoConnection::new(iota.clone(), Vec::new()).await);
 
-                iota.set_rho_connection(Arc::downgrade(&rho)).await;
+                iota.set_rho_connection(rho.clone()).await;
+
+                let get_iota_msg = CommunicationValue::new(CommunicationType::get_iota_data)
+                    .add_data(DataTypes::iota_id, DataValue::Number(id as i64));
+
+                if let Ok(iota_data_cv) = get_omega_connection()
+                    .await_response(&get_iota_msg, Some(Duration::from_secs(20)))
+                    .await
+                {
+                    if let DataValue::Array(users) = iota_data_cv.get_data(DataTypes::user_ids) {
+                        let mut user_ids: Vec<u64> = Vec::new();
+                        for value in users {
+                            if let DataValue::Number(user_id) = value {
+                                user_ids.push(*user_id as u64);
+                            }
+                        }
+                        iota.set_user_ids(user_ids).await;
+                    }
+                }
 
                 rho_manager::add_rho(rho).await;
 

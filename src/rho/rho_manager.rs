@@ -13,13 +13,14 @@ pub static RHO_CONNECTIONS: LazyLock<Arc<RwLock<HashMap<i64, Arc<RhoConnection>>
 pub async fn get_rho_con_for_user(user_id: i64) -> Option<Arc<RhoConnection>> {
     let connections = RHO_CONNECTIONS.read().await;
     for rho_connection in connections.values() {
+        let rho_user_ids = rho_connection.get_user_ids().await;
         log_in!(
             user_id,
             PrintType::Client,
             "Comparing user IDs: {:?}",
-            rho_connection.get_user_ids().to_vec()
+            rho_user_ids
         );
-        if rho_connection.get_user_ids().contains(&user_id) {
+        if rho_user_ids.contains(&user_id) {
             return Some(Arc::clone(rho_connection));
         }
     }
@@ -30,6 +31,29 @@ pub async fn get_rho_con_for_user(user_id: i64) -> Option<Arc<RhoConnection>> {
 pub async fn contains_iota(iota_id: i64) -> bool {
     let connections = RHO_CONNECTIONS.read().await;
     connections.contains_key(&iota_id)
+}
+
+/// Bind a user ID to an already tracked iota/rho connection.
+pub async fn bind_user_to_iota(user_id: i64, iota_id: i64) -> Option<Arc<RhoConnection>> {
+    let connections = RHO_CONNECTIONS.read().await;
+    if let Some(rho_connection) = connections.get(&iota_id) {
+        let rho = Arc::clone(rho_connection);
+        drop(connections);
+
+        rho.add_user_id(user_id).await;
+
+        log_in!(
+            user_id,
+            PrintType::Client,
+            "Bound user {} to iota {}",
+            user_id,
+            iota_id
+        );
+
+        Some(rho)
+    } else {
+        None
+    }
 }
 
 /// Remove a RhoConnection by Iota ID

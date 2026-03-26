@@ -3,16 +3,13 @@ use crate::calls::call_manager;
 use crate::log_cv_in;
 use crate::log_cv_out;
 use crate::log_err;
+use crate::log_in;
 use crate::omega::omega_connection::get_omega_connection;
 use crate::rho::connection::GeneralConnection;
 use crate::util::logger::PrintType;
 use dashmap::DashMap;
 use std::collections::BTreeMap;
-use std::{
-    collections::HashMap,
-    sync::{Arc, Weak},
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use ttp_core::CommunicationType;
@@ -36,7 +33,7 @@ pub struct IotaConnection {
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub waiting_tasks:
         DashMap<u32, Box<dyn Fn(Arc<IotaConnection>, CommunicationValue) -> bool + Send + Sync>>,
-    pub rho_connection: Arc<RwLock<Option<Weak<RhoConnection>>>>,
+    pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
 }
 
 impl IotaConnection {
@@ -44,7 +41,7 @@ impl IotaConnection {
         Arc::new(Self {
             ping: Arc::new(RwLock::new(0)),
             pub_key: Arc::new(RwLock::new(None)),
-            rho_connection: Arc::new(RwLock::new(None)),
+            rho_connection: general.rho_connection.clone(),
             user_ids: Arc::new(RwLock::new(Vec::new())),
             sender: general.sender.clone(),
             receiver: general.receiver.clone(),
@@ -65,6 +62,7 @@ impl IotaConnection {
                     }
                 }
             }
+            self_clone.handle_close().await;
         });
     }
 
@@ -87,13 +85,43 @@ impl IotaConnection {
         self.user_ids.read().await.clone()
     }
 
+    /// Replace all users linked to this iota and synchronize the attached rho mapping.
+    pub async fn set_user_ids(&self, user_ids: Vec<u64>) {
+        {
+            let mut guard = self.user_ids.write().await;
+            *guard = user_ids.clone();
+        }
+
+        if let Some(rho_conn) = self.get_rho_connection().await {
+            let user_ids_i64: Vec<i64> = user_ids.into_iter().map(|u| u as i64).collect();
+            rho_conn.set_user_ids(user_ids_i64);
+        }
+    }
+
+    pub async fn add_user_id(&self, user_id: u64) {
+        let mut should_sync = false;
+        {
+            let mut guard = self.user_ids.write().await;
+            if !guard.contains(&user_id) {
+                guard.push(user_id);
+                should_sync = true;
+            }
+        }
+
+        if should_sync {
+            if let Some(rho_conn) = self.get_rho_connection().await {
+                rho_conn.add_user_id(user_id as i64).await;
+            }
+        }
+    }
+
     /// Get current ping
     pub async fn get_ping(&self) -> i64 {
         *self.ping.read().await
     }
 
     /// Set the RhoConnection reference
-    pub async fn set_rho_connection(&self, rho_connection: Weak<RhoConnection>) {
+    pub async fn set_rho_connection(&self, rho_connection: Arc<RhoConnection>) {
         let mut rho_ref = self.rho_connection.write().await;
         *rho_ref = Some(rho_connection);
     }
@@ -102,7 +130,7 @@ impl IotaConnection {
     pub async fn get_rho_connection(&self) -> Option<Arc<RhoConnection>> {
         let rho_ref = self.rho_connection.read().await;
         if let Some(weak_ref) = rho_ref.as_ref() {
-            weak_ref.upgrade()
+            Some(weak_ref.clone())
         } else {
             None
         }
@@ -217,8 +245,20 @@ impl IotaConnection {
     async fn handle_forward_message(&self, cv: CommunicationValue) {
         let receiver_id = cv.get_receiver();
         let sender_id = cv.get_sender();
+        let my_user_ids = self.get_user_ids().await;
 
-        if self.get_user_ids().await.contains(&(sender_id as u64)) {
+        log_in!(
+            self.iota_id as i64,
+            PrintType::Iota,
+            "Authority check: sender_id={} receiver_id={} iota_user_ids={:?} msg_type={:?} msg_id={}",
+            sender_id,
+            receiver_id,
+            my_user_ids,
+            cv.get_type(),
+            cv.get_id()
+        );
+
+        if my_user_ids.contains(&(sender_id as u64)) {
             if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id as i64).await {
                 target_rho.message_to_iota(cv).await;
             } else {
@@ -228,6 +268,14 @@ impl IotaConnection {
                 self.send_message(&error).await;
             }
         } else {
+            log_err!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Rejected client->iota forward: sender_id={} is not authorized for this iota. Known users={:?}",
+                sender_id,
+                my_user_ids
+            );
+
             self.send_message(
                 &CommunicationValue::new(CommunicationType::error_invalid_user_id).add_data(
                     DataTypes::error_type,
@@ -350,7 +398,6 @@ impl IotaConnection {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn handle_close(&self) {
         if let Some(rho_conn) = self.get_rho_connection().await {
             rho_conn.close_iota_connection().await;

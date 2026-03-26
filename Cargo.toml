@@ -23,12 +23,12 @@ rustls = { version = "0.23.37", default-features = false, features = [
     "aws-lc-rs",
     "prefer-post-quantum",
 ] }
-sha2 = "*"
+aes-gcm = "0.10.3"
+sha2 = "0.10.9"
 tokio = { version = "*", features = ["full"] }
 x448 = { version = "*" }
 log = "0.4"
 dotenv = "0.15.0"
-aes-gcm = "0.10.3"
 hkdf = "0.12.4"
 strum = "0.28.0"
 strum_macros = "0.28.0"

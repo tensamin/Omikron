@@ -49,6 +49,7 @@ impl AnonymousClientConnection {
             while let Ok(cv) = self_clone.receiver.receive().await {
                 self_clone.clone().handle_message(cv).await;
             }
+            self_clone.handle_close().await;
         });
     }
 
@@ -457,11 +458,10 @@ impl AnonymousClientConnection {
         let error = CommunicationValue::new(error_type).with_id(*message_id);
         self.send_message(&error).await;
     }
-    #[allow(dead_code)]
     /// Close the connection
     pub async fn close(&self) {
         let mut is_open_guard = self.is_open.write().await;
-        if *is_open_guard {
+        if !*is_open_guard {
             return;
         }
         *is_open_guard = false;
@@ -494,7 +494,6 @@ impl AnonymousClientConnection {
         }
     }
 
-    #[allow(dead_code)]
     /// Handle connection close
     pub async fn handle_close(&self) {
 

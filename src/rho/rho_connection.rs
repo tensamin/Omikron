@@ -9,7 +9,7 @@ use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 
 pub struct RhoConnection {
     iota_connection: Arc<IotaConnection>,
-    user_ids: Vec<i64>,
+    user_ids: Arc<RwLock<Vec<i64>>>,
     client_connections: Arc<RwLock<Vec<Arc<ClientConnection>>>>,
 }
 
@@ -18,7 +18,7 @@ impl RhoConnection {
     pub async fn new(iota_connection: Arc<IotaConnection>, user_ids: Vec<i64>) -> Self {
         let rho_connection = Self {
             iota_connection,
-            user_ids: user_ids.clone(),
+            user_ids: Arc::new(RwLock::new(user_ids.clone())),
             client_connections: Arc::new(RwLock::new(Vec::new())),
         };
 
@@ -29,8 +29,25 @@ impl RhoConnection {
         self.iota_connection.iota_id
     }
 
-    pub fn get_user_ids(&self) -> &Vec<i64> {
-        &self.user_ids
+    pub async fn get_user_ids(&self) -> Vec<i64> {
+        self.user_ids.read().await.clone()
+    }
+
+    pub async fn set_user_ids(&self, user_ids: Vec<i64>) {
+        let mut guard = self.user_ids.write().await;
+        *guard = user_ids;
+    }
+
+    pub async fn add_user_id(&self, user_id: i64) {
+        let mut guard = self.user_ids.write().await;
+        if !guard.contains(&user_id) {
+            guard.push(user_id);
+        }
+    }
+
+    pub async fn bind_user_id(&self, user_id: i64) {
+        self.add_user_id(user_id).await;
+        self.iota_connection.add_user_id(user_id as u64).await;
     }
 
     pub fn get_iota_connection(&self) -> &Arc<IotaConnection> {
@@ -169,8 +186,8 @@ impl RhoConnection {
 
     /// Check if this RhoConnection contains a specific user ID
     #[allow(dead_code)]
-    pub fn contains_user(&self, user_id: &i64) -> bool {
-        self.user_ids.contains(user_id)
+    pub async fn contains_user(&self, user_id: &i64) -> bool {
+        self.user_ids.read().await.contains(user_id)
     }
 
     /// Get count of active client connections
