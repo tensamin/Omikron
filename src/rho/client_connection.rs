@@ -47,6 +47,16 @@ impl ClientConnection {
             }
             self_clone.handle_close().await;
         });
+
+        let self_clone2 = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if self_clone2.get_rho_connection().await.is_none() {
+                self_clone2
+                    .send_error_response(0, CommunicationType::error)
+                    .await;
+            }
+        });
     }
 
     /// Get the user ID
@@ -499,6 +509,8 @@ impl ClientConnection {
                 msg_type,
                 msg_id
             );
+            self.send_error_response(msg_id, CommunicationType::error)
+                .await;
         }
     }
 
