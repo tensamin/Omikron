@@ -153,6 +153,13 @@ impl IotaConnection {
 
     /// Handle incoming message from Iota
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
+        let msg_id = cv.get_id();
+        if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
+            if (task)(self.clone(), cv.clone()) {
+                return;
+            }
+        }
+
         // Handle ping
         if cv.is_type(CommunicationType::ping) || cv.is_type(CommunicationType::pong) {
             self.handle_ping(cv).await;

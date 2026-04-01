@@ -271,7 +271,6 @@ impl GeneralConnection {
                 let user_id = id as i64;
 
                 let client = ClientConnection::from_general(self.clone(), id).await;
-                client.clone().start();
 
                 let mut rho = rho_manager::get_rho_con_for_user(user_id).await;
 
@@ -299,9 +298,8 @@ impl GeneralConnection {
                 *self.rho_connection.write().await = rho.clone();
 
                 if let Some(rho_conn) = rho {
-                    // Make sure user is bound before the client starts forwarding
                     rho_conn.bind_user_id(user_id).await;
-                    rho_conn.add_client_connection(client).await;
+                    rho_conn.add_client_connection(client.clone()).await;
                 } else {
                     log_err!(
                         user_id,
@@ -310,6 +308,8 @@ impl GeneralConnection {
                         id
                     );
                 }
+
+                client.start();
             }
             ConnectionKind::Iota => {
                 let notify = CommunicationValue::new(CommunicationType::iota_connected)
@@ -323,8 +323,6 @@ impl GeneralConnection {
                 iota.set_rho_connection(rho.clone()).await;
 
                 rho_manager::add_rho(rho).await;
-
-                iota.clone().start();
 
                 let get_iota_msg = CommunicationValue::new(CommunicationType::get_iota_data)
                     .add_data(DataTypes::iota_id, DataValue::Number(id as i64));
@@ -343,14 +341,16 @@ impl GeneralConnection {
                         iota.set_user_ids(user_ids).await;
                     }
                 }
+
+                iota.clone().start();
             }
             ConnectionKind::AnonymousClient => {
                 let client = AnonymousClientConnection::from_general(self.clone(), id).await;
                 client.start();
             }
             ConnectionKind::Phi => {
-                let iota = ClientConnection::from_general(self.clone(), id).await;
-                iota.start();
+                let phi = ClientConnection::from_general(self.clone(), id).await;
+                phi.start();
             }
         }
         true
