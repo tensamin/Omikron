@@ -35,6 +35,7 @@ pub struct GeneralConnection {
     identified: Arc<RwLock<bool>>,
     challenged: Arc<RwLock<bool>>,
     challenge: Arc<RwLock<String>>,
+    challenge_cv_id: Arc<RwLock<u32>>,
 
     connection_kind: Arc<RwLock<Option<ConnectionKind>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
@@ -51,6 +52,7 @@ impl GeneralConnection {
             identified: Arc::new(RwLock::new(false)),
             challenged: Arc::new(RwLock::new(false)),
             challenge: Arc::new(RwLock::new(String::new())),
+            challenge_cv_id: Arc::new(RwLock::new(0)),
             connection_kind: Arc::new(RwLock::new(None)),
             rho_connection: Arc::new(RwLock::new(None)),
             id: Arc::new(RwLock::new(0)),
@@ -232,15 +234,7 @@ impl GeneralConnection {
 
             if *response == expected {
                 *self.challenged.write().await = true;
-
-                let response = CommunicationValue::new(CommunicationType::identification_response)
-                    .with_id(cv.get_id())
-                    .add_data(DataTypes::accepted, DataValue::Bool(true));
-
-                log_cv_out!(response);
-                if let Err(_) = self.sender.send(&response).await {
-                    return;
-                }
+                *self.challenge_cv_id.write().await = cv.get_id();
             } else {
                 log_err!(
                     id,
@@ -306,6 +300,27 @@ impl GeneralConnection {
                 if let Some(rho_conn) = rho {
                     rho_conn.bind_user_id(user_id).await;
                     rho_conn.add_client_connection(client.clone()).await;
+
+                    let session_id = *self.session_id.read().await as i64;
+                    let iota_msg = CommunicationValue::new(CommunicationType::client_connected)
+                        .add_data(DataTypes::user_id, DataValue::Number(user_id))
+                        .add_data(DataTypes::session_id, DataValue::Number(session_id));
+
+                    if let Ok(resp) = rho_conn
+                        .get_iota_connection()
+                        .clone()
+                        .await_response(&iota_msg, Some(Duration::from_secs(20)))
+                        .await
+                    {
+                        let mut ident_resp =
+                            CommunicationValue::new(CommunicationType::identification_response)
+                                .with_id(*self.challenge_cv_id.read().await);
+                        for (k, v) in resp.get_data_container() {
+                            ident_resp = ident_resp.add_data(k.clone(), v.clone());
+                        }
+                        log_cv_out!(ident_resp);
+                        let _ = self.sender.send(&ident_resp).await;
+                    }
                 } else {
                     log_err!(
                         user_id,
