@@ -1,7 +1,7 @@
 use rand::{Rng, distributions::Alphanumeric};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, util::rand_u64};
 use ttp_native::{Receiver, Sender};
 
 use crate::{
@@ -39,6 +39,7 @@ pub struct GeneralConnection {
     connection_kind: Arc<RwLock<Option<ConnectionKind>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     id: Arc<RwLock<u64>>,
+    pub session_id: Arc<RwLock<u64>>,
 
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
 }
@@ -53,6 +54,7 @@ impl GeneralConnection {
             connection_kind: Arc::new(RwLock::new(None)),
             rho_connection: Arc::new(RwLock::new(None)),
             id: Arc::new(RwLock::new(0)),
+            session_id: Arc::new(RwLock::new(0)),
             pub_key: Arc::new(RwLock::new(None)),
         })
     }
@@ -156,6 +158,10 @@ impl GeneralConnection {
             let _ = self.sender.send(&response).await;
         } else if let DataValue::Number(user_id) = cv.get_data(DataTypes::user_id) {
             *self.id.write().await = *user_id as u64;
+            *self.session_id.write().await = match cv.get_data(DataTypes::session_id) {
+                DataValue::Number(s) => *s as u64,
+                _ => rand_u64(),
+            };
             *self.connection_kind.write().await = Some(ConnectionKind::Client);
 
             let get_pub_key_msg = CommunicationValue::new(CommunicationType::get_user_data)
