@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 pub struct ClientConnection {
     pub user_id: u64,
+    pub session_id: u64,
 
     pub sender: Arc<Sender>,
     pub receiver: Arc<Receiver>,
@@ -37,6 +38,7 @@ impl ClientConnection {
             sender: general.sender.clone(),
             receiver: general.receiver.clone(),
             user_id: user_id,
+            session_id: general.session_id.read().await.clone(),
         })
     }
     pub fn start(self: Arc<Self>) {
@@ -573,6 +575,7 @@ impl Clone for ClientConnection {
             sender: Arc::clone(&self.sender),
             receiver: Arc::clone(&self.receiver),
             user_id: self.user_id,
+            session_id: self.session_id,
             ping: Arc::clone(&self.ping),
             pub_key: Arc::clone(&self.pub_key),
             rho_connection: Arc::clone(&self.rho_connection),

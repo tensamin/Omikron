@@ -26,10 +26,12 @@ pub async fn get_anonymous_user(user_id: u64) -> Option<Arc<AnonymousClientConne
 pub async fn get_anonymous_user_by_name(
     username: String,
 ) -> Option<Arc<AnonymousClientConnection>> {
-    for user_conn in ANONYMOUS_USERS
+    let users: Vec<_> = ANONYMOUS_USERS
         .iter()
         .map(|ref_multi| ref_multi.value().clone())
-    {
+        .collect();
+
+    for user_conn in users {
         if user_conn.get_user_name().await == username {
             return Some(user_conn);
         }

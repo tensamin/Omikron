@@ -1,7 +1,7 @@
 use rand::{Rng, distributions::Alphanumeric};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, util::rand_u64};
 use ttp_native::{Receiver, Sender};
 
 use crate::{
@@ -35,10 +35,12 @@ pub struct GeneralConnection {
     identified: Arc<RwLock<bool>>,
     challenged: Arc<RwLock<bool>>,
     challenge: Arc<RwLock<String>>,
+    challenge_cv_id: Arc<RwLock<u32>>,
 
     connection_kind: Arc<RwLock<Option<ConnectionKind>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     id: Arc<RwLock<u64>>,
+    pub session_id: Arc<RwLock<u64>>,
 
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
 }
@@ -50,9 +52,11 @@ impl GeneralConnection {
             identified: Arc::new(RwLock::new(false)),
             challenged: Arc::new(RwLock::new(false)),
             challenge: Arc::new(RwLock::new(String::new())),
+            challenge_cv_id: Arc::new(RwLock::new(0)),
             connection_kind: Arc::new(RwLock::new(None)),
             rho_connection: Arc::new(RwLock::new(None)),
             id: Arc::new(RwLock::new(0)),
+            session_id: Arc::new(RwLock::new(0)),
             pub_key: Arc::new(RwLock::new(None)),
         })
     }
@@ -183,6 +187,10 @@ impl GeneralConnection {
             let _ = self.sender.send(&response).await;
         } else if let DataValue::Number(user_id) = cv.get_data(DataTypes::user_id) {
             *self.id.write().await = *user_id as u64;
+            *self.session_id.write().await = match cv.get_data(DataTypes::session_id) {
+                DataValue::Number(s) => *s as u64,
+                _ => rand_u64(),
+            };
             *self.connection_kind.write().await = Some(ConnectionKind::Client);
 
             let get_pub_key_msg = CommunicationValue::new(CommunicationType::get_user_data)
@@ -253,15 +261,7 @@ impl GeneralConnection {
 
             if *response == expected {
                 *self.challenged.write().await = true;
-
-                let response = CommunicationValue::new(CommunicationType::identification_response)
-                    .with_id(cv.get_id())
-                    .add_data(DataTypes::accepted, DataValue::Bool(true));
-
-                log_cv_out!(response);
-                if let Err(_) = self.sender.send(&response).await {
-                    return;
-                }
+                *self.challenge_cv_id.write().await = cv.get_id();
             } else {
                 log_err!(
                     id,
@@ -327,6 +327,27 @@ impl GeneralConnection {
                 if let Some(rho_conn) = rho {
                     rho_conn.bind_user_id(user_id).await;
                     rho_conn.add_client_connection(client.clone()).await;
+
+                    let session_id = *self.session_id.read().await as i64;
+                    let iota_msg = CommunicationValue::new(CommunicationType::client_connected)
+                        .add_data(DataTypes::user_id, DataValue::Number(user_id))
+                        .add_data(DataTypes::session_id, DataValue::Number(session_id));
+
+                    if let Ok(resp) = rho_conn
+                        .get_iota_connection()
+                        .clone()
+                        .await_response(&iota_msg, Some(Duration::from_secs(20)))
+                        .await
+                    {
+                        let mut ident_resp =
+                            CommunicationValue::new(CommunicationType::identification_response)
+                                .with_id(*self.challenge_cv_id.read().await);
+                        for (k, v) in resp.get_data_container() {
+                            ident_resp = ident_resp.add_data(k.clone(), v.clone());
+                        }
+                        log_cv_out!(ident_resp);
+                        let _ = self.sender.send(&ident_resp).await;
+                    }
                 } else {
                     log_err!(
                         user_id,
