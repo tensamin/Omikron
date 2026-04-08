@@ -92,6 +92,33 @@ impl GeneralConnection {
         log_out!(0, PrintType::General, "General connection handler stopped");
     }
     async fn handle_identification(self: &Arc<Self>, cv: CommunicationValue) {
+        if cv.is_type(CommunicationType::register_iota) {
+            if let DataValue::Str(pub_key) = cv.get_data(DataTypes::public_key) {
+                let msg = CommunicationValue::new(CommunicationType::complete_register_iota)
+                    .add_data(DataTypes::public_key, DataValue::Str(pub_key.clone()));
+
+                let response = get_omega_connection()
+                    .await_response(&msg, Some(Duration::from_secs(20)))
+                    .await;
+
+                if let Ok(response_cv) = response {
+                    if let DataValue::Number(iota_id) = response_cv.get_data(DataTypes::iota_id) {
+                        let success_msg = CommunicationValue::new(CommunicationType::success)
+                            .with_id(cv.get_id())
+                            .add_data(DataTypes::iota_id, DataValue::Number(*iota_id));
+
+                        log_cv_out!(success_msg);
+                        let _ = self.sender.send(&success_msg).await;
+                    } else {
+                        let err_msg =
+                            CommunicationValue::new(CommunicationType::error).with_id(cv.get_id());
+                        let _ = self.sender.send(&err_msg).await;
+                    }
+                }
+            }
+            return;
+        }
+
         if !cv.is_type(CommunicationType::identification) {
             return;
         }
