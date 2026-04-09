@@ -102,9 +102,13 @@ impl RhoConnection {
         let target_user_id = connection.get_user_id().await;
         {
             let mut connections = self.client_connections.write().await;
-            connections.retain(|con| {
-                futures::executor::block_on(async { con.get_user_id().await != target_user_id })
-            });
+            let mut keep = Vec::new();
+            for con in connections.drain(..) {
+                if con.get_user_id().await != target_user_id {
+                    keep.push(con);
+                }
+            }
+            *connections = keep;
         }
 
         // Notify OmegaConnection
