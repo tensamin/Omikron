@@ -1,16 +1,18 @@
 use super::{client_connection::ClientConnection, iota_connection::IotaConnection, rho_manager};
 
-use crate::data::user::UserStatus;
 use crate::omega::omega_connection::OmegaConnection;
+use crate::{data::user::UserStatus, rho::app_connection::AppConnection};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
+use uuid::Uuid;
 
 pub struct RhoConnection {
     iota_connection: Arc<IotaConnection>,
     user_ids: Arc<RwLock<Vec<i64>>>,
     client_connections: Arc<RwLock<Vec<Arc<ClientConnection>>>>,
+    app_connections: Arc<RwLock<Vec<Arc<AppConnection>>>>,
 }
 
 impl RhoConnection {
@@ -20,6 +22,7 @@ impl RhoConnection {
             iota_connection,
             user_ids: Arc::new(RwLock::new(user_ids.clone())),
             client_connections: Arc::new(RwLock::new(Vec::new())),
+            app_connections: Arc::new(RwLock::new(Vec::new())),
         };
 
         rho_connection
@@ -72,6 +75,47 @@ impl RhoConnection {
             }
         }
         collections
+    }
+
+    pub async fn get_app_connections(
+        &self,
+        userid: Option<i64>,
+        app_identifier: Option<String>,
+        app_session: Option<Uuid>,
+    ) -> Vec<Arc<AppConnection>> {
+        let connections = self.app_connections.read().await;
+        connections
+            .iter()
+            .filter(|conn| {
+                if let Some(uid) = userid {
+                    if conn.user_id != uid as u64 {
+                        return false;
+                    }
+                }
+                if let Some(ref identifier) = app_identifier {
+                    if conn.app_identifier != *identifier {
+                        return false;
+                    }
+                }
+                if let Some(ref session) = app_session {
+                    if conn.app_session != *session {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub async fn add_app_connection(&self, connection: Arc<AppConnection>) {
+        let mut connections = self.app_connections.write().await;
+        connections.push(connection);
+    }
+
+    pub async fn close_app_connection(&self, connection: Arc<AppConnection>) {
+        let mut connections = self.app_connections.write().await;
+        connections.retain(|c| c.app_session != connection.app_session);
     }
 
     /// Add a client connection

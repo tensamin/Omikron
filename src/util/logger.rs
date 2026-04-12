@@ -18,6 +18,7 @@ static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 pub enum PrintType {
     Call,
     Client,
+    App,
     Iota,
     Omikron,
     Omega,
@@ -77,6 +78,7 @@ fn colorize(kind: PrintType, is_error: bool) -> Color {
     match kind {
         PrintType::Call => Color::Purple,
         PrintType::Client => Color::Green,
+        PrintType::App => Color::Green,
         PrintType::Iota => Color::Yellow,
         PrintType::Omikron => Color::Blue,
         PrintType::Omega => Color::Cyan,

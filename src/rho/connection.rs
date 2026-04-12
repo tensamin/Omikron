@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, util::rand_u64};
 use ttp_native::{Receiver, Sender};
+use uuid::Uuid;
 
 use crate::{
     anonymous_clients::anonymous_client_connection::AnonymousClientConnection,
@@ -41,6 +42,8 @@ pub struct GeneralConnection {
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     id: Arc<RwLock<u64>>,
     pub session_id: Arc<RwLock<u64>>,
+    pub app_identifier: Arc<RwLock<Option<String>>>,
+    pub app_session: Arc<RwLock<Option<Uuid>>>,
 
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
 }
@@ -57,6 +60,8 @@ impl GeneralConnection {
             rho_connection: Arc::new(RwLock::new(None)),
             id: Arc::new(RwLock::new(0)),
             session_id: Arc::new(RwLock::new(0)),
+            app_identifier: Arc::new(RwLock::new(None)),
+            app_session: Arc::new(RwLock::new(None)),
             pub_key: Arc::new(RwLock::new(None)),
         })
     }
