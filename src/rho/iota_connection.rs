@@ -55,7 +55,10 @@ impl IotaConnection {
             loop {
                 match self_clone.receiver.receive().await {
                     Ok(cv) => {
-                        self_clone.clone().handle_message(cv).await;
+                        let iota_for_closure = self_clone.clone();
+                        tokio::spawn(async move {
+                            iota_for_closure.handle_message(cv).await;
+                        });
                     }
                     Err(_) => {
                         break;
@@ -184,15 +187,33 @@ impl IotaConnection {
             return;
         }
 
+        if cv.is_type(CommunicationType::complete_register_user) {
+            let response_cv = get_omega_connection()
+                .await_response(
+                    &cv.clone().with_sender(self.iota_id),
+                    Some(Duration::from_secs(20)),
+                )
+                .await;
+            if let Ok(response_cv) = response_cv {
+                if response_cv.is_type(CommunicationType::success) {
+                    if let Some(user_id) = cv.get_data(DataTypes::user_id).as_number() {
+                        self.add_user_id(user_id as u64);
+                    }
+                }
+                self.send_message(&response_cv).await;
+            }
+            return;
+        }
+
         if cv.is_type(CommunicationType::change_iota_data)
             || cv.is_type(CommunicationType::push_notification)
             || cv.is_type(CommunicationType::get_user_data)
             || cv.is_type(CommunicationType::get_iota_data)
             || cv.is_type(CommunicationType::get_register)
-            || cv.is_type(CommunicationType::complete_register_user)
             || cv.is_type(CommunicationType::delete_iota)
         {
             let sender = self.get_iota_id().await;
+
             self.handle_omega_forward(cv.with_sender(sender as u64))
                 .await;
             return;
@@ -213,14 +234,12 @@ impl IotaConnection {
 
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
         let iota_for_closure = self.clone();
-        tokio::spawn(async move {
-            let response_cv = get_omega_connection()
-                .await_response(&cv.with_sender(self.iota_id), Some(Duration::from_secs(20)))
-                .await;
-            if let Ok(response_cv) = response_cv {
-                iota_for_closure.send_message(&response_cv).await;
-            }
-        });
+        let response_cv = get_omega_connection()
+            .await_response(&cv.with_sender(self.iota_id), Some(Duration::from_secs(20)))
+            .await;
+        if let Ok(response_cv) = response_cv {
+            iota_for_closure.send_message(&response_cv).await;
+        }
     }
     /// Handle ping message
     async fn handle_ping(&self, cv: CommunicationValue) {
