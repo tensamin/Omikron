@@ -1,7 +1,7 @@
 use rand::{Rng, distributions::Alphanumeric};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, util::rand_u64};
+use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 use ttp_native::{Receiver, Sender};
 use uuid::Uuid;
 
@@ -10,8 +10,8 @@ use crate::{
     get_private_key, get_public_key, log_cv_in, log_cv_out, log_err, log_in, log_out,
     omega::omega_connection::get_omega_connection,
     rho::{
-        client_connection::ClientConnection, iota_connection::IotaConnection,
-        rho_connection::RhoConnection, rho_manager,
+        app_connection::AppConnection, client_connection::ClientConnection,
+        iota_connection::IotaConnection, rho_connection::RhoConnection, rho_manager,
     },
     util::{
         crypto_helper::{load_public_key, public_key_to_base64},
@@ -70,14 +70,7 @@ impl GeneralConnection {
     pub async fn handle(self: Arc<Self>) {
         log_in!(0, PrintType::General, "General connection handler started");
 
-        loop {
-            let cv = match self.receiver.receive().await {
-                Ok(v) => v,
-                Err(_) => {
-                    break;
-                }
-            };
-
+        while let Ok(cv) = self.receiver.receive().await {
             log_cv_in!(cv);
 
             if !*self.identified.read().await {
@@ -125,6 +118,60 @@ impl GeneralConnection {
                     }
                 }
             }
+            return;
+        }
+
+        if cv.is_type(CommunicationType::app_identification) {
+            let app_identifier = cv
+                .get_data(DataTypes::app_identifier)
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let app_session_id_str = cv.get_data(DataTypes::app_session).as_str().unwrap_or("");
+            let app_session_id = Uuid::parse_str(app_session_id_str).unwrap_or(Uuid::new_v4());
+            let pub_key_str = cv
+                .get_data(DataTypes::app_public_key)
+                .as_str()
+                .unwrap_or("");
+            let user_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0);
+
+            *self.id.write().await = user_id as u64;
+            *self.app_identifier.write().await = Some(app_identifier);
+            *self.app_session.write().await = Some(app_session_id);
+            *self.connection_kind.write().await = Some(ConnectionKind::Phi);
+
+            let pub_key = match load_public_key(pub_key_str) {
+                Some(pk) => pk,
+                None => return,
+            };
+            *self.pub_key.write().await = Some(pub_key.as_bytes().to_vec());
+
+            let challenge: String = rand::thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
+
+            *self.challenge.write().await = challenge.clone();
+            *self.identified.write().await = true;
+
+            let encrypted_challenge =
+                SecurePayload::new(challenge.as_bytes(), DataFormat::Raw, get_private_key())
+                    .unwrap()
+                    .encrypt_x448(pub_key)
+                    .unwrap()
+                    .export(DataFormat::Base64);
+
+            let response = CommunicationValue::new(CommunicationType::app_challange)
+                .with_id(cv.get_id())
+                .add_data(
+                    DataTypes::public_key,
+                    DataValue::Str(public_key_to_base64(&get_public_key())),
+                )
+                .add_data(DataTypes::challenge, DataValue::Str(encrypted_challenge));
+
+            log_cv_out!(response);
+            let _ = self.sender.send(&response).await;
             return;
         }
 
@@ -194,30 +241,53 @@ impl GeneralConnection {
             *self.id.write().await = *user_id as u64;
             *self.session_id.write().await = match cv.get_data(DataTypes::session_id) {
                 DataValue::Number(s) => *s as u64,
-                _ => rand_u64(),
+                _ => cv.get_sender(),
             };
-            *self.connection_kind.write().await = Some(ConnectionKind::Client);
 
-            let get_pub_key_msg = CommunicationValue::new(CommunicationType::get_user_data)
-                .add_data(DataTypes::user_id, DataValue::Number(*user_id));
+            let mut base64_pub = String::new();
 
-            let response_cv = get_omega_connection()
-                .await_response(&get_pub_key_msg, Some(Duration::from_secs(20)))
-                .await;
+            if cv.is_type(CommunicationType::app_identification) {
+                *self.connection_kind.write().await = Some(ConnectionKind::Phi);
 
-            let response_cv = match response_cv {
-                Ok(r) => r,
-                Err(_) => {
-                    return;
+                if let DataValue::Str(app_id) = cv.get_data(DataTypes::app_identifier) {
+                    *self.app_identifier.write().await = Some(app_id.clone());
                 }
-            };
+                if let DataValue::Str(app_sess) = cv.get_data(DataTypes::app_session) {
+                    if let Ok(uuid) = uuid::Uuid::parse_str(&app_sess) {
+                        *self.app_session.write().await = Some(uuid);
+                    }
+                }
 
-            let base64_pub = response_cv
-                .get_data(DataTypes::public_key)
-                .as_str()
-                .unwrap_or("");
+                base64_pub = cv
+                    .get_data(DataTypes::app_public_key)
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+            } else {
+                *self.connection_kind.write().await = Some(ConnectionKind::Client);
 
-            let pub_key = match load_public_key(base64_pub) {
+                let get_pub_key_msg = CommunicationValue::new(CommunicationType::get_user_data)
+                    .add_data(DataTypes::user_id, DataValue::Number(*user_id));
+
+                let response_cv = get_omega_connection()
+                    .await_response(&get_pub_key_msg, Some(Duration::from_secs(20)))
+                    .await;
+
+                let response_cv = match response_cv {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return;
+                    }
+                };
+
+                base64_pub = response_cv
+                    .get_data(DataTypes::public_key)
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+            }
+
+            let pub_key = match load_public_key(&base64_pub) {
                 Some(pk) => pk,
                 None => {
                     return;
@@ -242,8 +312,15 @@ impl GeneralConnection {
                     .unwrap()
                     .export(DataFormat::Base64);
 
-            let response = CommunicationValue::new(CommunicationType::challenge)
+            let challenge_type = if cv.is_type(CommunicationType::app_identification) {
+                CommunicationType::app_challange
+            } else {
+                CommunicationType::challenge
+            };
+
+            let response = CommunicationValue::new(challenge_type)
                 .with_id(cv.get_id())
+                .with_receiver(*self.session_id.read().await)
                 .add_data(
                     DataTypes::public_key,
                     DataValue::Str(public_key_to_base64(&get_public_key())),
@@ -257,7 +334,9 @@ impl GeneralConnection {
     async fn handle_challenge_response(self: &Arc<Self>, cv: CommunicationValue) {
         let id = *self.id.read().await as i64;
 
-        if !cv.is_type(CommunicationType::challenge_response) {
+        if !cv.is_type(CommunicationType::challenge_response)
+            && !cv.is_type(CommunicationType::app_challange_response)
+        {
             return;
         }
 
@@ -402,8 +481,47 @@ impl GeneralConnection {
                 client.start();
             }
             ConnectionKind::Phi => {
-                let phi = ClientConnection::from_general(self.clone(), id).await;
-                phi.start();
+                let user_id = id as i64;
+                let mut rho = rho_manager::get_rho_con_for_user(user_id).await;
+
+                if rho.is_none() {
+                    let get_user_msg = CommunicationValue::new(CommunicationType::get_user_data)
+                        .add_data(DataTypes::user_id, DataValue::Number(user_id));
+
+                    if let Ok(user_data_cv) = get_omega_connection()
+                        .await_response(&get_user_msg, Some(Duration::from_secs(20)))
+                        .await
+                    {
+                        if let DataValue::Number(iota_id) =
+                            user_data_cv.get_data(DataTypes::iota_id)
+                        {
+                            if let Some(bound_rho) =
+                                rho_manager::bind_user_to_iota(user_id, *iota_id).await
+                            {
+                                bound_rho.bind_user_id(user_id).await;
+                                rho = Some(bound_rho);
+                            }
+                        }
+                    }
+                }
+
+                *self.rho_connection.write().await = rho.clone();
+
+                let app_conn = AppConnection::from_general(self.clone(), id).await;
+
+                if let Some(rho_conn) = rho {
+                    rho_conn.bind_user_id(user_id).await;
+                    rho_conn.add_app_connection(app_conn.clone()).await;
+                }
+
+                let response =
+                    CommunicationValue::new(CommunicationType::app_identification_response)
+                        .with_id(*self.challenge_cv_id.read().await)
+                        .with_receiver(*self.session_id.read().await);
+
+                let _ = self.sender.send(&response).await;
+
+                app_conn.start();
             }
         }
         true

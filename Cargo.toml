@@ -35,3 +35,4 @@ strum_macros = "0.28.0"
 livekit-api = { version = "0.4.14", features = ["native-tls"] }
 livekit-protocol = "0.7.1"
 thiserror = "2.0.18"
+hickory-resolver = "0.25.2"

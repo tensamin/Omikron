@@ -133,6 +133,10 @@ impl ClientConnection {
                 self.handle_call_set_anonymous_joining(cv).await;
                 return;
             }
+            if cv.is_type(CommunicationType::load_txt_record) {
+                self.handle_load_txt_record(cv).await;
+                return;
+            }
             if cv.is_type(CommunicationType::get_user_data) {
                 if let Some(anonymous) = {
                     if let Some(user_id) = cv.get_data(DataTypes::user_id).as_number() {
@@ -402,6 +406,33 @@ impl ClientConnection {
             response_cv = response_cv.add_data(DataTypes::link, DataValue::Str(short_link));
         }
         self.send_message(&response_cv).await;
+    }
+
+    async fn handle_load_txt_record(self: Arc<Self>, cv: CommunicationValue) {
+        if let Some(path) = cv.get_data(DataTypes::path).as_str() {
+            if let Ok(builder) = hickory_resolver::Resolver::builder_tokio() {
+                let resolver = builder.build();
+                if let Ok(lookup) = resolver.txt_lookup(path).await {
+                    for record in lookup.iter() {
+                        for txt_data in record.txt_data() {
+                            if let Ok(s) = std::str::from_utf8(txt_data) {
+                                let response =
+                                    CommunicationValue::new(CommunicationType::load_txt_record)
+                                        .with_id(cv.get_id())
+                                        .add_data(
+                                            DataTypes::content,
+                                            DataValue::Str(s.to_string()),
+                                        );
+                                self.send_message(&response).await;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.send_error_response(cv.get_id(), CommunicationType::error)
+            .await;
     }
 
     /// Forward message to Iota

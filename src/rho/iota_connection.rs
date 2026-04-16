@@ -197,7 +197,7 @@ impl IotaConnection {
             if let Ok(response_cv) = response_cv {
                 if response_cv.is_type(CommunicationType::success) {
                     if let Some(user_id) = cv.get_data(DataTypes::user_id).as_number() {
-                        self.add_user_id(user_id as u64);
+                        self.add_user_id(user_id as u64).await;
                     }
                 }
                 self.send_message(&response_cv).await;
