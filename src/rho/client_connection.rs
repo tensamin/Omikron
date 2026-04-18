@@ -119,6 +119,11 @@ impl ClientConnection {
                 return;
             }
 
+            if cv.is_type(CommunicationType::call_data) {
+                self.handle_get_call_data(cv).await;
+                return;
+            }
+
             if cv.is_type(CommunicationType::call_disconnect_user) {
                 self.handle_call_disconnect_user(cv).await;
                 return;
@@ -342,6 +347,52 @@ impl ClientConnection {
             return;
         }
     }
+    async fn handle_get_call_data(self: Arc<Self>, cv: CommunicationValue) {
+        let user_id = self.get_user_id().await;
+
+        let call_id = match cv.get_data(DataTypes::call_id) {
+            DataValue::Str(id_str) => match Uuid::parse_str(id_str.as_str()) {
+                Ok(id) => id,
+                Err(_) => {
+                    self.send_error_response(cv.get_id(), CommunicationType::error)
+                        .await;
+                    return;
+                }
+            },
+            _ => {
+                self.send_error_response(cv.get_id(), CommunicationType::error)
+                    .await;
+                return;
+            }
+        };
+
+        if let Some(call) = call_manager::get_call(call_id).await {
+            if let Some(_) = call.get_caller(user_id).await {
+                let mut user_ids: Vec<DataValue> = Vec::new();
+                let members = call.members.read().await.clone();
+                for member in members {
+                    if member.user_id == user_id {
+                        user_ids.push(DataValue::Number(member.user_id as i64));
+                    }
+                }
+
+                let response = CommunicationValue::new(CommunicationType::call_data)
+                    .with_id(cv.get_id())
+                    .with_receiver(user_id as u64)
+                    .add_data(DataTypes::user_ids, DataValue::Array(user_ids));
+                self.send_message(&response).await;
+            } else {
+                self.send_error_response(cv.get_id(), CommunicationType::error)
+                    .await;
+                return;
+            }
+        } else {
+            self.send_error_response(cv.get_id(), CommunicationType::error)
+                .await;
+            return;
+        }
+    }
+
     async fn handle_call_timeout_user(self: Arc<Self>, cv: CommunicationValue) {
         let call_id =
             Uuid::from_str(cv.get_data(DataTypes::call_id).as_str().unwrap_or("")).unwrap();

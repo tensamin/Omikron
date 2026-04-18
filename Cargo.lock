@@ -3279,7 +3279,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "ttp-core"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Tensamin/TTP.git#d8d82e108ae4e25ad34947e03e917528407e43f3"
+source = "git+https://git.methanium.net/Tensamin/TTP.git#01cefdf60d77b39565d662f5b585058a2b62decf"
 dependencies = [
  "base64 0.22.1",
  "byteorder",
@@ -3292,7 +3292,7 @@ dependencies = [
 [[package]]
 name = "ttp-native"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Tensamin/TTP.git#d8d82e108ae4e25ad34947e03e917528407e43f3"
+source = "git+https://git.methanium.net/Tensamin/TTP.git#01cefdf60d77b39565d662f5b585058a2b62decf"
 dependencies = [
  "quinn",
  "rustls",
