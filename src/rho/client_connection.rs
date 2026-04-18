@@ -293,6 +293,10 @@ impl ClientConnection {
         let forward = CommunicationValue::new(CommunicationType::call_invite)
             .with_receiver(receiver_id as u64)
             .with_sender(sender_id as u64)
+            .add_data(
+                DataTypes::call_secret,
+                cv.get_data(DataTypes::call_secret).clone(),
+            )
             .add_data(DataTypes::call_id, DataValue::Str(call_id.to_string()))
             .add_data(
                 DataTypes::receiver_id,
