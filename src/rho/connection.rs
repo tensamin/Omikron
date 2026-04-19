@@ -452,32 +452,40 @@ impl GeneralConnection {
                                             })
                                             .collect()
                                     };
+                                    if mapped.is_empty() {
+                                        DataValue::Array(contacts)
+                                    } else {
+                                        let mut new_contacts: Vec<DataValue> = Vec::new();
+                                        for contact in contacts {
+                                            if let Some(mut contact_map) = contact.as_map() {
+                                                let filtered_mapped: Vec<(
+                                                    Arc<Caller>,
+                                                    &Arc<CallGroup>,
+                                                )> = mapped
+                                                    .clone()
+                                                    .into_iter()
+                                                    .filter(|(caller, _)| {
+                                                        caller.user_id
+                                                            == contact_map
+                                                                .get(&DataTypes::user_id)
+                                                                .unwrap_or(&DataValue::Null)
+                                                                .as_number()
+                                                                .unwrap_or(0)
+                                                                as u64
+                                                    })
+                                                    .collect();
+                                                if filtered_mapped.is_empty() {
+                                                    new_contacts.push(
+                                                        DataValue::container_from_map(&contact_map),
+                                                    );
+                                                    continue;
+                                                }
 
-                                    let mut new_contacts: Vec<DataValue> = Vec::new();
-                                    for contact in contacts {
-                                        if let Some(mut contact_map) = contact.as_map() {
-                                            let filtered_mapped: Vec<(
-                                                Arc<Caller>,
-                                                &Arc<CallGroup>,
-                                            )> = mapped
-                                                .clone()
-                                                .into_iter()
-                                                .filter(|(caller, _)| {
-                                                    caller.user_id
-                                                        == contact_map
-                                                            .get(&DataTypes::user_id)
-                                                            .unwrap_or(&DataValue::Null)
-                                                            .as_number()
-                                                            .unwrap_or(0)
-                                                            as u64
-                                                })
-                                                .collect();
-
-                                            let mut vec_of_filtered_calls: Vec<DataValue> =
-                                                Vec::new();
-                                            for (caller, call_group) in filtered_mapped {
-                                                vec_of_filtered_calls.push(DataValue::Container(
-                                                    vec![
+                                                let mut vec_of_filtered_calls: Vec<DataValue> =
+                                                    Vec::new();
+                                                for (caller, call_group) in filtered_mapped {
+                                                    vec_of_filtered_calls.push(
+                                                        DataValue::Container(vec![
                                                         (
                                                             DataTypes::call_id,
                                                             DataValue::Str(
@@ -508,22 +516,24 @@ impl GeneralConnection {
                                                                     .clone(),
                                                             ),
                                                         ),
-                                                    ],
+                                                    ]),
+                                                    );
+                                                }
+
+                                                contact_map.insert(
+                                                    DataTypes::calls,
+                                                    DataValue::Array(vec_of_filtered_calls),
+                                                );
+
+                                                new_contacts.push(DataValue::container_from_map(
+                                                    &contact_map,
                                                 ));
+                                            } else {
+                                                new_contacts.push(contact.clone());
                                             }
-
-                                            contact_map.insert(
-                                                DataTypes::calls,
-                                                DataValue::Array(vec_of_filtered_calls),
-                                            );
-
-                                            new_contacts
-                                                .push(DataValue::container_from_map(&contact_map));
-                                        } else {
-                                            new_contacts.push(contact.clone());
                                         }
+                                        DataValue::Array(new_contacts)
                                     }
-                                    DataValue::Array(new_contacts)
                                 } else {
                                     v.clone()
                                 }
