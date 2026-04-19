@@ -519,12 +519,12 @@ impl GeneralConnection {
                                                     ]),
                                                     );
                                                 }
-
-                                                contact_map.insert(
-                                                    DataTypes::calls,
-                                                    DataValue::Array(vec_of_filtered_calls),
-                                                );
-
+                                                if !vec_of_filtered_calls.is_empty() {
+                                                    contact_map.insert(
+                                                        DataTypes::calls,
+                                                        DataValue::Array(vec_of_filtered_calls),
+                                                    );
+                                                }
                                                 new_contacts.push(DataValue::container_from_map(
                                                     &contact_map,
                                                 ));

@@ -380,7 +380,9 @@ impl IotaConnection {
                             interested_ids.push(*user_id);
 
                             // attach calls if exists
-                            if let Some(call_list) = invites.get(user_id) {
+                            if let Some(call_list) = invites.get(user_id)
+                                && !call_list.is_empty()
+                            {
                                 user_map
                                     .insert(DataTypes::calls, DataValue::Array(call_list.clone()));
                             }
