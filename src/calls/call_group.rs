@@ -1,6 +1,6 @@
 use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 
-use std::{env, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -15,6 +15,7 @@ pub struct CallGroup {
     pub show: RwLock<bool>,
     pub anonymous_joining: RwLock<bool>,
     pub short_link: RwLock<Option<String>>,
+    pub secrets: RwLock<BTreeMap<(u64, u64), String>>,
 }
 
 impl CallGroup {
@@ -25,6 +26,7 @@ impl CallGroup {
             show: RwLock::new(true),
             anonymous_joining: RwLock::new(false),
             short_link: RwLock::new(None),
+            secrets: RwLock::new(BTreeMap::new()),
         }
     }
 

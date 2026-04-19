@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     anonymous_clients::anonymous_client_connection::AnonymousClientConnection,
+    calls::{call_group::CallGroup, call_manager, caller::Caller},
     get_private_key, get_public_key, log_cv_in, log_cv_out, log_err, log_in, log_out,
     omega::omega_connection::get_omega_connection,
     rho::{
@@ -244,6 +245,7 @@ impl GeneralConnection {
                 _ => cv.get_sender(),
             };
 
+            #[allow(unused_assignments)]
             let mut base64_pub = String::new();
 
             if cv.is_type(CommunicationType::app_identification) {
@@ -427,7 +429,109 @@ impl GeneralConnection {
                             CommunicationValue::new(CommunicationType::identification_response)
                                 .with_id(*self.challenge_cv_id.read().await);
                         for (k, v) in resp.get_data_container() {
-                            ident_resp = ident_resp.add_data(k.clone(), v.clone());
+                            let value_to_add = if k == &DataTypes::contacts {
+                                if let Some(contacts) = v.as_array() {
+                                    let call_groups =
+                                        call_manager::get_call_groups(user_id as u64).await;
+                                    let callers =
+                                        call_manager::get_call_invites(user_id as u64).await;
+                                    let mapped: Vec<(Arc<Caller>, &Arc<CallGroup>)> = {
+                                        callers
+                                            .iter()
+                                            .map(|caller| {
+                                                (
+                                                    Arc::clone(caller),
+                                                    call_groups.iter().find(|call_group| {
+                                                        call_group.call_id == caller.call_id
+                                                    }),
+                                                )
+                                            })
+                                            .filter(|(_, call_group)| call_group.is_some())
+                                            .map(|(caller, call_group)| {
+                                                (caller, call_group.unwrap())
+                                            })
+                                            .collect()
+                                    };
+
+                                    let mut new_contacts: Vec<DataValue> = Vec::new();
+                                    for contact in contacts {
+                                        if let Some(mut contact_map) = contact.as_map() {
+                                            let filtered_mapped: Vec<(
+                                                Arc<Caller>,
+                                                &Arc<CallGroup>,
+                                            )> = mapped
+                                                .clone()
+                                                .into_iter()
+                                                .filter(|(caller, _)| {
+                                                    caller.user_id
+                                                        == contact_map
+                                                            .get(&DataTypes::user_id)
+                                                            .unwrap_or(&DataValue::Null)
+                                                            .as_number()
+                                                            .unwrap_or(0)
+                                                            as u64
+                                                })
+                                                .collect();
+
+                                            let mut vec_of_filtered_calls: Vec<DataValue> =
+                                                Vec::new();
+                                            for (caller, call_group) in filtered_mapped {
+                                                vec_of_filtered_calls.push(DataValue::Container(
+                                                    vec![
+                                                        (
+                                                            DataTypes::call_id,
+                                                            DataValue::Str(
+                                                                caller.call_id.to_string(),
+                                                            ),
+                                                        ),
+                                                        (
+                                                            DataTypes::call_secret,
+                                                            DataValue::Str(
+                                                                call_group
+                                                                    .secrets
+                                                                    .read()
+                                                                    .await
+                                                                    .get(&(
+                                                                        contact_map
+                                                                            .get(
+                                                                                &DataTypes::user_id,
+                                                                            )
+                                                                            .unwrap_or(
+                                                                                &DataValue::Null,
+                                                                            )
+                                                                            .as_number()
+                                                                            .unwrap_or(0)
+                                                                            as u64,
+                                                                        user_id as u64,
+                                                                    ))
+                                                                    .unwrap_or(&"".to_string())
+                                                                    .clone(),
+                                                            ),
+                                                        ),
+                                                    ],
+                                                ));
+                                            }
+
+                                            contact_map.insert(
+                                                DataTypes::calls,
+                                                DataValue::Array(vec_of_filtered_calls),
+                                            );
+
+                                            new_contacts
+                                                .push(DataValue::container_from_map(&contact_map));
+                                        } else {
+                                            new_contacts.push(contact.clone());
+                                        }
+                                    }
+                                    DataValue::Array(new_contacts)
+                                } else {
+                                    v.clone()
+                                }
+                            } else {
+                                v.clone()
+                            };
+
+                            ident_resp = ident_resp.add_data(k.clone(), value_to_add);
                         }
                         log_cv_out!(ident_resp);
                         let _ = self.sender.send(&ident_resp).await;
