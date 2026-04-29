@@ -292,7 +292,7 @@ impl ClientConnection {
         };
 
         // Get sender user ID
-        let sender_id = self.get_user_id().await;
+        let sender_id = self.get_user_id().await as i64;
 
         // Create and send call distribution message
         let forward = CommunicationValue::new(CommunicationType::call_invite)
@@ -303,11 +303,8 @@ impl ClientConnection {
                 cv.get_data(DataTypes::call_secret).clone(),
             )
             .add_data(DataTypes::call_id, DataValue::Str(call_id.to_string()))
-            .add_data(
-                DataTypes::receiver_id,
-                DataValue::Str(receiver_id.to_string()),
-            )
-            .add_data(DataTypes::sender_id, DataValue::Str(sender_id.to_string()));
+            .add_data(DataTypes::receiver_id, DataValue::Number(receiver_id))
+            .add_data(DataTypes::sender_id, DataValue::Number(sender_id));
 
         target_rho.message_to_client(forward).await;
 
@@ -323,13 +320,13 @@ impl ClientConnection {
             DataValue::Str(id_str) => match Uuid::parse_str(id_str.as_str()) {
                 Ok(id) => id,
                 Err(_) => {
-                    self.send_error_response(cv.get_id(), CommunicationType::error)
+                    self.send_error_response(cv.get_id(), CommunicationType::error_invalid_call_id)
                         .await;
                     return;
                 }
             },
             _ => {
-                self.send_error_response(cv.get_id(), CommunicationType::error)
+                self.send_error_response(cv.get_id(), CommunicationType::error_no_call_id)
                     .await;
                 return;
             }
