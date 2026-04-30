@@ -1,3 +1,4 @@
+use serde_json::Map;
 use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 
 use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
@@ -43,12 +44,59 @@ impl CallGroup {
         *self.anonymous_joining.read().await
     }
 
-    pub async fn set_anonymous_joining(&self, enable: bool) {
-        *self.anonymous_joining.write().await = enable;
+    pub async fn update_admins(&self) {
+        let call_metadata = match call_util::get_room_metadata(self.call_id).await {
+            Ok(metadata) => metadata,
+            Err(_) => "{}".to_string(),
+        };
+        let call_metadata: serde_json::Value = match serde_json::from_str(&call_metadata) {
+            Ok(json) => json,
+            Err(_) => serde_json::Value::Object(Map::new()),
+        };
+        let mut call_metadata = match call_metadata.as_object() {
+            Some(metadata) => metadata.clone(),
+            None => Map::new(),
+        };
+
+        let admin_ids = self
+            .members
+            .read()
+            .await
+            .iter()
+            .filter(|member| member.has_admin)
+            .map(|admin| admin.user_id)
+            .collect::<Vec<_>>();
+
+        call_metadata.insert("admins".to_string(), serde_json::json!(admin_ids));
 
         let _ = call_util::set_room_metadata(
             self.call_id,
-            format!("{{\"anonymous_joining\": \"{}\"}}", enable),
+            serde_json::Value::Object(call_metadata).to_string(),
+        )
+        .await;
+    }
+
+    pub async fn set_anonymous_joining(&self, enable: bool) {
+        *self.anonymous_joining.write().await = enable;
+
+        let call_metadata = match call_util::get_room_metadata(self.call_id).await {
+            Ok(metadata) => metadata,
+            Err(_) => "{}".to_string(),
+        };
+        let call_metadata: serde_json::Value = match serde_json::from_str(&call_metadata) {
+            Ok(json) => json,
+            Err(_) => serde_json::Value::Object(Map::new()),
+        };
+        let mut call_metadata = match call_metadata.as_object() {
+            Some(metadata) => metadata.clone(),
+            None => Map::new(),
+        };
+
+        call_metadata.insert("anonymous_joining".to_string(), serde_json::json!(enable));
+
+        let _ = call_util::set_room_metadata(
+            self.call_id,
+            serde_json::Value::Object(call_metadata).to_string(),
         )
         .await;
 

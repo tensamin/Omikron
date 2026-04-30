@@ -74,6 +74,7 @@ pub async fn get_call_token(user_id: u64, call_id: Uuid) -> Option<String> {
 
     let caller = Arc::new(Caller::new(user_id, call_id, true));
     let call_group = CallGroup::new(call_id, caller.clone());
+    call_group.update_admins().await;
 
     CALL_GROUPS.insert(call_id, Arc::new(call_group));
 

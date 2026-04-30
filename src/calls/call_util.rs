@@ -42,11 +42,11 @@ pub fn create_token(user_id: u64, call_id: Uuid, has_admin: bool) -> Result<Stri
         .with_identity(&user_id.to_string())
         .with_grants(access_token::VideoGrants {
             room_join: true,
+            can_update_own_metadata: true,
             room_admin: has_admin,
             room: call_id.to_string(),
             ..Default::default()
         })
-        .with_metadata(&format!("{{\"isAdmin\":{}}}", has_admin))
         .to_jwt();
     if let Ok(token) = token {
         Ok(token)
