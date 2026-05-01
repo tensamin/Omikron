@@ -93,16 +93,15 @@ pub async fn get_room_metadata(call_id: Uuid) -> Result<String, ()> {
 }
 
 pub async fn set_room_metadata(call_id: Uuid, metadata: String) -> Result<(), ()> {
-    if let Ok((hostname, api_key, api_secret)) = get_livekit() {
-        let room_service = RoomClient::with_api_key(&hostname, &api_key, &api_secret);
-        if let Ok(_) = room_service
-            .update_room_metadata(&call_id.to_string(), &metadata)
-            .await
-        {
-            return Ok(());
-        }
-    }
-    return Err(());
+    let (hostname, api_key, api_secret) = get_livekit()?;
+    let room_service = RoomClient::with_api_key(&hostname, &api_key, &api_secret);
+
+    room_service
+        .update_room_metadata(&call_id.to_string(), &metadata)
+        .await
+        .map_err(|_| ())?;
+
+    Ok(())
 }
 
 pub fn garbage_collect_calls() {
