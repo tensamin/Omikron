@@ -316,44 +316,82 @@ impl IotaConnection {
 
     /// Handle GET_CHATS message
     async fn handle_get_chats(&self, cv: CommunicationValue) {
-        let receiver_id = cv.get_receiver();
+        let user_id = cv.get_sender();
+
+        // Authority check: user must be linked to this Iota
+        if !self.get_user_ids().await.contains(&user_id) {
+            log_err!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Rejected get_chats: sender_id={} is not authorized for this iota.",
+                user_id
+            );
+            return;
+        }
+
         let mut interested_ids: Vec<i64> = Vec::new();
 
         // ============================
         // Load Calls
         // ============================
-        let calls: Vec<Arc<CallGroup>> = call_manager::get_call_groups(receiver_id).await;
+        let calls: Vec<Arc<CallGroup>> = call_manager::get_call_groups(user_id).await;
 
         let mut invites: HashMap<i64, Vec<DataValue>> = HashMap::new();
+        let mut global_calls: Vec<DataValue> = Vec::new();
         let empty = calls.is_empty();
 
         for call in calls {
-            for inviter in call.members.read().await.iter() {
-                let call_self = call.get_caller(receiver_id).await.unwrap();
+            let members = call.members.read().await;
 
-                let inviter_id = inviter.user_id;
+            // Find ourselves in the call to get our specific status
+            let call_self = members.iter().find(|m| m.user_id == user_id).cloned();
+
+            if let Some(call_self) = call_self {
                 let timeout = *call_self.timeout.read().await;
                 let admin = call_self.has_admin();
 
-                // Build call container
-                let mut call_map: BTreeMap<DataTypes, DataValue> = BTreeMap::new();
+                // List of all members in the call
+                let member_ids: Vec<DataValue> = members
+                    .iter()
+                    .map(|m| DataValue::Number(m.user_id as i64))
+                    .collect();
 
-                call_map.insert(DataTypes::call_id, DataValue::Str(call.call_id.to_string()));
+                // Build base call container
+                let mut base_call_map: BTreeMap<DataTypes, DataValue> = BTreeMap::new();
+                base_call_map.insert(DataTypes::call_id, DataValue::Str(call.call_id.to_string()));
+                base_call_map.insert(DataTypes::call_members, DataValue::Array(member_ids));
 
                 if timeout > 0 {
-                    call_map.insert(DataTypes::timeout, DataValue::Number(timeout as i64));
+                    base_call_map.insert(DataTypes::timeout, DataValue::Number(timeout as i64));
                 }
 
                 if admin {
-                    call_map.insert(DataTypes::has_admin, DataValue::Bool(true));
+                    base_call_map.insert(DataTypes::has_admin, DataValue::Bool(true));
                 }
 
-                let call_container = DataValue::container_from_map(&call_map);
+                // Add to global calls (without contact-specific secret)
+                global_calls.push(DataValue::container_from_map(&base_call_map));
 
-                invites
-                    .entry(inviter_id as i64)
-                    .or_insert_with(Vec::new)
-                    .push(call_container);
+                // Attach this call to EVERY member of the call (other than ourselves)
+                for member in members.iter() {
+                    let member_id = member.user_id;
+                    if member_id == user_id {
+                        continue;
+                    }
+
+                    let mut contact_call_map = base_call_map.clone();
+
+                    // Add secret if it exists for this pairing
+                    if let Some(secret) = call.secrets.read().await.get(&(member_id, user_id)) {
+                        contact_call_map
+                            .insert(DataTypes::call_secret, DataValue::Str(secret.clone()));
+                    }
+
+                    invites
+                        .entry(member_id as i64)
+                        .or_insert_with(Vec::new)
+                        .push(DataValue::container_from_map(&contact_call_map));
+                }
             }
         }
 
@@ -374,13 +412,10 @@ impl IotaConnection {
                         let mut user_map: BTreeMap<DataTypes, DataValue> =
                             entries.iter().cloned().collect();
 
-                        // extract user_id
-                        if let Some(DataValue::Number(user_id)) = user_map.get(&DataTypes::user_id)
-                        {
-                            interested_ids.push(*user_id);
+                        if let Some(DataValue::Number(id)) = user_map.get(&DataTypes::user_id) {
+                            interested_ids.push(*id);
 
-                            // attach calls if exists
-                            if let Some(call_list) = invites.get(user_id)
+                            if let Some(call_list) = invites.get(id)
                                 && !call_list.is_empty()
                             {
                                 user_map
@@ -399,22 +434,25 @@ impl IotaConnection {
         // ============================
         // Notify Omega
         // ============================
-        OmegaConnection::user_states(receiver_id as i64, interested_ids.clone()).await;
+        OmegaConnection::user_states(user_id as i64, interested_ids.clone()).await;
 
         // ============================
         // Notify Rho
         // ============================
         if let Some(rho_conn) = self.get_rho_connection().await {
             rho_conn
-                .set_interested(receiver_id as i64, interested_ids)
+                .set_interested(user_id as i64, interested_ids)
                 .await;
         }
 
         // ============================
         // Forward to client
         // ============================
-        self.forward_to_client(cv.add_data(DataTypes::user_ids, enriched_contacts))
-            .await;
+        self.forward_to_client(
+            cv.add_data(DataTypes::user_ids, enriched_contacts)
+                .add_data(DataTypes::calls, DataValue::Array(global_calls)),
+        )
+        .await;
     }
 
     /// Forward message to client

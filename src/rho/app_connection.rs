@@ -64,6 +64,7 @@ impl AppConnection {
     }
 
     /// Get current ping
+    #[allow(unused)]
     pub async fn get_ping(&self) -> i64 {
         *self.ping.read().await
     }
@@ -304,6 +305,7 @@ impl AppConnection {
     }
 
     /// Close the connection
+    #[allow(unused)]
     pub async fn close(&self) {
         let mut is_open_guard = self.is_open.write().await;
         if !*is_open_guard {

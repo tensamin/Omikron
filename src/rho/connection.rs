@@ -1,5 +1,5 @@
 use rand::{Rng, distributions::Alphanumeric};
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 use ttp_native::{Receiver, Sender};
@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     anonymous_clients::anonymous_client_connection::AnonymousClientConnection,
-    calls::{call_group::CallGroup, call_manager, caller::Caller},
+    calls::call_manager,
     get_private_key, get_public_key, log_cv_in, log_cv_out, log_err, log_in, log_out,
     omega::omega_connection::get_omega_connection,
     rho::{
@@ -163,7 +163,7 @@ impl GeneralConnection {
                     .unwrap()
                     .export(DataFormat::Base64);
 
-            let response = CommunicationValue::new(CommunicationType::app_challange)
+            let response = CommunicationValue::new(CommunicationType::app_challenge)
                 .with_id(cv.get_id())
                 .add_data(
                     DataTypes::public_key,
@@ -315,7 +315,7 @@ impl GeneralConnection {
                     .export(DataFormat::Base64);
 
             let challenge_type = if cv.is_type(CommunicationType::app_identification) {
-                CommunicationType::app_challange
+                CommunicationType::app_challenge
             } else {
                 CommunicationType::challenge
             };
@@ -337,7 +337,7 @@ impl GeneralConnection {
         let id = *self.id.read().await as i64;
 
         if !cv.is_type(CommunicationType::challenge_response)
-            && !cv.is_type(CommunicationType::app_challange_response)
+            && !cv.is_type(CommunicationType::app_challenge_response)
         {
             return;
         }
@@ -433,107 +433,108 @@ impl GeneralConnection {
                                 if let Some(contacts) = v.as_array() {
                                     let call_groups =
                                         call_manager::get_call_groups(user_id as u64).await;
-                                    let callers =
-                                        call_manager::get_call_invites(user_id as u64).await;
-                                    let mapped: Vec<(Arc<Caller>, &Arc<CallGroup>)> = {
-                                        callers
-                                            .iter()
-                                            .map(|caller| {
-                                                (
-                                                    Arc::clone(caller),
-                                                    call_groups.iter().find(|call_group| {
-                                                        call_group.call_id == caller.call_id
-                                                    }),
-                                                )
-                                            })
-                                            .filter(|(_, call_group)| call_group.is_some())
-                                            .map(|(caller, call_group)| {
-                                                (caller, call_group.unwrap())
-                                            })
-                                            .collect()
-                                    };
-                                    if mapped.is_empty() {
-                                        DataValue::Array(contacts)
-                                    } else {
-                                        let mut new_contacts: Vec<DataValue> = Vec::new();
-                                        for contact in contacts {
-                                            if let Some(mut contact_map) = contact.as_map() {
-                                                let filtered_mapped: Vec<(
-                                                    Arc<Caller>,
-                                                    &Arc<CallGroup>,
-                                                )> = mapped
-                                                    .clone()
-                                                    .into_iter()
-                                                    .filter(|(caller, _)| {
-                                                        caller.user_id
-                                                            == contact_map
-                                                                .get(&DataTypes::user_id)
-                                                                .unwrap_or(&DataValue::Null)
-                                                                .as_number()
-                                                                .unwrap_or(0)
-                                                                as u64
-                                                    })
-                                                    .collect();
-                                                if filtered_mapped.is_empty() {
-                                                    new_contacts.push(
-                                                        DataValue::container_from_map(&contact_map),
-                                                    );
+                                    let mut invites: HashMap<i64, Vec<DataValue>> = HashMap::new();
+                                    let mut global_calls: Vec<DataValue> = Vec::new();
+
+                                    for call in call_groups {
+                                        let members = call.members.read().await;
+
+                                        let call_self =
+                                            members.iter().find(|m| m.user_id == user_id as u64);
+
+                                        if let Some(call_self) = call_self {
+                                            let timeout = *call_self.timeout.read().await;
+                                            let admin = call_self.has_admin();
+
+                                            // List of all members in the call
+                                            let member_ids: Vec<DataValue> = members
+                                                .iter()
+                                                .map(|m| DataValue::Number(m.user_id as i64))
+                                                .collect();
+
+                                            let mut base_call_map: BTreeMap<DataTypes, DataValue> =
+                                                BTreeMap::new();
+                                            base_call_map.insert(
+                                                DataTypes::call_id,
+                                                DataValue::Str(call.call_id.to_string()),
+                                            );
+                                            base_call_map.insert(
+                                                DataTypes::call_members,
+                                                DataValue::Array(member_ids),
+                                            );
+
+                                            if timeout > 0 {
+                                                base_call_map.insert(
+                                                    DataTypes::timeout,
+                                                    DataValue::Number(timeout as i64),
+                                                );
+                                            }
+
+                                            if admin {
+                                                base_call_map.insert(
+                                                    DataTypes::has_admin,
+                                                    DataValue::Bool(true),
+                                                );
+                                            }
+
+                                            // Add to global calls (without contact-specific secret)
+                                            global_calls.push(DataValue::container_from_map(
+                                                &base_call_map,
+                                            ));
+
+                                            for member in members.iter() {
+                                                let member_id = member.user_id;
+                                                if member_id == user_id as u64 {
                                                     continue;
                                                 }
 
-                                                let mut vec_of_filtered_calls: Vec<DataValue> =
-                                                    Vec::new();
-                                                for (caller, call_group) in filtered_mapped {
-                                                    vec_of_filtered_calls.push(
-                                                        DataValue::Container(vec![
-                                                        (
-                                                            DataTypes::call_id,
-                                                            DataValue::Str(
-                                                                caller.call_id.to_string(),
-                                                            ),
-                                                        ),
-                                                        (
-                                                            DataTypes::call_secret,
-                                                            DataValue::Str(
-                                                                call_group
-                                                                    .secrets
-                                                                    .read()
-                                                                    .await
-                                                                    .get(&(
-                                                                        contact_map
-                                                                            .get(
-                                                                                &DataTypes::user_id,
-                                                                            )
-                                                                            .unwrap_or(
-                                                                                &DataValue::Null,
-                                                                            )
-                                                                            .as_number()
-                                                                            .unwrap_or(0)
-                                                                            as u64,
-                                                                        user_id as u64,
-                                                                    ))
-                                                                    .unwrap_or(&"".to_string())
-                                                                    .clone(),
-                                                            ),
-                                                        ),
-                                                    ]),
+                                                let mut contact_call_map = base_call_map.clone();
+
+                                                if let Some(secret) = call
+                                                    .secrets
+                                                    .read()
+                                                    .await
+                                                    .get(&(member_id, user_id as u64))
+                                                {
+                                                    contact_call_map.insert(
+                                                        DataTypes::call_secret,
+                                                        DataValue::Str(secret.clone()),
                                                     );
                                                 }
-                                                if !vec_of_filtered_calls.is_empty() {
-                                                    contact_map.insert(
-                                                        DataTypes::calls,
-                                                        DataValue::Array(vec_of_filtered_calls),
-                                                    );
-                                                }
-                                                new_contacts.push(DataValue::container_from_map(
-                                                    &contact_map,
-                                                ));
-                                            } else {
-                                                new_contacts.push(contact.clone());
+
+                                                invites
+                                                    .entry(member_id as i64)
+                                                    .or_insert_with(Vec::new)
+                                                    .push(DataValue::container_from_map(
+                                                        &contact_call_map,
+                                                    ));
                                             }
                                         }
-                                        DataValue::Array(new_contacts)
                                     }
+
+                                    let mut new_contacts: Vec<DataValue> = Vec::new();
+                                    for contact in contacts {
+                                        if let Some(mut contact_map) = contact.as_map() {
+                                            if let Some(DataValue::Number(id)) =
+                                                contact_map.get(&DataTypes::user_id)
+                                            {
+                                                if let Some(call_list) = invites.get(id) {
+                                                    contact_map.insert(
+                                                        DataTypes::calls,
+                                                        DataValue::Array(call_list.clone()),
+                                                    );
+                                                }
+                                            }
+                                            new_contacts
+                                                .push(DataValue::container_from_map(&contact_map));
+                                        } else {
+                                            new_contacts.push(contact.clone());
+                                        }
+                                    }
+
+                                    ident_resp = ident_resp
+                                        .add_data(DataTypes::calls, DataValue::Array(global_calls));
+                                    DataValue::Array(new_contacts)
                                 } else {
                                     v.clone()
                                 }

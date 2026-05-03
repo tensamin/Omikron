@@ -77,6 +77,7 @@ impl RhoConnection {
         collections
     }
 
+    #[allow(unused)]
     pub async fn get_app_connections(
         &self,
         userid: Option<i64>,

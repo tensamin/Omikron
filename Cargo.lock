@@ -3,40 +3,6 @@
 version = 4
 
 [[package]]
-name = "Omikron"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "ansi_term",
- "base64 0.22.1",
- "dashmap",
- "dotenv",
- "futures",
- "hex",
- "hickory-resolver",
- "hkdf 0.13.0",
- "json",
- "livekit-api",
- "livekit-protocol",
- "log",
- "once_cell",
- "rand 0.8.6",
- "rand_core 0.6.4",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "strum",
- "strum_macros",
- "thiserror 2.0.18",
- "tokio",
- "ttp-core",
- "ttp-native",
- "uuid",
- "x448",
-]
-
-[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2153,6 +2119,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "omikron"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "ansi_term",
+ "base64 0.22.1",
+ "dashmap",
+ "dotenv",
+ "futures",
+ "hex",
+ "hickory-resolver",
+ "hkdf 0.13.0",
+ "json",
+ "livekit-api",
+ "livekit-protocol",
+ "log",
+ "once_cell",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "strum",
+ "strum_macros",
+ "thiserror 2.0.18",
+ "tokio",
+ "ttp-core",
+ "ttp-native",
+ "uuid",
+ "x448",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3461,7 +3461,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 [[package]]
 name = "ttp-core"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Tensamin/TTP.git#9677eb6c6040e4e8d85ba8b6232aa954b5a9438d"
+source = "git+https://git.methanium.net/Tensamin/TTP.git#0cc917d75562953b49a83804f9f37e89aca6fd88"
 dependencies = [
  "base64 0.22.1",
  "byteorder",
@@ -3474,7 +3474,7 @@ dependencies = [
 [[package]]
 name = "ttp-native"
 version = "0.1.0"
-source = "git+https://git.methanium.net/Tensamin/TTP.git#9677eb6c6040e4e8d85ba8b6232aa954b5a9438d"
+source = "git+https://git.methanium.net/Tensamin/TTP.git#0cc917d75562953b49a83804f9f37e89aca6fd88"
 dependencies = [
  "quinn",
  "rustls",

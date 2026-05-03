@@ -3,7 +3,7 @@ use once_cell::sync::Lazy;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::calls::{call_group::CallGroup, caller::Caller};
+use crate::calls::{call_group::CallGroup, call_util, caller::Caller};
 
 pub static CALL_GROUPS: Lazy<DashMap<Uuid, Arc<CallGroup>>> = Lazy::new(|| DashMap::new());
 #[allow(dead_code)]
@@ -59,29 +59,23 @@ pub async fn get_call_token(user_id: u64, call_id: Uuid) -> Option<String> {
         return Some(token);
     }
 
-    if let Some(cg) = CALL_GROUPS.get(&call_id) {
-        let cg_clone = cg.clone();
-
-        let mut members = cg_clone.members.write().await;
-        if let Some(member) = members.iter().find(|m| m.user_id == user_id) {
-            return Some(member.create_token());
-        }
-        let new_caller = Arc::new(Caller::new(user_id, call_id, false));
-        let token = new_caller.create_token();
-        members.push(new_caller);
-        return Some(token);
-    }
-
     let caller = Arc::new(Caller::new(user_id, call_id, true));
-    let call_group = CallGroup::new(call_id, caller.clone());
-    call_group.update_admins().await;
+    let call_group = Arc::new(CallGroup::new(call_id, caller.clone()));
 
-    CALL_GROUPS.insert(call_id, Arc::new(call_group));
+    CALL_GROUPS.insert(call_id, call_group.clone());
+
+    let _ = call_util::create_room(call_id).await;
+    call_group.update_admins().await;
 
     Some(caller.create_token())
 }
 
-pub async fn add_invite(call_id: Uuid, inviter_id: u64, invitee_id: u64) -> bool {
+pub async fn add_invite(
+    call_id: Uuid,
+    inviter_id: u64,
+    invitee_id: u64,
+    secret: Option<String>,
+) -> bool {
     if let Some(cg) = CALL_GROUPS.get(&call_id) {
         let mut members = cg.members.write().await;
 
@@ -91,6 +85,13 @@ pub async fn add_invite(call_id: Uuid, inviter_id: u64, invitee_id: u64) -> bool
             if !members.iter().any(|m| m.user_id == invitee_id) {
                 members.push(Arc::new(Caller::new(invitee_id, call_id, false)));
             }
+
+            if let Some(secret) = secret {
+                let mut secrets = cg.secrets.write().await;
+                secrets.insert((inviter_id, invitee_id), secret.clone());
+                secrets.insert((invitee_id, inviter_id), secret);
+            }
+
             return true;
         }
     }

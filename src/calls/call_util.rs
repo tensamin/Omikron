@@ -1,3 +1,4 @@
+use livekit_api::services::room::CreateRoomOptions;
 use livekit_api::{
     access_token::{self},
     services::room::RoomClient,
@@ -33,6 +34,20 @@ pub fn get_livekit() -> Result<(String, String, String), ()> {
         }
     };
     Ok((hostname, api_key, api_secret))
+}
+
+pub async fn create_room(call_id: Uuid) -> Result<(), ()> {
+    let (hostname, api_key, api_secret) = get_livekit()?;
+    let room_service = RoomClient::with_api_key(&hostname, &api_key, &api_secret);
+
+    let options = CreateRoomOptions::default();
+
+    room_service
+        .create_room(&call_id.to_string(), options)
+        .await
+        .map_err(|_| ())?;
+
+    Ok(())
 }
 
 pub fn create_token(user_id: u64, call_id: Uuid, has_admin: bool) -> Result<String, ()> {

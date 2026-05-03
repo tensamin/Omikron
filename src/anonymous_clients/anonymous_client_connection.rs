@@ -344,7 +344,12 @@ impl AnonymousClientConnection {
             }
         };
 
-        let invited = call_manager::add_invite(call_id, self.user_id, receiver_id as u64).await;
+        let secret = cv
+            .get_data(DataTypes::call_secret)
+            .as_str()
+            .map(|s| s.to_string());
+        let invited =
+            call_manager::add_invite(call_id, self.user_id, receiver_id as u64, secret).await;
         if !invited {
             self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_call_id)
                 .await;
@@ -459,6 +464,7 @@ impl AnonymousClientConnection {
         self.send_message(&error).await;
     }
     /// Close the connection
+    #[allow(unused)]
     pub async fn close(&self) {
         let mut is_open_guard = self.is_open.write().await;
         if !*is_open_guard {

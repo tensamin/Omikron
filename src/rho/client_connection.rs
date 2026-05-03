@@ -274,7 +274,12 @@ impl ClientConnection {
             }
         };
 
-        let invited = call_manager::add_invite(call_id, self.user_id, receiver_id as u64).await;
+        let secret = cv
+            .get_data(DataTypes::call_secret)
+            .as_str()
+            .map(|s| s.to_string());
+        let invited =
+            call_manager::add_invite(call_id, self.user_id, receiver_id as u64, secret).await;
         if !invited {
             self.send_error_response(cv.get_id(), CommunicationType::error_invalid_call_id)
                 .await;
