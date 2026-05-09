@@ -411,9 +411,6 @@ impl GeneralConnection {
                 *self.rho_connection.write().await = rho.clone();
 
                 if let Some(rho_conn) = rho {
-                    rho_conn.bind_user_id(user_id).await;
-                    rho_conn.add_client_connection(client.clone()).await;
-
                     let session_id = *self.session_id.read().await as i64;
                     let iota_msg = CommunicationValue::new(CommunicationType::client_connected)
                         .add_data(DataTypes::user_id, DataValue::Number(user_id))
@@ -546,6 +543,8 @@ impl GeneralConnection {
                         }
                         log_cv_out!(ident_resp);
                         let _ = self.sender.send(&ident_resp).await;
+                        rho_conn.bind_user_id(user_id).await;
+                        rho_conn.add_client_connection(client.clone()).await;
                     }
                 } else {
                     log_err!(
