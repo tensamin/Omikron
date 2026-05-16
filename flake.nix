@@ -88,6 +88,24 @@
                 description = "Whether to open the firewall for ports used by the Omikron.";
               };
 
+              rhoPort = lib.mkOption {
+                type = lib.types.port;
+                default = 959;
+                description = "Port the Omikron server listens on for incoming QUIC connections.";
+              };
+
+              omegaHost = lib.mkOption {
+                type = lib.types.str;
+                default = "tensamin.net";
+                description = "Hostname of the upstream Omega server.";
+              };
+
+              omegaPort = lib.mkOption {
+                type = lib.types.port;
+                default = 9187;
+                description = "Port of the upstream Omega server.";
+              };
+
               package = lib.mkOption {
                 type = lib.types.package;
                 default = defaultPackage;
@@ -117,6 +135,12 @@
                 description = "Tensamin Omikron";
                 wantedBy = [ "multi-user.target" ];
                 after = [ "network.target" ];
+
+                environment = {
+                  RHO_PORT = toString cfg.rhoPort;
+                  OMEGA_HOST = cfg.omegaHost;
+                  OMEGA_PORT = toString cfg.omegaPort;
+                };
 
                 serviceConfig = {
                   Type = "simple";
@@ -164,8 +188,8 @@
               };
 
               networking.firewall = lib.mkIf cfg.openFirewall {
-                allowedTCPPorts = [ 959 ];
-                allowedUDPPorts = [ 959 ];
+                allowedTCPPorts = [ cfg.rhoPort ];
+                allowedUDPPorts = [ cfg.rhoPort ];
               };
             };
           };

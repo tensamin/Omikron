@@ -39,9 +39,14 @@ async fn main() {
     dotenv().ok();
     startup();
 
+    let rho_port = env::var("RHO_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(959);
+
     get_omega_connection();
     tokio::spawn(async move {
-        if let Err(e) = start(959).await {
+        if let Err(e) = start(rho_port).await {
             log_err!(0, util::logger::PrintType::General, "{}", e);
         }
     });

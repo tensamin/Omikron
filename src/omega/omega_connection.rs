@@ -26,6 +26,20 @@ use uuid::Uuid;
 
 const OMEGA_HOST_DEFAULT: &str = "tensamin.net";
 const OMEGA_PORT_DEFAULT: u16 = 9187;
+
+fn omega_host_and_port() -> (String, u16) {
+    let host = env::var("OMEGA_HOST")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| OMEGA_HOST_DEFAULT.to_string());
+
+    let port = env::var("OMEGA_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(OMEGA_PORT_DEFAULT);
+
+    (host, port)
+}
+
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -104,7 +118,8 @@ pub struct OmegaConnection {
 
 impl OmegaConnection {
     pub fn new() -> Self {
-        Self::with_host(OMEGA_HOST_DEFAULT, OMEGA_PORT_DEFAULT)
+        let (host, port) = omega_host_and_port();
+        Self::with_host(&host, port)
     }
 
     pub fn with_host(host: &str, port: u16) -> Self {
