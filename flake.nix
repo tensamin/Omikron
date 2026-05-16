@@ -124,8 +124,8 @@
                   Group = "omikron";
                   WorkingDirectory = cfg.dataDir;
                   ExecStart = "${cfg.package}/bin/omikron";
-                  Restart = "unless-stopped";
-                  RestartSec = "5";
+                  Restart = "always";
+                  RestartSec = "5s";
 
                   EnvironmentFile = cfg.environmentFiles;
 
