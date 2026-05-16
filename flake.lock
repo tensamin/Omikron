@@ -59,16 +59,15 @@
     "ttp": {
       "flake": false,
       "locked": {
-        "lastModified": 1778329030,
-        "narHash": "sha256-qEEPlOuGVco1g6lI/kfEvIZkJmBbjehuchGWPTywR10=",
-        "ref": "refs/heads/main",
-        "rev": "929cb9d3a6aebebe6365973f13062ac2a8e03af6",
-        "revCount": 115,
+        "lastModified": 1778948017,
+        "narHash": "sha256-hqBYSZnPq7f/F2Z6nJK+6a8ITk6WRCcVBcNT0CR6SnM=",
+        "rev": "7e5d1953df8592a1feba0f390d205d0ef61a3119",
+        "revCount": 117,
         "type": "git",
         "url": "https://git.methanium.net/Tensamin/TTP.git"
       },
       "original": {
-        "rev": "929cb9d3a6aebebe6365973f13062ac2a8e03af6",
+        "rev": "7e5d1953df8592a1feba0f390d205d0ef61a3119",
         "type": "git",
         "url": "https://git.methanium.net/Tensamin/TTP.git"
       }
