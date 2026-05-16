@@ -59,13 +59,21 @@
               };
 
               certFile = lib.mkOption {
-                type = lib.types.path;
-                description = "Path to the SSL certificate file (cert.pem).";
+                type = lib.types.nullOr lib.types.path;
+                default = null;
+                description = "Path to the SSL certificate file (cert.pem). Required if acmeCertDir is not set.";
               };
 
               keyFile = lib.mkOption {
-                type = lib.types.path;
-                description = "Path to the SSL private key file (key.pem).";
+                type = lib.types.nullOr lib.types.path;
+                default = null;
+                description = "Path to the SSL private key file (key.pem). Required if acmeCertDir is not set.";
+              };
+
+              acmeCertDir = lib.mkOption {
+                type = lib.types.nullOr lib.types.path;
+                default = null;
+                description = "Directory containing ACME certificates (fullchain.pem and key.pem). When set, the service will automatically convert the EC key to PKCS8 and copy both files into the dataDir/certs directory on startup.";
               };
 
               environmentFiles = lib.mkOption {
@@ -88,6 +96,13 @@
             };
 
             config = lib.mkIf cfg.enable {
+              assertions = [
+                {
+                  assertion = cfg.acmeCertDir != null || (cfg.certFile != null && cfg.keyFile != null);
+                  message = "services.omikron: either acmeCertDir must be set, or both certFile and keyFile must be provided.";
+                }
+              ];
+
               users.users.omikron = {
                 isSystemUser = true;
                 group = "omikron";
@@ -118,12 +133,19 @@
                   CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
 
                   ExecStartPre = [
-                    ("+" + pkgs.writeShellScript "omikron-setup-certs" ''
+                    ("+" + pkgs.writeShellScript "omikron-setup-certs" (if cfg.acmeCertDir != null then ''
+                      mkdir -p ${cfg.dataDir}/certs
+                      cp ${cfg.acmeCertDir}/fullchain.pem ${cfg.dataDir}/certs/cert.pem
+                      ${pkgs.openssl}/bin/openssl pkcs8 -topk8 -nocrypt \
+                        -in ${cfg.acmeCertDir}/key.pem \
+                        -out ${cfg.dataDir}/certs/key.pem
+                      chown -R omikron:omikron ${cfg.dataDir}
+                    '' else ''
                       mkdir -p ${cfg.dataDir}/certs
                       ln -sf ${cfg.certFile} ${cfg.dataDir}/certs/cert.pem
                       ln -sf ${cfg.keyFile} ${cfg.dataDir}/certs/key.pem
                       chown -R omikron:omikron ${cfg.dataDir}
-                    '')
+                    ''))
                   ];
 
                   ProtectSystem = "strict";
