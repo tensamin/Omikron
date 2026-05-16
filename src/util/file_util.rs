@@ -177,9 +177,8 @@ pub fn get_children(path: &str) -> Vec<String> {
 }
 
 pub fn get_directory() -> String {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    exe.parent()
-        .unwrap_or(Path::new("."))
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
         .to_string_lossy()
         .to_string()
 }
