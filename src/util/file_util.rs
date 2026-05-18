@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::log;
 use crate::util::logger::PrintType;
@@ -177,8 +177,5 @@ pub fn get_children(path: &str) -> Vec<String> {
 }
 
 pub fn get_directory() -> String {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .to_string_lossy()
-        .to_string()
+    crate::WORKING_DIR.to_string_lossy().to_string()
 }

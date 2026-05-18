@@ -2,7 +2,6 @@ use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
-    path::Path,
     sync::{OnceLock, mpsc},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -39,8 +38,8 @@ pub fn startup() {
     LOGGER.set(tx).expect("Logger already initialized");
 
     thread::spawn(move || {
-        let log_dir = Path::new("logs");
-        fs::create_dir_all(log_dir).expect("Failed to create log directory");
+        let log_dir = crate::WORKING_DIR.join("logs");
+        fs::create_dir_all(&log_dir).expect("Failed to create log directory");
 
         let start_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)

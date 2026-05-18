@@ -6,9 +6,14 @@ mod rho;
 mod util;
 
 use std::env;
+use std::path::PathBuf;
 
 use dotenv::dotenv;
 use once_cell::sync::Lazy;
+
+pub static WORKING_DIR: Lazy<PathBuf> = Lazy::new(|| {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+});
 use rustls::crypto::aws_lc_rs::default_provider;
 
 use crate::{
