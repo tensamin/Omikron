@@ -9,7 +9,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     ttp = {
-      url = "git+https://git.methanium.net/Tensamin/TTP.git?rev=7e5d1953df8592a1feba0f390d205d0ef61a3119";
+      url = "git+https://git.methanium.net/tensamin/ttp.git";
       flake = false;
     };
   };
