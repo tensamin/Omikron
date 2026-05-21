@@ -113,8 +113,10 @@ impl GeneralConnection {
                         log_cv_out!(success_msg);
                         let _ = self.sender.send(&success_msg).await;
                     } else {
-                        let err_msg =
-                            CommunicationValue::new(CommunicationType::error).with_id(cv.get_id());
+                        let err_msg = CommunicationValue::new(
+                            CommunicationType::error_invalid_omikron_id,
+                        )
+                        .with_id(cv.get_id());
                         let _ = self.sender.send(&err_msg).await;
                     }
                 }
@@ -356,7 +358,7 @@ impl GeneralConnection {
                     expected,
                     response
                 );
-                let err_msg = CommunicationValue::new(CommunicationType::error)
+                let err_msg = CommunicationValue::new(CommunicationType::error_invalid_challenge)
                     .with_id(cv.get_id())
                     .add_data(
                         DataTypes::message,

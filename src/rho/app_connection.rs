@@ -52,7 +52,7 @@ impl AppConnection {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if self_clone2.get_rho_connection().await.is_none() {
                 self_clone2
-                    .send_error_response(0, CommunicationType::error)
+                    .send_error_response(0, CommunicationType::error_no_iota)
                     .await;
             }
         });
@@ -293,8 +293,10 @@ impl AppConnection {
                 msg_type,
                 msg_id
             );
-            self.send_error_response(msg_id, CommunicationType::error)
-                .await;
+            let error_cv = CommunicationValue::new(CommunicationType::error_no_iota)
+                .with_id(msg_id)
+                .add_data(DataTypes::user_id, DataValue::Number(sender_user_id as i64));
+            self.send_message(&error_cv).await;
         }
     }
 

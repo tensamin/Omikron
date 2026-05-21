@@ -55,7 +55,7 @@ impl ClientConnection {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if self_clone2.get_rho_connection().await.is_none() {
                 self_clone2
-                    .send_error_response(0, CommunicationType::error)
+                    .send_error_response(0, CommunicationType::error_no_iota)
                     .await;
             }
         });
@@ -287,11 +287,13 @@ impl ClientConnection {
         }
 
         // Find target RhoConnection
-        let target_rho = match rho_manager::get_rho_con_for_user(receiver_id).await {
+            let target_rho = match rho_manager::get_rho_con_for_user(receiver_id).await {
             Some(rho) => rho,
             _ => {
-                self.send_error_response(cv.get_id(), CommunicationType::error)
-                    .await;
+                let error_cv = CommunicationValue::new(CommunicationType::error_not_found)
+                    .with_id(cv.get_id())
+                    .add_data(DataTypes::receiver_id, DataValue::Number(receiver_id));
+                self.send_message(&error_cv).await;
                 return;
             }
         };
@@ -344,8 +346,10 @@ impl ClientConnection {
                 .add_data(DataTypes::call_token, DataValue::Str(token));
             self.send_message(&response).await;
         } else {
-            self.send_error_response(cv.get_id(), CommunicationType::error)
-                .await;
+            let error_cv = CommunicationValue::new(CommunicationType::error_no_call_id)
+                .with_id(cv.get_id())
+                .add_data(DataTypes::call_id, DataValue::Str(call_id.to_string()));
+            self.send_message(&error_cv).await;
             return;
         }
     }
@@ -356,13 +360,13 @@ impl ClientConnection {
             DataValue::Str(id_str) => match Uuid::parse_str(id_str.as_str()) {
                 Ok(id) => id,
                 Err(_) => {
-                    self.send_error_response(cv.get_id(), CommunicationType::error)
+                    self.send_error_response(cv.get_id(), CommunicationType::error_invalid_call_id)
                         .await;
                     return;
                 }
             },
             _ => {
-                self.send_error_response(cv.get_id(), CommunicationType::error)
+                self.send_error_response(cv.get_id(), CommunicationType::error_no_call_id)
                     .await;
                 return;
             }
@@ -384,13 +388,17 @@ impl ClientConnection {
                     .add_data(DataTypes::user_ids, DataValue::Array(user_ids));
                 self.send_message(&response).await;
             } else {
-                self.send_error_response(cv.get_id(), CommunicationType::error)
-                    .await;
+                let error_cv = CommunicationValue::new(CommunicationType::error_invalid_user_id)
+                    .with_id(cv.get_id())
+                    .add_data(DataTypes::user_id, DataValue::Number(user_id as i64));
+                self.send_message(&error_cv).await;
                 return;
             }
         } else {
-            self.send_error_response(cv.get_id(), CommunicationType::error)
-                .await;
+            let error_cv = CommunicationValue::new(CommunicationType::error_not_found)
+                .with_id(cv.get_id())
+                .add_data(DataTypes::call_id, DataValue::Str(call_id.to_string()));
+            self.send_message(&error_cv).await;
             return;
         }
     }
@@ -488,8 +496,11 @@ impl ClientConnection {
                 }
             }
         }
-        self.send_error_response(cv.get_id(), CommunicationType::error)
-            .await;
+        let path_data = cv.get_data(DataTypes::path).clone();
+        let error_cv = CommunicationValue::new(CommunicationType::error_not_found)
+            .with_id(cv.get_id())
+            .add_data(DataTypes::path, path_data);
+        self.send_message(&error_cv).await;
     }
 
     /// Forward message to Iota
@@ -599,8 +610,10 @@ impl ClientConnection {
                 msg_type,
                 msg_id
             );
-            self.send_error_response(msg_id, CommunicationType::error)
-                .await;
+            let error_cv = CommunicationValue::new(CommunicationType::error_no_iota)
+                .with_id(msg_id)
+                .add_data(DataTypes::user_id, DataValue::Number(sender_user_id as i64));
+            self.send_message(&error_cv).await;
         }
     }
 

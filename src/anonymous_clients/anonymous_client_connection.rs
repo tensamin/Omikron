@@ -360,8 +360,10 @@ impl AnonymousClientConnection {
         let target_rho = match rho_manager::get_rho_con_for_user(receiver_id).await {
             Some(rho) => rho,
             _ => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
-                    .await;
+                let error_cv = CommunicationValue::new(CommunicationType::error_not_found)
+                    .with_id(cv.get_id())
+                    .add_data(DataTypes::receiver_id, DataValue::Number(receiver_id));
+                self.send_message(&error_cv).await;
                 return;
             }
         };
@@ -394,13 +396,13 @@ impl AnonymousClientConnection {
             DataValue::Str(id_str) => match Uuid::parse_str(&id_str.to_string()) {
                 Ok(id) => id,
                 Err(_) => {
-                    self.send_error_response(&cv.get_id(), CommunicationType::error)
+                    self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_call_id)
                         .await;
                     return;
                 }
             },
             _ => {
-                self.send_error_response(&cv.get_id(), CommunicationType::error)
+                self.send_error_response(&cv.get_id(), CommunicationType::error_no_call_id)
                     .await;
                 return;
             }
@@ -413,8 +415,10 @@ impl AnonymousClientConnection {
                 .add_data(DataTypes::call_token, DataValue::Str(token.to_string()));
             self.send_message(&response).await;
         } else {
-            self.send_error_response(&cv.get_id(), CommunicationType::error)
-                .await;
+            let error_cv = CommunicationValue::new(CommunicationType::error_no_call_id)
+                .with_id(cv.get_id())
+                .add_data(DataTypes::call_id, DataValue::Str(call_id.to_string()));
+            self.send_message(&error_cv).await;
             return;
         }
     }
