@@ -356,6 +356,15 @@ impl GeneralConnection {
                     expected,
                     response
                 );
+                let err_msg = CommunicationValue::new(CommunicationType::error)
+                    .with_id(cv.get_id())
+                    .add_data(
+                        DataTypes::message,
+                        DataValue::Str(
+                            "Challenge response mismatch — authentication rejected".to_string(),
+                        ),
+                    );
+                let _ = self.sender.send(&err_msg).await;
             }
         } else {
             log_err!(

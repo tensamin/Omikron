@@ -160,6 +160,12 @@ impl OmegaConnection {
             handle.abort();
         }
 
+        // Recreate shutdown_tx if it was taken by stop()
+        if self.shutdown_tx.lock().await.is_none() {
+            let (shutdown_tx, _) = watch::channel(false);
+            *self.shutdown_tx.lock().await = Some(shutdown_tx);
+        }
+
         // Set reconnect flag
         *self.reconnect_on_close.write().await = true;
 
