@@ -113,10 +113,9 @@ impl GeneralConnection {
                         log_cv_out!(success_msg);
                         let _ = self.sender.send(&success_msg).await;
                     } else {
-                        let err_msg = CommunicationValue::new(
-                            CommunicationType::error_invalid_omikron_id,
-                        )
-                        .with_id(cv.get_id());
+                        let err_msg =
+                            CommunicationValue::new(CommunicationType::error_invalid_omikron_id)
+                                .with_id(cv.get_id());
                         let _ = self.sender.send(&err_msg).await;
                     }
                 }
@@ -196,6 +195,12 @@ impl GeneralConnection {
             let response_cv = match response_cv {
                 Ok(r) => r,
                 Err(_) => {
+                    log_err!(
+                        *iota_id,
+                        PrintType::Iota,
+                        "Failed to get Iota data from Omega for iota_id={}",
+                        iota_id
+                    );
                     return;
                 }
             };
@@ -208,6 +213,12 @@ impl GeneralConnection {
             let pub_key = match load_public_key(base64_pub) {
                 Some(pk) => pk,
                 None => {
+                    log_err!(
+                        *iota_id,
+                        PrintType::Iota,
+                        "Failed to load public key for iota_id={}",
+                        iota_id
+                    );
                     return;
                 }
             };
@@ -363,7 +374,7 @@ impl GeneralConnection {
                     .add_data(
                         DataTypes::message,
                         DataValue::Str(
-                            "Challenge response mismatch — authentication rejected".to_string(),
+                            "Challenge response mismatch; authentication rejected".to_string(),
                         ),
                     );
                 let _ = self.sender.send(&err_msg).await;
@@ -598,6 +609,14 @@ impl GeneralConnection {
                         iota.set_user_ids(user_ids).await;
                     }
                 }
+
+                let ident_resp =
+                    CommunicationValue::new(CommunicationType::identification_response)
+                        .with_id(*self.challenge_cv_id.read().await)
+                        .add_data(DataTypes::accepted, DataValue::Bool(true));
+
+                log_cv_out!(ident_resp);
+                let _ = self.sender.send(&ident_resp).await;
 
                 iota.clone().start();
             }
