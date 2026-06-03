@@ -101,6 +101,8 @@ impl ClientConnection {
             }
             log_cv_in!(PrintType::Client, cv);
 
+            let mut cv = cv;
+
             // Handle client status changes
             if cv.is_type(CommunicationType::client_changed) {
                 self.handle_client_changed(cv).await;
@@ -190,6 +192,76 @@ impl ClientConnection {
                     .await;
                 return;
             }
+
+            let is_per_device_settings = cv.is_type(CommunicationType::settings_save)
+                || cv.is_type(CommunicationType::settings_load)
+                || cv.is_type(CommunicationType::settings_list);
+            let is_global_settings = cv.is_type(CommunicationType::global_settings_save)
+                || cv.is_type(CommunicationType::global_settings_load);
+
+            if is_per_device_settings || is_global_settings {
+                let expected_session_id = self.session_id as i64;
+                let session_id = cv.get_data(DataTypes::session_id).as_number();
+
+                if is_per_device_settings {
+                    let Some(session_id) = session_id else {
+                        let response =
+                            CommunicationValue::new(CommunicationType::error_invalid_data)
+                                .with_id(cv.get_id())
+                                .with_receiver(self.user_id)
+                                .add_data(
+                                    DataTypes::message,
+                                    DataValue::Str("Missing session_id".to_string()),
+                                )
+                                .add_data(
+                                    DataTypes::session_id,
+                                    DataValue::Number(expected_session_id),
+                                );
+                        self.send_message(&response).await;
+                        return;
+                    };
+
+                    if session_id != expected_session_id {
+                        let response =
+                            CommunicationValue::new(CommunicationType::error_invalid_data)
+                                .with_id(cv.get_id())
+                                .with_receiver(self.user_id)
+                                .add_data(
+                                    DataTypes::message,
+                                    DataValue::Str("session_id mismatch".to_string()),
+                                )
+                                .add_data(
+                                    DataTypes::session_id,
+                                    DataValue::Number(expected_session_id),
+                                );
+                        self.send_message(&response).await;
+                        return;
+                    }
+                } else if let Some(session_id) = session_id {
+                    if session_id != expected_session_id {
+                        let response =
+                            CommunicationValue::new(CommunicationType::error_invalid_data)
+                                .with_id(cv.get_id())
+                                .with_receiver(self.user_id)
+                                .add_data(
+                                    DataTypes::message,
+                                    DataValue::Str("session_id mismatch".to_string()),
+                                )
+                                .add_data(
+                                    DataTypes::session_id,
+                                    DataValue::Number(expected_session_id),
+                                );
+                        self.send_message(&response).await;
+                        return;
+                    }
+                } else {
+                    cv = cv.add_data(
+                        DataTypes::session_id,
+                        DataValue::Number(expected_session_id),
+                    );
+                }
+            }
+
             // Forward other messages to Iota
             self.forward_to_iota(cv).await;
         });
@@ -236,8 +308,8 @@ impl ClientConnection {
     /// Handle client status change
     async fn handle_client_changed(self: Arc<Self>, cv: CommunicationValue) {
         let user_id = self.get_user_id().await;
-        if let DataValue::Str(_status_str) = cv.get_data(DataTypes::user_state) {
-            let user_status = UserStatus::user_online;
+        if let DataValue::Str(status_str) = cv.get_data(DataTypes::user_state) {
+            let user_status = UserStatus::from_str(&status_str).unwrap_or(UserStatus::user_online);
             if let Some(rho_conn) = self.get_rho_connection().await {
                 OmegaConnection::client_changed(
                     rho_conn.get_iota_id().await as i64,
@@ -287,9 +359,28 @@ impl ClientConnection {
         }
 
         // Find target RhoConnection
-            let target_rho = match rho_manager::get_rho_con_for_user(receiver_id).await {
+        let target_rho = match rho_manager::get_rho_con_for_user(receiver_id).await {
             Some(rho) => rho,
             _ => {
+                // Get sender user ID
+                let sender_id = self.get_user_id().await;
+
+                // User is offline - send push notification for call invite
+                let push_cv = CommunicationValue::new(CommunicationType::push_notification)
+                    .with_receiver(receiver_id as u64)
+                    .add_data(DataTypes::sender_id, DataValue::Number(sender_id as i64))
+                    .add_data(DataTypes::call_id, DataValue::Str(call_id.to_string()))
+                    .add_data(
+                        DataTypes::notifications,
+                        DataValue::Str("call_invite".to_string()),
+                    );
+
+                let omega_conn = get_omega_connection();
+                // Send fire-and-forget, don't await to avoid blocking
+                tokio::spawn(async move {
+                    let _ = omega_conn.send_message(&push_cv).await;
+                });
+
                 let error_cv = CommunicationValue::new(CommunicationType::error_not_found)
                     .with_id(cv.get_id())
                     .add_data(DataTypes::receiver_id, DataValue::Number(receiver_id));
@@ -404,61 +495,73 @@ impl ClientConnection {
     }
 
     async fn handle_call_timeout_user(self: Arc<Self>, cv: CommunicationValue) {
-        let call_id =
-            Uuid::from_str(cv.get_data(DataTypes::call_id).as_str().unwrap_or("")).unwrap();
+        let Ok(call_id) = Uuid::from_str(cv.get_data(DataTypes::call_id).as_str().unwrap_or(""))
+        else {
+            self.send_error_response(cv.get_id(), CommunicationType::error_invalid_call_id)
+                .await;
+            return;
+        };
         let user_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0);
         let untill = cv.get_data(DataTypes::untill).as_number().unwrap_or(0);
 
-        let call = call_manager::get_call(call_id).await;
-        if let Some(call) = call {
-            if call
-                .get_caller(self.get_user_id().await)
-                .await
-                .unwrap()
-                .has_admin()
-            {
-                let _ = call_util::remove_participant(call_id, user_id as u64).await;
-                call.get_caller(user_id as u64)
-                    .await
-                    .unwrap()
-                    .set_timeout(untill)
-                    .await;
+        let Some(call) = call_manager::get_call(call_id).await else {
+            self.send_error_response(cv.get_id(), CommunicationType::error_not_found)
+                .await;
+            return;
+        };
+
+        let Some(caller) = call.get_caller(self.get_user_id().await).await else {
+            self.send_error_response(cv.get_id(), CommunicationType::error_invalid_user_id)
+                .await;
+            return;
+        };
+        if caller.has_admin() {
+            let _ = call_util::remove_participant(call_id, user_id as u64).await;
+            if let Some(target) = call.get_caller(user_id as u64).await {
+                target.set_timeout(untill).await;
             }
         }
     }
     async fn handle_call_disconnect_user(self: Arc<Self>, cv: CommunicationValue) {
-        let call_id =
-            Uuid::from_str(cv.get_data(DataTypes::call_id).as_str().unwrap_or("")).unwrap();
+        let Ok(call_id) = Uuid::from_str(cv.get_data(DataTypes::call_id).as_str().unwrap_or(""))
+        else {
+            self.send_error_response(cv.get_id(), CommunicationType::error_invalid_call_id)
+                .await;
+            return;
+        };
         let user_id = cv.get_data(DataTypes::user_id).as_number().unwrap_or(0);
 
-        let call = call_manager::get_call(call_id).await;
-        if let Some(call) = call {
-            if call
-                .get_caller(self.get_user_id().await)
-                .await
-                .unwrap()
-                .has_admin()
-            {
-                call.remove_caller(user_id as u64).await;
-            }
+        let Some(call) = call_manager::get_call(call_id).await else {
+            self.send_error_response(cv.get_id(), CommunicationType::error_not_found)
+                .await;
+            return;
+        };
+        let Some(caller) = call.get_caller(self.get_user_id().await).await else {
+            self.send_error_response(cv.get_id(), CommunicationType::error_invalid_user_id)
+                .await;
+            return;
+        };
+        if caller.has_admin() {
+            call.remove_caller(user_id as u64).await;
         }
     }
     async fn handle_call_set_anonymous_joining(self: Arc<Self>, cv: CommunicationValue) {
-        let call_id =
-            Uuid::from_str(cv.get_data(DataTypes::call_id).as_str().unwrap_or("")).unwrap();
+        let Ok(call_id) = Uuid::from_str(cv.get_data(DataTypes::call_id).as_str().unwrap_or(""))
+        else {
+            self.send_error_response(cv.get_id(), CommunicationType::error_invalid_call_id)
+                .await;
+            return;
+        };
         let enable = cv.get_data(DataTypes::enabled).as_bool().unwrap_or(true);
 
         let call = call_manager::get_call(call_id).await;
 
         let mut short_link = None;
         if let Some(call) = call {
-            if call
-                .get_caller(self.get_user_id().await)
-                .await
-                .unwrap()
-                .has_admin()
-            {
-                call.set_anonymous_joining(enable).await;
+            if let Some(caller) = call.get_caller(self.get_user_id().await).await {
+                if caller.has_admin() {
+                    call.set_anonymous_joining(enable).await;
+                }
             }
             short_link = call.get_short_link().await;
         }
@@ -647,12 +750,17 @@ impl ClientConnection {
 
     /// Check if interested in a user and send notification
     #[allow(dead_code)]
-    pub async fn are_you_interested(self: Arc<Self>, user_id: i64) {
+    pub async fn are_you_interested(self: Arc<Self>, user_id: i64, user_status: &str) {
         let interested_guard = self.clone().get_interested_users().await;
         if interested_guard.contains(&user_id) {
+            let status = if user_status == "user_invisible" {
+                "user_offline"
+            } else {
+                user_status
+            };
             let notification = CommunicationValue::new(CommunicationType::client_changed)
                 .add_data(DataTypes::user_id, DataValue::Str(user_id.to_string()))
-                .add_data(DataTypes::user_state, DataValue::Str("online".to_string()));
+                .add_data(DataTypes::user_state, DataValue::Str(status.to_string()));
 
             self.send_message(&notification).await;
         }

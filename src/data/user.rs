@@ -10,6 +10,7 @@ pub enum UserStatus {
     user_idle,
     user_wc,
     user_borked,
+    user_invisible,
     iota_offline,
     iota_online,
     iota_borked,

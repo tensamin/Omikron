@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use crate::anonymous_clients::anonymous_manager::{self, generate_username};
 use crate::calls::call_manager;
-use crate::omega::omega_connection::get_omega_connection;
+use crate::data::user::UserStatus;
+use crate::omega::omega_connection::{OmegaConnection, get_omega_connection};
 use crate::rho::connection::GeneralConnection;
 use crate::rho::rho_manager;
 use crate::util::logger::PrintType;
@@ -309,11 +310,12 @@ impl AnonymousClientConnection {
     }
 
     /// Handle client status change
-    async fn handle_client_changed(self: Arc<Self>, _cv: CommunicationValue) {
-        /*let user_id = self.get_user_id().await;
-        if let Some(_status_str) = cv.get_data(DataTypes::user_state) {
-            let user_status = UserStatus::online;
-        }*/
+    async fn handle_client_changed(self: Arc<Self>, cv: CommunicationValue) {
+        if let DataValue::Str(status_str) = cv.get_data(DataTypes::user_state) {
+            let user_status = UserStatus::from_str(&status_str).unwrap_or(UserStatus::user_online);
+            OmegaConnection::client_changed(self.user_id as i64, self.user_id as i64, user_status)
+                .await;
+        }
     }
 
     /// Handle call invite
@@ -360,6 +362,25 @@ impl AnonymousClientConnection {
         let target_rho = match rho_manager::get_rho_con_for_user(receiver_id).await {
             Some(rho) => rho,
             _ => {
+                // Get sender user ID
+                let sender_id = self.get_user_id();
+
+                // User is offline - send push notification for call invite
+                let push_cv = CommunicationValue::new(CommunicationType::push_notification)
+                    .with_receiver(receiver_id as u64)
+                    .add_data(DataTypes::sender_id, DataValue::Number(sender_id as i64))
+                    .add_data(DataTypes::call_id, DataValue::Str(call_id.to_string()))
+                    .add_data(
+                        DataTypes::notifications,
+                        DataValue::Str("call_invite".to_string()),
+                    );
+
+                let omega_conn = get_omega_connection();
+                // Send fire-and-forget, don't await to avoid blocking
+                tokio::spawn(async move {
+                    let _ = omega_conn.send_message(&push_cv).await;
+                });
+
                 let error_cv = CommunicationValue::new(CommunicationType::error_not_found)
                     .with_id(cv.get_id())
                     .add_data(DataTypes::receiver_id, DataValue::Number(receiver_id));
@@ -396,8 +417,11 @@ impl AnonymousClientConnection {
             DataValue::Str(id_str) => match Uuid::parse_str(&id_str.to_string()) {
                 Ok(id) => id,
                 Err(_) => {
-                    self.send_error_response(&cv.get_id(), CommunicationType::error_invalid_call_id)
-                        .await;
+                    self.send_error_response(
+                        &cv.get_id(),
+                        CommunicationType::error_invalid_call_id,
+                    )
+                    .await;
                     return;
                 }
             },
@@ -493,12 +517,17 @@ impl AnonymousClientConnection {
 
     #[allow(dead_code)]
     /// Check if interested in a user and send notification
-    pub async fn are_you_interested(self: Arc<Self>, user_id: i64) {
+    pub async fn are_you_interested(self: Arc<Self>, user_id: i64, user_status: &str) {
         let interested_guard = self.clone().get_interested_users().await;
         if interested_guard.contains(&user_id) {
+            let status = if user_status == "user_invisible" {
+                "user_offline"
+            } else {
+                user_status
+            };
             let notification = CommunicationValue::new(CommunicationType::client_changed)
                 .add_data(DataTypes::user_id, DataValue::Str(user_id.to_string()))
-                .add_data(DataTypes::user_state, DataValue::Str("online".to_string()));
+                .add_data(DataTypes::user_state, DataValue::Str(status.to_string()));
 
             self.send_message(&notification).await;
         }

@@ -719,11 +719,13 @@ impl OmegaConnection {
         let msg_type = match state {
             UserStatus::iota_offline => CommunicationType::user_disconnected,
             UserStatus::user_offline => CommunicationType::user_disconnected,
+            UserStatus::user_invisible => CommunicationType::user_disconnected,
             _ => CommunicationType::user_connected,
         };
 
         let cv = CommunicationValue::new(msg_type)
-            .add_data(DataTypes::user_id, DataValue::Number(user_id));
+            .add_data(DataTypes::user_id, DataValue::Number(user_id))
+            .add_data(DataTypes::user_state, DataValue::Str(state.to_string()));
         OMEGA_CONNECTION.send_message(&cv).await;
     }
 
