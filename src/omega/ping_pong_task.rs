@@ -1,6 +1,6 @@
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::time::Duration;
 use tokio::time::Instant;
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
 
 use crate::omega::omega_connection::OmegaConnection;
 
@@ -8,7 +8,7 @@ const PING_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl OmegaConnection {
     pub async fn send_ping(&self) {
-        let id = rand_u32();
+        let id = rand::random::<u32>();
         let send_time = Instant::now();
 
         let mut message_send_times = self.message_send_times.lock().await;
@@ -19,11 +19,11 @@ impl OmegaConnection {
     }
 
     pub async fn send_ping_message(&self, id: u32) {
-        let ping_message = CommunicationValue::new(CommunicationType::ping)
+        let ping_message = CommunicationValue::new(CommunicationType::Ping)
             .with_id(id)
             .add_data(
-                DataTypes::last_ping,
-                DataValue::Number(self.last_ping.lock().await.unwrap()),
+                DataType::LastPing,
+                DataValue::SignedNumber(self.last_ping.lock().await.unwrap()),
             );
 
         self.send_message(&ping_message).await;

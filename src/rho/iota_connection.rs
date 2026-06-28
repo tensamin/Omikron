@@ -8,16 +8,18 @@ use crate::omega::omega_connection::get_omega_connection;
 use crate::rho::connection::GeneralConnection;
 use crate::util::logger::PrintType;
 use dashmap::DashMap;
+use mtp::codec::CommunicationType;
+use mtp::codec::CommunicationValue;
+use mtp::codec::DataType;
+use mtp::codec::DataTypeId;
+use mtp::codec::DataValue;
+use mtp::codec::TypeMap;
+use mtp::transport::Receiver;
+use mtp::transport::Sender;
 use std::collections::BTreeMap;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
-use ttp_core::CommunicationType;
-use ttp_core::CommunicationValue;
-use ttp_core::DataTypes;
-use ttp_core::DataValue;
-use ttp_native::Receiver;
-use ttp_native::Sender;
 use x448::PublicKey;
 
 use super::{rho_connection::RhoConnection, rho_manager};
@@ -26,6 +28,7 @@ use crate::omega::omega_connection::OmegaConnection;
 #[allow(dead_code)]
 pub struct IotaConnection {
     pub iota_id: u64,
+    pub client_version: String,
     pub sender: Arc<Sender>,
     pub receiver: Arc<Receiver>,
     pub user_ids: Arc<RwLock<Vec<u64>>>,
@@ -46,6 +49,7 @@ impl IotaConnection {
             sender: general.sender.clone(),
             receiver: general.receiver.clone(),
             iota_id: iota_id,
+            client_version: general.client_version.read().await.clone(),
             waiting_tasks: DashMap::new(),
         })
     }
@@ -141,7 +145,7 @@ impl IotaConnection {
 
     /// Send a CommunicationValue to the Iota
     pub async fn send_message(&self, cv: &CommunicationValue) {
-        if !cv.is_type(CommunicationType::pong) {
+        if !cv.is_type(CommunicationType::Pong) {
             log_cv_out!(PrintType::Iota, cv);
         }
         if let Err(e) = self.sender.send(&cv).await {
@@ -164,7 +168,7 @@ impl IotaConnection {
         }
 
         // Handle ping
-        if cv.is_type(CommunicationType::ping) || cv.is_type(CommunicationType::pong) {
+        if cv.is_type(CommunicationType::Ping) || cv.is_type(CommunicationType::Pong) {
             self.handle_ping(cv).await;
             return;
         }
@@ -172,7 +176,7 @@ impl IotaConnection {
         log_cv_in!(PrintType::Iota, cv);
 
         // Handle GET_CHATS
-        if cv.is_type(CommunicationType::get_chats) {
+        if cv.is_type(CommunicationType::GetChats) {
             self.handle_get_chats(cv).await;
             return;
         }
@@ -180,14 +184,14 @@ impl IotaConnection {
         // Handle forwarding to other Iotas or clients
         let receiver_id = cv.get_receiver();
         if (receiver_id != 0 && !self.get_user_ids().await.contains(&(receiver_id as u64)))
-            || cv.is_type(CommunicationType::message_other_iota)
-            || cv.is_type(CommunicationType::send_chat)
+            || cv.is_type(CommunicationType::MessageOtherIota)
+            || cv.is_type(CommunicationType::SendChat)
         {
             self.handle_forward_message(cv).await;
             return;
         }
 
-        if cv.is_type(CommunicationType::complete_register_user) {
+        if cv.is_type(CommunicationType::CompleteRegisterUser) {
             let response_cv = get_omega_connection()
                 .await_response(
                     &cv.clone().with_sender(self.iota_id),
@@ -195,8 +199,8 @@ impl IotaConnection {
                 )
                 .await;
             if let Ok(response_cv) = response_cv {
-                if response_cv.is_type(CommunicationType::success) {
-                    if let Some(user_id) = cv.get_data(DataTypes::user_id).as_number() {
+                if response_cv.is_type(CommunicationType::Success) {
+                    if let Some(user_id) = cv.get_data(DataType::UserId).as_number() {
                         self.add_user_id(user_id as u64).await;
                     }
                 }
@@ -205,12 +209,12 @@ impl IotaConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::change_iota_data)
-            || cv.is_type(CommunicationType::push_notification)
-            || cv.is_type(CommunicationType::get_user_data)
-            || cv.is_type(CommunicationType::get_iota_data)
-            || cv.is_type(CommunicationType::get_register)
-            || cv.is_type(CommunicationType::delete_iota)
+        if cv.is_type(CommunicationType::ChangeIotaData)
+            || cv.is_type(CommunicationType::PushNotification)
+            || cv.is_type(CommunicationType::GetUserData)
+            || cv.is_type(CommunicationType::GetIotaData)
+            || cv.is_type(CommunicationType::GetRegister)
+            || cv.is_type(CommunicationType::DeleteIota)
         {
             let sender = self.get_iota_id().await;
 
@@ -243,7 +247,7 @@ impl IotaConnection {
     }
     /// Handle ping message
     async fn handle_ping(&self, cv: CommunicationValue) {
-        if let DataValue::Number(last_ping) = cv.get_data(DataTypes::last_ping) {
+        if let DataValue::SignedNumber(last_ping) = cv.get_data(DataType::LastPing) {
             if let Ok(ping_val) = last_ping.to_string().parse::<i64>() {
                 let mut ping_guard = self.ping.write().await;
                 *ping_guard = ping_val;
@@ -256,13 +260,21 @@ impl IotaConnection {
             HashMap::new()
         };
 
-        let pings: Vec<(DataTypes, DataValue)> = client_pings
+        let tm = TypeMap::latest();
+        let pings: Vec<DataValue> = client_pings
             .into_iter()
-            .map(|(k, v)| (DataTypes::parse(k), DataValue::Number(v)))
+            .map(|(k, v)| {
+                let mut map = BTreeMap::new();
+                if let Ok(uid) = k.parse::<i128>() {
+                    map.insert(DataType::UserId.to_id(&tm), DataValue::SignedNumber(uid));
+                }
+                map.insert(DataType::LastPing.to_id(&tm), DataValue::SignedNumber(v.into()));
+                DataValue::container_from_map(&map)
+            })
             .collect();
-        let response = CommunicationValue::new(CommunicationType::pong)
+        let response = CommunicationValue::new(CommunicationType::Pong)
             .with_id(cv.get_id())
-            .add_data(DataTypes::ping_clients, DataValue::Container(pings));
+            .add_typed_default(DataType::PingClients, DataValue::Array(pings));
 
         self.send_message(&response).await;
     }
@@ -288,7 +300,7 @@ impl IotaConnection {
             if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id as i64).await {
                 target_rho.message_to_iota(cv).await;
             } else {
-                let error = CommunicationValue::new(CommunicationType::error_no_iota)
+                let error = CommunicationValue::new(CommunicationType::ErrorNoIota)
                     .with_id(cv.get_id())
                     .with_sender(cv.get_sender());
                 self.send_message(&error).await;
@@ -303,8 +315,8 @@ impl IotaConnection {
             );
 
             self.send_message(
-                &CommunicationValue::new(CommunicationType::error_invalid_user_id).add_data(
-                    DataTypes::error_type,
+                &CommunicationValue::new(CommunicationType::ErrorInvalidUserId).add_typed_default(
+                    DataType::ErrorType,
                     DataValue::Str(
                         "You are sending to another User without authority.".to_string(),
                     ),
@@ -330,6 +342,7 @@ impl IotaConnection {
         }
 
         let mut interested_ids: Vec<i64> = Vec::new();
+        let tm = TypeMap::latest();
 
         // ============================
         // Load Calls
@@ -353,20 +366,21 @@ impl IotaConnection {
                 // List of all members in the call
                 let member_ids: Vec<DataValue> = members
                     .iter()
-                    .map(|m| DataValue::Number(m.user_id as i64))
+                    .map(|m| DataValue::SignedNumber(m.user_id.into()))
                     .collect();
 
                 // Build base call container
-                let mut base_call_map: BTreeMap<DataTypes, DataValue> = BTreeMap::new();
-                base_call_map.insert(DataTypes::call_id, DataValue::Str(call.call_id.to_string()));
-                base_call_map.insert(DataTypes::call_members, DataValue::Array(member_ids));
+                let mut base_call_map: BTreeMap<DataTypeId, DataValue> = BTreeMap::new();
+                base_call_map.insert(DataType::CallId.to_id(&tm), DataValue::Str(call.call_id.to_string()));
+                base_call_map.insert(DataType::CallMembers.to_id(&tm), DataValue::Array(member_ids));
 
                 if timeout > 0 {
-                    base_call_map.insert(DataTypes::timeout, DataValue::Number(timeout as i64));
+                    base_call_map
+                        .insert(DataType::Timeout.to_id(&tm), DataValue::SignedNumber(timeout.into()));
                 }
 
                 if admin {
-                    base_call_map.insert(DataTypes::has_admin, DataValue::Bool(true));
+                    base_call_map.insert(DataType::HasAdmin.to_id(&tm), DataValue::Bool(true));
                 }
 
                 // Add to global calls (without contact-specific secret)
@@ -384,7 +398,7 @@ impl IotaConnection {
                     // Add secret if it exists for this pairing
                     if let Some(secret) = call.secrets.read().await.get(&(member_id, user_id)) {
                         contact_call_map
-                            .insert(DataTypes::call_secret, DataValue::Str(secret.clone()));
+                            .insert(DataType::CallSecret.to_id(&tm), DataValue::Str(secret.clone()));
                     }
 
                     invites
@@ -399,27 +413,27 @@ impl IotaConnection {
         // Enrich Contacts
         // ============================
         let enriched_contacts = if empty {
-            match cv.get_data(DataTypes::user_ids) {
+            match cv.get_data(DataType::UserIds) {
                 DataValue::Array(arr) => DataValue::Array(arr.clone()),
                 _ => DataValue::Array(vec![]),
             }
         } else {
             let mut enriched: Vec<DataValue> = Vec::new();
 
-            if let DataValue::Array(users) = cv.get_data(DataTypes::user_ids) {
+            if let DataValue::Array(users) = cv.get_data(DataType::UserIds) {
                 for user_val in users {
                     if let DataValue::Container(entries) = user_val {
-                        let mut user_map: BTreeMap<DataTypes, DataValue> =
+                        let mut user_map: BTreeMap<DataTypeId, DataValue> =
                             entries.iter().cloned().collect();
 
-                        if let Some(DataValue::Number(id)) = user_map.get(&DataTypes::user_id) {
-                            interested_ids.push(*id);
+                        if let Some(DataValue::SignedNumber(id)) = user_map.get(&DataType::UserId.to_id(&tm)) {
+                            interested_ids.push(*id as i64);
 
-                            if let Some(call_list) = invites.get(id)
+                            if let Some(call_list) = invites.get(&(*id as i64))
                                 && !call_list.is_empty()
                             {
                                 user_map
-                                    .insert(DataTypes::calls, DataValue::Array(call_list.clone()));
+                                    .insert(DataType::Calls.to_id(&tm), DataValue::Array(call_list.clone()));
                             }
                         }
 
@@ -449,8 +463,8 @@ impl IotaConnection {
         // Forward to client
         // ============================
         self.forward_to_client(
-            cv.add_data(DataTypes::user_ids, enriched_contacts)
-                .add_data(DataTypes::calls, DataValue::Array(global_calls)),
+            cv.add_typed_default(DataType::UserIds, enriched_contacts)
+                .add_typed_default(DataType::Calls, DataValue::Array(global_calls)),
         )
         .await;
     }

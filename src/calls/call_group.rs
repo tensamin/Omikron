@@ -1,5 +1,5 @@
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use serde_json::Map;
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 
 use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
@@ -111,15 +111,15 @@ impl CallGroup {
             );
             let response_cv = get_omega_connection()
                 .await_response(
-                    &CommunicationValue::new(CommunicationType::shorten_link)
-                        .add_data(DataTypes::link, DataValue::Str(long_link)),
+                    &CommunicationValue::new(CommunicationType::ShortenLink)
+                        .add_typed_default(DataType::Link, DataValue::Str(long_link)),
                     Some(Duration::from_secs(20)),
                 )
                 .await;
             if let Ok(response) = response_cv {
                 *self.short_link.write().await = Some(
                     response
-                        .get_data(DataTypes::link)
+                        .get_data(DataType::Link)
                         .as_str()
                         .unwrap()
                         .to_string(),

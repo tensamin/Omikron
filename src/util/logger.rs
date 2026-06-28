@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     sync::{OnceLock, mpsc},
@@ -8,7 +7,7 @@ use std::{
 };
 
 use ansi_term::Color;
-use ttp_core::{CommunicationValue, DataTypes, DataValue};
+use mtp::codec::{CommunicationValue, DataTypeId, DataValue, Version};
 
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 
@@ -177,17 +176,19 @@ pub fn format_cv(cv: &CommunicationValue) -> String {
     let comm_type = cv.get_type().to_string();
     parts.push(format!("{}", comm_type));
 
-    let data: &BTreeMap<DataTypes, DataValue> = cv.get_data_container();
+    let data = cv.data();
 
-    let formated_data =
-        format_data_container(data.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+    let formated_data = format_data_container(
+        data.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        Version(1, 0),
+    );
 
     parts.push(format!("{}", formated_data));
 
     parts.join(": ")
 }
 
-fn format_data_container(data: Vec<(DataTypes, DataValue)>) -> String {
+fn format_data_container(data: Vec<(DataTypeId, DataValue)>, version: Version) -> String {
     let parts: Vec<String> = data
         .into_iter()
         .map(|(key, value)| {
@@ -197,12 +198,12 @@ fn format_data_container(data: Vec<(DataTypes, DataValue)>) -> String {
                 DataValue::Str(s) => format!("{}=\"{}\"", key_str, s),
 
                 DataValue::Container(inner) => {
-                    let inner_formatted = format_data_container(inner);
+                    let inner_formatted = format_data_container(inner, version.clone());
                     format!("{}={{ {} }}", key_str, inner_formatted)
                 }
 
                 DataValue::Array(arr) => {
-                    let arr_formatted = format_array(arr);
+                    let arr_formatted = format_array(arr, version.clone());
                     format!("{}=[{}]", key_str, arr_formatted)
                 }
 
@@ -211,7 +212,7 @@ fn format_data_container(data: Vec<(DataTypes, DataValue)>) -> String {
                 DataValue::BoolTrue => format!("{}=true", key_str),
                 DataValue::BoolFalse => format!("{}=false", key_str),
 
-                DataValue::Number(num) => format!("{}={}", key_str, num),
+                DataValue::SignedNumber(num) => format!("{}={}", key_str, num),
 
                 _ => "".to_string(),
             }
@@ -221,19 +222,19 @@ fn format_data_container(data: Vec<(DataTypes, DataValue)>) -> String {
     parts.join(", ")
 }
 
-fn format_array(arr: Vec<DataValue>) -> String {
+fn format_array(arr: Vec<DataValue>, version: Version) -> String {
     let parts: Vec<String> = arr
         .into_iter()
         .map(|value| match value {
             DataValue::Str(s) => format!("\"{}\"", s),
 
             DataValue::Container(inner) => {
-                let inner_formatted = format_data_container(inner);
+                let inner_formatted = format_data_container(inner, version.clone());
                 format!("{{ {} }}", inner_formatted)
             }
 
             DataValue::Array(inner_arr) => {
-                let formatted = format_array(inner_arr);
+                let formatted = format_array(inner_arr, version.clone());
                 format!("[{}]", formatted)
             }
 
@@ -242,7 +243,7 @@ fn format_array(arr: Vec<DataValue>) -> String {
             DataValue::BoolTrue => "true".to_string(),
             DataValue::BoolFalse => "false".to_string(),
 
-            DataValue::Number(num) => num.to_string(),
+            DataValue::SignedNumber(num) => num.to_string(),
 
             _ => String::new(),
         })

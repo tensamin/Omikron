@@ -2,10 +2,10 @@ use super::{client_connection::ClientConnection, iota_connection::IotaConnection
 
 use crate::omega::omega_connection::OmegaConnection;
 use crate::{data::user::UserStatus, rho::app_connection::AppConnection};
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
 use uuid::Uuid;
 
 pub struct RhoConnection {
@@ -125,8 +125,8 @@ impl RhoConnection {
         let user_id = connection.user_id as i64;
         let session_id = connection.session_id as i64;
 
-        let notification = CommunicationValue::new(CommunicationType::client_connected)
-            .add_data(DataTypes::user_id, DataValue::Number(user_id));
+        let notification = CommunicationValue::new(CommunicationType::ClientConnected)
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
 
         self.iota_connection.send_message(&notification).await;
 
@@ -216,14 +216,14 @@ impl RhoConnection {
     pub async fn message_to_client(&self, cv: CommunicationValue) {
         let connections = self.client_connections.read().await;
         let receiver_id = cv.get_receiver();
-        let session_id = cv.get_data(DataTypes::session_id).as_number();
+        let session_id = cv.get_data(DataType::SessionId).as_number();
 
         for connection in connections.iter() {
             if connection.user_id != receiver_id {
                 continue;
             }
             if let Some(session_id) = session_id {
-                if connection.session_id as i64 != session_id {
+                if connection.session_id as i128 != session_id {
                     continue;
                 }
             }

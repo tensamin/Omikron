@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ttp-core = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-core" }
-ttp-native = { git = "https://git.methanium.net/Tensamin/TTP.git", package = "ttp-native" }
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git", features = ["host", "client"] }
 
 ansi_term = "*"
 uuid = { version = "*", features = ["v4"] }

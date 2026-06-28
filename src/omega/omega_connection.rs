@@ -9,6 +9,8 @@ use crate::{
     },
 };
 use dashmap::DashMap;
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use mtp::transport::{Policy, Receiver, SendMode, Sender};
 use once_cell::sync::Lazy;
 use std::{collections::HashMap, env, sync::Arc, time::Duration};
 use tokio::{
@@ -16,8 +18,6 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, sleep},
 };
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue, rand_u32};
-use ttp_native::{Policy, Receiver, SendMode, Sender};
 use uuid::Uuid;
 
 // ============================================================================
@@ -264,7 +264,7 @@ impl OmegaConnection {
 
         let addr_str = format!("https://{}:{}", self.host, self.port);
 
-        let (sender, mut receiver) = ttp_native::client::connect(
+        let (sender, mut receiver) = mtp::transport::client::connect(
             &addr_str,
             None,
             Policy {
@@ -347,22 +347,22 @@ impl OmegaConnection {
     // -------------------------------------------------------------------------
 
     async fn send_identification(&self) {
-        let id = rand_u32();
+        let id = rand::random::<u32>();
 
         let omikron_id = env::var("ID")
             .unwrap_or("0".to_string())
             .parse::<i64>()
             .unwrap_or(0);
 
-        let identify_msg = CommunicationValue::new(CommunicationType::identification)
+        let identify_msg = CommunicationValue::new(CommunicationType::Identification)
             .with_id(id)
-            .add_data(DataTypes::omikron_id, DataValue::Number(omikron_id));
+            .add_typed_default(DataType::OmikronId, DataValue::SignedNumber(omikron_id.into()));
 
         WAITING_TASKS.insert(
             id,
             WaitingTask {
                 task: Box::new(|selfc, cv| {
-                    if cv.is_type(CommunicationType::error_not_found) {
+                    if cv.is_type(CommunicationType::ErrorNotFound) {
                         log_err!(
                             0,
                             PrintType::Omega,
@@ -370,7 +370,7 @@ impl OmegaConnection {
                         );
                         return false;
                     }
-                    if !cv.is_type(CommunicationType::challenge) {
+                    if !cv.is_type(CommunicationType::Challenge) {
                         return false;
                     }
 
@@ -390,12 +390,12 @@ impl OmegaConnection {
 
     async fn handle_challenge(&self, cv: CommunicationValue) -> Result<(), String> {
         let challenge = cv
-            .get_data(DataTypes::challenge)
+            .get_data(DataType::Challenge)
             .as_str()
             .ok_or("Challenge not found")?;
 
         let server_pub_key = cv
-            .get_data(DataTypes::public_key)
+            .get_data(DataType::PublicKey)
             .as_str()
             .ok_or("Public key not found")?;
 
@@ -406,9 +406,9 @@ impl OmegaConnection {
         )
         .map_err(|e| format!("Decryption failed: {:?}", e))?;
 
-        let response_msg = CommunicationValue::new(CommunicationType::challenge_response)
+        let response_msg = CommunicationValue::new(CommunicationType::ChallengeResponse)
             .with_id(cv.get_id())
-            .add_data(DataTypes::challenge, DataValue::Str(decrypted_challenge));
+            .add_typed_default(DataType::Challenge, DataValue::Str(decrypted_challenge));
 
         let response_id = response_msg.get_id();
 
@@ -416,13 +416,13 @@ impl OmegaConnection {
             response_id,
             WaitingTask {
                 task: Box::new(|selfc, final_cv| {
-                    if !final_cv.is_type(CommunicationType::identification_response) {
+                    if !final_cv.is_type(CommunicationType::IdentificationResponse) {
                         log_err!(0, PrintType::Omega, "Expected identification_response");
                         return false;
                     }
 
                     let accepted = final_cv
-                        .get_data(DataTypes::accepted)
+                        .get_data(DataType::Accepted)
                         .as_bool()
                         .unwrap_or(false);
 
@@ -459,23 +459,25 @@ impl OmegaConnection {
         let rho_connections_reader = RHO_CONNECTIONS.read().await;
 
         for iota_id in rho_connections_reader.keys() {
-            connected_iota_ids.push(DataValue::Number(*iota_id));
+            connected_iota_ids.push(DataValue::SignedNumber((*iota_id).into()));
         }
 
         for rho in rho_connections_reader.values() {
             for client_conn in rho.get_client_connections().await {
-                connected_user_ids.push(DataValue::Number(client_conn.get_user_id().await as i64));
+                connected_user_ids.push(DataValue::SignedNumber(
+                    client_conn.get_user_id().await.into(),
+                ));
             }
         }
 
         drop(rho_connections_reader);
 
-        let sync_msg = CommunicationValue::new(CommunicationType::sync_client_iota_status)
-            .add_data(DataTypes::iota_ids, DataValue::Array(connected_iota_ids))
-            .add_data(DataTypes::user_ids, DataValue::Array(connected_user_ids))
-            .add_data(
-                DataTypes::rho_connections,
-                DataValue::Number(connection_count().await as i64),
+        let sync_msg = CommunicationValue::new(CommunicationType::SyncClientIotaStatus)
+            .add_typed_default(DataType::IotaIds, DataValue::Array(connected_iota_ids))
+            .add_typed_default(DataType::UserIds, DataValue::Array(connected_user_ids))
+            .add_typed_default(
+                DataType::RhoConnections,
+                DataValue::SignedNumber(connection_count().await as i128),
             );
 
         self.send_message(&sync_msg).await;
@@ -488,7 +490,7 @@ impl OmegaConnection {
     async fn read_loop(
         self: Arc<Self>,
         receiver: &mut Receiver,
-        sender_handle: Arc<ttp_native::ConnectionHandle>,
+        sender_handle: Arc<mtp::transport::ConnectionHandle>,
     ) {
         // Monitor both receiver and sender handle for close
         let mut close_rx = sender_handle.subscribe_close();
@@ -498,11 +500,11 @@ impl OmegaConnection {
                 result = receiver.receive() => {
                     match result {
                         Ok(cv) => {
-                            if !cv.is_type(CommunicationType::pong) && !cv.is_type(CommunicationType::ping) {
+                            if !cv.is_type(CommunicationType::Pong) && !cv.is_type(CommunicationType::Ping) {
                                 log_cv_in!(PrintType::Omega, &cv);
                             }
 
-                            if cv.is_type(CommunicationType::pong) || cv.is_type(CommunicationType::ping) {
+                            if cv.is_type(CommunicationType::Pong) || cv.is_type(CommunicationType::Ping) {
                                 self.handle_pong(&cv).await;
                                 continue;
                             }
@@ -514,17 +516,17 @@ impl OmegaConnection {
                                 }
                             }
 
-                            if cv.is_type(CommunicationType::iota_user_data) {
-                                if let DataValue::Array(users) = cv.get_data(DataTypes::user_ids) {
+                            if cv.is_type(CommunicationType::IotaUserData) {
+                                if let DataValue::Array(users) = cv.get_data(DataType::UserIds) {
                                     let mut user_ids: Vec<u64> = Vec::new();
                                     for value in users {
-                                        if let DataValue::Number(user_id) = value {
+                                        if let DataValue::SignedNumber(user_id) = value {
                                             user_ids.push(*user_id as u64);
                                         }
                                     }
                                     let connections = crate::rho::rho_manager::RHO_CONNECTIONS.read().await;
-                                    if let Some(iota_id) = cv.get_data(DataTypes::iota_id).as_number() {
-                                        if let Some(rho) = connections.get(&iota_id) {
+                                    if let Some(iota_id) = cv.get_data(DataType::IotaId).as_number() {
+                                        if let Some(rho) = connections.get(&(iota_id as i64)) {
                                             rho.get_iota_connection().set_user_ids(user_ids).await;
                                         }
                                     } else {
@@ -578,13 +580,13 @@ impl OmegaConnection {
     }
 
     async fn send_ping(&self) {
-        let ping = CommunicationValue::new(CommunicationType::ping).add_data(
-            DataTypes::send_time,
-            DataValue::Number(
+        let ping = CommunicationValue::new(CommunicationType::Ping).add_typed_default(
+            DataType::SendTime,
+            DataValue::SignedNumber(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs() as i64,
+                    .as_secs() as i128,
             ),
         );
         self.send_message(&ping).await;
@@ -592,16 +594,16 @@ impl OmegaConnection {
 
     async fn handle_pong(&self, cv: &CommunicationValue) {
         let timestamp = cv
-            .get_data(DataTypes::send_time)
+            .get_data(DataType::SendTime)
             .as_number()
             .unwrap_or_else(|| {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs() as i64
+                    .as_secs() as i128
             });
 
-        *self.last_ping.lock().await = timestamp;
+        *self.last_ping.lock().await = timestamp.try_into().unwrap();
     }
 
     // -------------------------------------------------------------------------
@@ -609,7 +611,7 @@ impl OmegaConnection {
     // -------------------------------------------------------------------------
 
     pub async fn send_message(&self, cv: &CommunicationValue) {
-        if !cv.is_type(CommunicationType::pong) && !cv.is_type(CommunicationType::ping) {
+        if !cv.is_type(CommunicationType::Pong) && !cv.is_type(CommunicationType::Ping) {
             log_cv_out!(PrintType::Omega, &cv);
         }
 
@@ -710,30 +712,33 @@ impl OmegaConnection {
 
     #[allow(dead_code)]
     pub async fn close_iota(iota_id: i64) {
-        let cv = CommunicationValue::new(CommunicationType::iota_disconnected)
-            .add_data(DataTypes::iota_id, DataValue::Number(iota_id));
+        let cv = CommunicationValue::new(CommunicationType::IotaDisconnected)
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()));
         OMEGA_CONNECTION.send_message(&cv).await;
     }
 
     pub async fn client_changed(_iota_id: i64, user_id: i64, state: UserStatus) {
         let msg_type = match state {
-            UserStatus::iota_offline => CommunicationType::user_disconnected,
-            UserStatus::user_offline => CommunicationType::user_disconnected,
-            UserStatus::user_invisible => CommunicationType::user_disconnected,
-            _ => CommunicationType::user_connected,
+            UserStatus::iota_offline => CommunicationType::UserDisconnected,
+            UserStatus::user_offline => CommunicationType::UserDisconnected,
+            UserStatus::user_invisible => CommunicationType::UserDisconnected,
+            _ => CommunicationType::UserConnected,
         };
 
         let cv = CommunicationValue::new(msg_type)
-            .add_data(DataTypes::user_id, DataValue::Number(user_id))
-            .add_data(DataTypes::user_state, DataValue::Str(state.to_string()));
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
+            .add_typed_default(DataType::UserState, DataValue::Str(state.to_string()));
         OMEGA_CONNECTION.send_message(&cv).await;
     }
 
     pub async fn user_states(user_id: i64, user_ids: Vec<i64>) {
-        let user_ids = user_ids.iter().map(|v| DataValue::Number(*v)).collect();
+        let user_ids = user_ids
+            .iter()
+            .map(|v| DataValue::SignedNumber((*v).into()))
+            .collect();
 
-        let cv = CommunicationValue::new(CommunicationType::get_states)
-            .add_data(DataTypes::user_ids, DataValue::Array(user_ids));
+        let cv = CommunicationValue::new(CommunicationType::GetStates)
+            .add_typed_default(DataType::UserIds, DataValue::Array(user_ids));
         let msg_id = cv.get_id();
 
         WAITING_TASKS.insert(

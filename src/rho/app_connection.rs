@@ -4,17 +4,18 @@ use crate::rho::connection::GeneralConnection;
 use crate::rho::{rho_connection::RhoConnection, rho_manager};
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err, log_in, log_out};
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use mtp::transport::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use ttp_core::{CommunicationType, CommunicationValue, DataTypes, DataValue};
-use ttp_native::{Receiver, Sender};
 use uuid::Uuid;
 
 pub struct AppConnection {
     pub user_id: u64,
     pub app_identifier: String,
     pub app_session: Uuid,
+    pub client_version: String,
 
     pub sender: Arc<Sender>,
     pub receiver: Arc<Receiver>,
@@ -36,6 +37,7 @@ impl AppConnection {
             user_id: user_id,
             app_identifier: general.app_identifier.read().await.clone().unwrap(),
             app_session: general.app_session.read().await.clone().unwrap(),
+            client_version: general.client_version.read().await.clone(),
         })
     }
     pub fn start(self: Arc<Self>) {
@@ -52,7 +54,7 @@ impl AppConnection {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if self_clone2.get_rho_connection().await.is_none() {
                 self_clone2
-                    .send_error_response(0, CommunicationType::error_no_iota)
+                    .send_error_response(0, CommunicationType::ErrorNoIota)
                     .await;
             }
         });
@@ -84,7 +86,7 @@ impl AppConnection {
             );
             return;
         }
-        if !cv.is_type(CommunicationType::pong) && !cv.is_type(CommunicationType::ping) {
+        if !cv.is_type(CommunicationType::Pong) && !cv.is_type(CommunicationType::Ping) {
             log_cv_out!(PrintType::App, &cv);
         }
         let _ = self.sender.send(&cv).await;
@@ -93,41 +95,41 @@ impl AppConnection {
     /// Handle incoming message from app
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
         tokio::spawn(async move {
-            if cv.is_type(CommunicationType::ping) {
+            if cv.is_type(CommunicationType::Ping) {
                 self.handle_ping(cv).await;
                 return;
             }
             log_cv_in!(PrintType::App, cv);
 
-            if cv.is_type(CommunicationType::get_user_data) {
+            if cv.is_type(CommunicationType::GetUserData) {
                 if let Some(anonymous) = {
-                    if let Some(user_id) = cv.get_data(DataTypes::user_id).as_number() {
+                    if let Some(user_id) = cv.get_data(DataType::UserId).as_number() {
                         anonymous_manager::get_anonymous_user(user_id as u64).await
-                    } else if let Some(username) = cv.get_data(DataTypes::username).as_str() {
+                    } else if let Some(username) = cv.get_data(DataType::Username).as_str() {
                         anonymous_manager::get_anonymous_user_by_name(username.to_string()).await
                     } else {
                         None
                     }
                 } {
-                    let response = CommunicationValue::new(CommunicationType::get_user_data)
+                    let response = CommunicationValue::new(CommunicationType::GetUserData)
                         .with_id(cv.get_id())
-                        .add_data(
-                            DataTypes::username,
+                        .add_typed_default(
+                            DataType::Username,
                             DataValue::Str(anonymous.get_user_name().await),
                         )
-                        .add_data(
-                            DataTypes::user_id,
-                            DataValue::Number(anonymous.get_user_id() as i64),
+                        .add_typed_default(
+                            DataType::UserId,
+                            DataValue::SignedNumber(anonymous.get_user_id().into()),
                         )
-                        .add_data(
-                            DataTypes::display,
+                        .add_typed_default(
+                            DataType::Display,
                             DataValue::Str(anonymous.get_display_name().await),
                         )
-                        .add_data(
-                            DataTypes::avatar,
+                        .add_typed_default(
+                            DataType::Avatar,
                             DataValue::Str(anonymous.get_avatar().await),
                         )
-                        .add_data(DataTypes::user_state, DataValue::Str("online".to_string()));
+                        .add_typed_default(DataType::UserState, DataValue::Str("online".to_string()));
 
                     self.send_message(&response).await;
 
@@ -135,8 +137,8 @@ impl AppConnection {
                 }
             }
 
-            if cv.is_type(CommunicationType::get_user_data)
-                || cv.is_type(CommunicationType::get_iota_data)
+            if cv.is_type(CommunicationType::GetUserData)
+                || cv.is_type(CommunicationType::GetIotaData)
             {
                 let sender = self.get_user_id().await;
                 self.handle_omega_forward(cv.with_sender(sender as u64))
@@ -162,13 +164,13 @@ impl AppConnection {
     /// Handle ping message
     async fn handle_ping(self: Arc<Self>, cv: CommunicationValue) {
         // Update our ping if provided
-        if let DataValue::Number(last_ping) = cv.get_data(DataTypes::last_ping) {
+        if let DataValue::SignedNumber(last_ping) = cv.get_data(DataType::LastPing) {
             let current = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis();
             let mut ping_guard = self.ping.write().await;
-            *ping_guard = current as i64 - last_ping;
+            *ping_guard = (current as i128 - *last_ping) as i64;
         }
 
         // Get Iota ping from RhoConnection
@@ -179,9 +181,9 @@ impl AppConnection {
         };
 
         // Send pong response
-        let response = CommunicationValue::new(CommunicationType::pong)
+        let response = CommunicationValue::new(CommunicationType::Pong)
             .with_id(cv.get_id())
-            .add_data(DataTypes::ping_iota, DataValue::Number(iota_ping));
+            .add_typed_default(DataType::PingIota, DataValue::SignedNumber(iota_ping.into()));
 
         self.send_message(&response).await;
     }
@@ -202,14 +204,11 @@ impl AppConnection {
             cv.get_receiver()
         );
 
-        if cv.is_type(CommunicationType::add_conversation)
-            && cv
-                .get_data(DataTypes::chat_partner_id)
-                .as_number()
-                .is_none()
+        if cv.is_type(CommunicationType::AddConversation)
+            && cv.get_data(DataType::ChatPartnerId).as_number().is_none()
         {
             let chat_partner_name = cv
-                .get_data(DataTypes::chat_partner_name)
+                .get_data(DataType::ChatPartnerName)
                 .as_str()
                 .unwrap_or("")
                 .to_string();
@@ -218,17 +217,17 @@ impl AppConnection {
                 .await
                 .is_some()
             {
-                self.send_error_response(cv.get_id(), CommunicationType::error_anonymous)
+                self.send_error_response(cv.get_id(), CommunicationType::ErrorAnonymous)
                     .await;
                 return;
             }
 
             let load_uuid_response = get_omega_connection()
                 .await_response(
-                    &CommunicationValue::new(CommunicationType::get_user_data)
+                    &CommunicationValue::new(CommunicationType::GetUserData)
                         .with_id(cv.clone().get_id())
-                        .add_data(
-                            DataTypes::username,
+                        .add_typed_default(
+                            DataType::Username,
                             DataValue::Str(chat_partner_name.clone()),
                         ),
                     Some(Duration::from_secs(20)),
@@ -236,7 +235,7 @@ impl AppConnection {
                 .await;
             let chat_partner_id = {
                 if let Ok(load_uuid_response) = load_uuid_response {
-                    load_uuid_response.get_data(DataTypes::user_id).clone()
+                    load_uuid_response.get_data(DataType::UserId).clone()
                 } else {
                     DataValue::Null
                 }
@@ -255,7 +254,7 @@ impl AppConnection {
 
                 let updated_cv = cv
                     .with_sender(sender_user_id as u64)
-                    .add_data(DataTypes::chat_partner_id, chat_partner_id);
+                    .add_typed_default(DataType::ChatPartnerId, chat_partner_id);
                 rho_conn.message_to_iota(updated_cv).await;
             } else {
                 log_err!(
@@ -293,9 +292,12 @@ impl AppConnection {
                 msg_type,
                 msg_id
             );
-            let error_cv = CommunicationValue::new(CommunicationType::error_no_iota)
+            let error_cv = CommunicationValue::new(CommunicationType::ErrorNoIota)
                 .with_id(msg_id)
-                .add_data(DataTypes::user_id, DataValue::Number(sender_user_id as i64));
+                .add_typed_default(
+                    DataType::UserId,
+                    DataValue::SignedNumber(sender_user_id.into()),
+                );
             self.send_message(&error_cv).await;
         }
     }
@@ -336,6 +338,7 @@ impl Clone for AppConnection {
             user_id: self.user_id,
             app_identifier: self.app_identifier.clone(),
             app_session: self.app_session,
+            client_version: self.client_version.clone(),
             ping: Arc::clone(&self.ping),
             pub_key: Arc::clone(&self.pub_key),
             rho_connection: Arc::clone(&self.rho_connection),
