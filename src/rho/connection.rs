@@ -5,20 +5,23 @@ use std::{collections::BTreeMap, collections::HashMap, sync::Arc, time::Duration
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine as _;
+use mtp::crypto::{
+    encrypt_for, EncryptionType, KemPublicKey, PublicKeyBundle, SignaturePqPublicKey,
+    SignaturePublicKey,
+};
+
 use crate::{
     anonymous_clients::anonymous_client_connection::AnonymousClientConnection,
     calls::call_manager,
-    get_private_key, get_public_key, log_cv_in, log_cv_out, log_err, log_in, log_out,
+    get_keyring, log_cv_in, log_cv_out, log_err, log_in, log_out,
     omega::omega_connection::get_omega_connection,
     rho::{
         app_connection::AppConnection, client_connection::ClientConnection,
         iota_connection::IotaConnection, rho_connection::RhoConnection, rho_manager,
     },
-    util::{
-        crypto_helper::{load_public_key, public_key_to_base64},
-        crypto_util::{DataFormat, SecurePayload},
-        logger::PrintType,
-    },
+    util::logger::PrintType,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,11 +149,11 @@ impl GeneralConnection {
             *self.app_session.write().await = Some(app_session_id);
             *self.connection_kind.write().await = Some(ConnectionKind::Phi);
 
-            let pub_key = match load_public_key(pub_key_str) {
-                Some(pk) => pk,
-                None => return,
+            let kem_bytes = match BASE64_STD.decode(pub_key_str) {
+                Ok(b) => b,
+                Err(_) => return,
             };
-            *self.pub_key.write().await = Some(pub_key.as_bytes().to_vec());
+            *self.pub_key.write().await = Some(kem_bytes.clone());
 
             let challenge: String = rand::thread_rng()
                 .sample_iter(&Alphanumeric)
@@ -161,18 +164,29 @@ impl GeneralConnection {
             *self.challenge.write().await = challenge.clone();
             *self.identified.write().await = true;
 
-            let encrypted_challenge =
-                SecurePayload::new(challenge.as_bytes(), DataFormat::Raw, get_private_key())
-                    .unwrap()
-                    .encrypt_x448(pub_key)
-                    .unwrap()
-                    .export(DataFormat::Base64);
+            let peer_bundle = PublicKeyBundle::new(
+                KemPublicKey::new(kem_bytes),
+                SignaturePqPublicKey::new(vec![]),
+                SignaturePublicKey::new(vec![]),
+            );
+            let encrypted_challenge = BASE64_STD.encode(
+                &encrypt_for(
+                    EncryptionType::MlKemChaCha20Poly1305,
+                    &peer_bundle,
+                    challenge.as_bytes(),
+                    b"challenge",
+                )
+                .unwrap(),
+            );
 
+            let our_pk = BASE64_STD.encode(
+                get_keyring().public_key_bundle().kem_public_key.as_bytes(),
+            );
             let response = CommunicationValue::new(CommunicationType::AppChallenge)
                 .with_id(cv.get_id())
                 .add_typed_default(
                     DataType::PublicKey,
-                    DataValue::Str(public_key_to_base64(&get_public_key())),
+                    DataValue::Str(our_pk),
                 )
                 .add_typed_default(DataType::Challenge, DataValue::Str(encrypted_challenge));
 
@@ -214,20 +228,20 @@ impl GeneralConnection {
                 .as_str()
                 .unwrap_or("");
 
-            let pub_key = match load_public_key(base64_pub) {
-                Some(pk) => pk,
-                None => {
+            let kem_bytes = match BASE64_STD.decode(base64_pub) {
+                Ok(b) => b,
+                Err(_) => {
                     log_err!(
                         *iota_id as i64,
                         PrintType::Iota,
-                        "Failed to load public key for iota_id={}",
+                        "Failed to decode public key for iota_id={}",
                         iota_id
                     );
                     return;
                 }
             };
 
-            *self.pub_key.write().await = Some(pub_key.as_bytes().to_vec());
+            *self.pub_key.write().await = Some(kem_bytes.clone());
 
             let challenge: String = rand::thread_rng()
                 .sample_iter(&Alphanumeric)
@@ -238,18 +252,29 @@ impl GeneralConnection {
             *self.challenge.write().await = challenge.clone();
             *self.identified.write().await = true;
 
-            let encrypted_challenge =
-                SecurePayload::new(challenge.as_bytes(), DataFormat::Raw, get_private_key())
-                    .unwrap()
-                    .encrypt_x448(pub_key)
-                    .unwrap()
-                    .export(DataFormat::Base64);
+            let peer_bundle = PublicKeyBundle::new(
+                KemPublicKey::new(kem_bytes),
+                SignaturePqPublicKey::new(vec![]),
+                SignaturePublicKey::new(vec![]),
+            );
+            let encrypted_challenge = BASE64_STD.encode(
+                &encrypt_for(
+                    EncryptionType::MlKemChaCha20Poly1305,
+                    &peer_bundle,
+                    challenge.as_bytes(),
+                    b"challenge",
+                )
+                .unwrap(),
+            );
 
+            let our_pk = BASE64_STD.encode(
+                get_keyring().public_key_bundle().kem_public_key.as_bytes(),
+            );
             let response = CommunicationValue::new(CommunicationType::Challenge)
                 .with_id(cv.get_id())
                 .add_typed_default(
                     DataType::PublicKey,
-                    DataValue::Str(public_key_to_base64(&get_public_key())),
+                    DataValue::Str(our_pk),
                 )
                 .add_typed_default(DataType::Challenge, DataValue::Str(encrypted_challenge));
 
@@ -306,14 +331,14 @@ impl GeneralConnection {
                     .to_string();
             }
 
-            let pub_key = match load_public_key(&base64_pub) {
-                Some(pk) => pk,
-                None => {
+            let kem_bytes = match BASE64_STD.decode(&base64_pub) {
+                Ok(b) => b,
+                Err(_) => {
                     return;
                 }
             };
 
-            *self.pub_key.write().await = Some(pub_key.as_bytes().to_vec());
+            *self.pub_key.write().await = Some(kem_bytes.clone());
 
             let challenge: String = rand::thread_rng()
                 .sample_iter(&Alphanumeric)
@@ -324,12 +349,20 @@ impl GeneralConnection {
             *self.challenge.write().await = challenge.clone();
             *self.identified.write().await = true;
 
-            let encrypted_challenge =
-                SecurePayload::new(challenge.as_bytes(), DataFormat::Raw, get_private_key())
-                    .unwrap()
-                    .encrypt_x448(pub_key)
-                    .unwrap()
-                    .export(DataFormat::Base64);
+            let peer_bundle = PublicKeyBundle::new(
+                KemPublicKey::new(kem_bytes),
+                SignaturePqPublicKey::new(vec![]),
+                SignaturePublicKey::new(vec![]),
+            );
+            let encrypted_challenge = BASE64_STD.encode(
+                &encrypt_for(
+                    EncryptionType::MlKemChaCha20Poly1305,
+                    &peer_bundle,
+                    challenge.as_bytes(),
+                    b"challenge",
+                )
+                .unwrap(),
+            );
 
             let challenge_type = if cv.is_type(CommunicationType::AppIdentification) {
                 CommunicationType::AppChallenge
@@ -337,12 +370,15 @@ impl GeneralConnection {
                 CommunicationType::Challenge
             };
 
+            let our_pk = BASE64_STD.encode(
+                get_keyring().public_key_bundle().kem_public_key.as_bytes(),
+            );
             let response = CommunicationValue::new(challenge_type)
                 .with_id(cv.get_id())
                 .with_receiver(*self.session_id.read().await)
                 .add_typed_default(
                     DataType::PublicKey,
-                    DataValue::Str(public_key_to_base64(&get_public_key())),
+                    DataValue::Str(our_pk),
                 )
                 .add_typed_default(DataType::Challenge, DataValue::Str(encrypted_challenge));
 

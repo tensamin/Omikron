@@ -11,28 +11,37 @@ use std::path::PathBuf;
 use dotenv::dotenv;
 use once_cell::sync::Lazy;
 
-pub static WORKING_DIR: Lazy<PathBuf> = Lazy::new(|| {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-});
+pub static WORKING_DIR: Lazy<PathBuf> =
+    Lazy::new(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 use rustls::crypto::aws_lc_rs::default_provider;
+
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine as _;
+use mtp::crypto::Keyring;
 
 use crate::{
     calls::call_util::garbage_collect_calls,
     omega::omega_connection::get_omega_connection,
     rho::server::start,
-    util::{
-        crypto_helper::{load_public_key, load_secret_key},
-        logger::startup,
-    },
+    util::logger::startup,
 };
 
-static PRIVATE_KEY: Lazy<String> = Lazy::new(|| env::var("PRIVATE_KEY").unwrap());
-pub fn get_private_key() -> x448::Secret {
-    load_secret_key(&*PRIVATE_KEY).unwrap()
-}
-static PUBLIC_KEY: Lazy<String> = Lazy::new(|| env::var("PUBLIC_KEY").unwrap());
-pub fn get_public_key() -> x448::PublicKey {
-    load_public_key(&*PUBLIC_KEY).unwrap()
+static KEYRING: Lazy<Keyring> = Lazy::new(|| {
+    if let Ok(encoded) = env::var("KEYRING") {
+        let bytes = BASE64_STD.decode(&encoded).expect("Invalid KEYRING base64");
+        Keyring::from_bytes(&bytes).expect("Invalid KEYRING data")
+    } else {
+        let kr = Keyring::generate();
+        eprintln!(
+            "Generated KEYRING (save to env): {}",
+            BASE64_STD.encode(&kr.to_bytes())
+        );
+        kr
+    }
+});
+
+pub fn get_keyring() -> &'static Keyring {
+    &KEYRING
 }
 
 #[tokio::main]

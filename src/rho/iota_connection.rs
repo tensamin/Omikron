@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
-use x448::PublicKey;
+use mtp::crypto::KemPublicKey;
 
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::omega::omega_connection::OmegaConnection;
@@ -79,12 +79,9 @@ impl IotaConnection {
     }
 
     #[allow(dead_code)]
-    pub async fn get_public_key(&self) -> Option<PublicKey> {
-        if let Some(public_key) = self.pub_key.read().await.clone() {
-            PublicKey::from_bytes(&public_key)
-        } else {
-            None
-        }
+    pub async fn get_public_key(&self) -> Option<KemPublicKey> {
+        let guard = self.pub_key.read().await;
+        guard.as_ref().map(|bytes| KemPublicKey::new(bytes.clone()))
     }
 
     /// Get the user IDs

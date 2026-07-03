@@ -1,9 +1,12 @@
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+use base64::Engine as _;
+use mtp::crypto::decrypt_with;
+
 use crate::{
     data::user::UserStatus,
-    get_private_key, log, log_cv_in, log_cv_out, log_err, log_in,
+    get_keyring, log, log_cv_in, log_cv_out, log_err, log_in,
     rho::rho_manager::{self, RHO_CONNECTIONS, connection_count},
     util::{
-        crypto_helper::{decrypt_b64, secret_key_to_base64},
         file_util::load_file_vec,
         logger::PrintType,
     },
@@ -389,22 +392,18 @@ impl OmegaConnection {
     }
 
     async fn handle_challenge(&self, cv: CommunicationValue) -> Result<(), String> {
-        let challenge = cv
+        let challenge_b64 = cv
             .get_data(DataType::Challenge)
             .as_str()
             .ok_or("Challenge not found")?;
 
-        let server_pub_key = cv
-            .get_data(DataType::PublicKey)
-            .as_str()
-            .ok_or("Public key not found")?;
-
-        let decrypted_challenge = decrypt_b64(
-            &secret_key_to_base64(&get_private_key()),
-            server_pub_key,
-            challenge,
-        )
-        .map_err(|e| format!("Decryption failed: {:?}", e))?;
+        let blob = BASE64_STD
+            .decode(challenge_b64)
+            .map_err(|e| format!("Base64 decode failed: {}", e))?;
+        let decrypted = decrypt_with(&blob, get_keyring(), b"challenge")
+            .map_err(|e| format!("Decryption failed: {:?}", e))?;
+        let decrypted_challenge =
+            String::from_utf8(decrypted).map_err(|_| "Decrypted challenge not valid UTF-8")?;
 
         let response_msg = CommunicationValue::new(CommunicationType::ChallengeResponse)
             .with_id(cv.get_id())
