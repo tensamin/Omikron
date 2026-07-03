@@ -8,7 +8,11 @@ mtp = { git = "https://git.methanium.net/Methanium/mtp.git", features = [
     "host",
     "client",
     "crypto",
+    "files",
 ] }
+# Needed directly for `ConnectionHandle`, which `mtp-client` does not re-export.
+# Pulled in transitively already via `mtp`, so this just names the same crate/commit.
+mtp-transport = { git = "https://git.methanium.net/Methanium/mtp.git" }
 
 ansi_term = "*"
 uuid = { version = "*", features = ["v4"] }

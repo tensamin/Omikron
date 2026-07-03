@@ -1,5 +1,5 @@
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
-use mtp::transport::{Receiver, Sender};
+use mtp::host::{Receiver, Sender};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -138,10 +138,11 @@ impl AnonymousClientConnection {
                 for call_invitee in call.members.read().await.clone() {
                     let call_invitee_cv = get_omega_connection()
                         .await_response(
-                            &CommunicationValue::new(CommunicationType::GetUserData).add_typed_default(
-                                DataType::UserId,
-                                DataValue::SignedNumber(call_invitee.user_id.into()),
-                            ),
+                            &CommunicationValue::new(CommunicationType::GetUserData)
+                                .add_typed_default(
+                                    DataType::UserId,
+                                    DataValue::SignedNumber(call_invitee.user_id.into()),
+                                ),
                             Some(Duration::from_secs(2)),
                         )
                         .await
@@ -164,7 +165,12 @@ impl AnonymousClientConnection {
                         call_invitee_cv.get_data(DataType::Avatar).clone(),
                     ));
 
-                    let _ = invited.push(DataValue::Container(json_invitee.iter().map(|(k, v)| (k.to_id(&TypeMap::latest()), v.clone())).collect()));
+                    let _ = invited.push(DataValue::Container(
+                        json_invitee
+                            .iter()
+                            .map(|(k, v)| (k.to_id(&TypeMap::latest()), v.clone()))
+                            .collect(),
+                    ));
                 }
 
                 let token = call.create_anonymous_token(self.get_user_id()).await;
@@ -190,8 +196,19 @@ impl AnonymousClientConnection {
                                 DataType::Display,
                                 DataValue::Str(self.get_display_name().await),
                             )
-                            .add_typed_default(DataType::Avatar, DataValue::Str(self.get_avatar().await))
-                            .add_typed_default(DataType::CallState, DataValue::Container(serialized.iter().map(|(k, v)| (k.to_id(&TypeMap::latest()), v.clone())).collect())),
+                            .add_typed_default(
+                                DataType::Avatar,
+                                DataValue::Str(self.get_avatar().await),
+                            )
+                            .add_typed_default(
+                                DataType::CallState,
+                                DataValue::Container(
+                                    serialized
+                                        .iter()
+                                        .map(|(k, v)| (k.to_id(&TypeMap::latest()), v.clone()))
+                                        .collect(),
+                                ),
+                            ),
                     )
                     .await;
             }
@@ -261,7 +278,10 @@ impl AnonymousClientConnection {
                             DataType::Display,
                             DataValue::Str(anonymous.get_display_name().await),
                         )
-                        .add_typed_default(DataType::UserState, DataValue::Str("online".to_string()))
+                        .add_typed_default(
+                            DataType::UserState,
+                            DataValue::Str("online".to_string()),
+                        )
                         .add_typed_default(
                             DataType::Avatar,
                             DataValue::Str(anonymous.get_avatar().await),
@@ -321,7 +341,10 @@ impl AnonymousClientConnection {
 
     /// Handle call invite
     async fn handle_call_invite(self: Arc<Self>, cv: CommunicationValue) {
-        let receiver_id: i64 = cv.get_data(DataType::ReceiverId).as_signed_number().unwrap_or(0) as i64;
+        let receiver_id: i64 = cv
+            .get_data(DataType::ReceiverId)
+            .as_signed_number()
+            .unwrap_or(0) as i64;
         if receiver_id == 0 {
             self.send_error_response(&cv.get_id(), CommunicationType::ErrorNoUserId)
                 .await;
@@ -384,7 +407,10 @@ impl AnonymousClientConnection {
 
                 let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
                     .with_id(cv.get_id())
-                    .add_typed_default(DataType::ReceiverId, DataValue::SignedNumber(receiver_id.into()));
+                    .add_typed_default(
+                        DataType::ReceiverId,
+                        DataValue::SignedNumber(receiver_id.into()),
+                    );
                 self.send_message(&error_cv).await;
                 return;
             }
@@ -446,8 +472,14 @@ impl AnonymousClientConnection {
     }
     async fn handle_call_timeout_user(self: Arc<Self>, cv: CommunicationValue) {
         let call_id = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or("")).unwrap();
-        let user_id = cv.get_data(DataType::UserId).as_signed_number().unwrap_or(0);
-        let untill = cv.get_data(DataType::Untill).as_signed_number().unwrap_or(0);
+        let user_id = cv
+            .get_data(DataType::UserId)
+            .as_signed_number()
+            .unwrap_or(0);
+        let untill = cv
+            .get_data(DataType::Untill)
+            .as_signed_number()
+            .unwrap_or(0);
 
         let call = call_manager::get_call(call_id).await;
         if let Some(call) = call {
@@ -467,7 +499,10 @@ impl AnonymousClientConnection {
     }
     async fn handle_call_disconnect_user(self: Arc<Self>, cv: CommunicationValue) {
         let call_id = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or("")).unwrap();
-        let user_id = cv.get_data(DataType::UserId).as_signed_number().unwrap_or(0);
+        let user_id = cv
+            .get_data(DataType::UserId)
+            .as_signed_number()
+            .unwrap_or(0);
 
         let call = call_manager::get_call(call_id).await;
         if let Some(call) = call {

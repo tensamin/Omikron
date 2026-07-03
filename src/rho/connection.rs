@@ -1,15 +1,15 @@
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue};
-use mtp::transport::{Receiver, Sender};
+use mtp::host::{Receiver, Sender};
 use rand::{Rng, distributions::Alphanumeric};
 use std::{collections::BTreeMap, collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use mtp::crypto::{
-    encrypt_for, EncryptionType, KemPublicKey, PublicKeyBundle, SignaturePqPublicKey,
-    SignaturePublicKey,
+    EncryptionType, KemPublicKey, PublicKeyBundle, SignaturePqPublicKey, SignaturePublicKey,
+    encrypt_for,
 };
 
 use crate::{
@@ -179,15 +179,11 @@ impl GeneralConnection {
                 .unwrap(),
             );
 
-            let our_pk = BASE64_STD.encode(
-                get_keyring().public_key_bundle().kem_public_key.as_bytes(),
-            );
+            let our_pk =
+                BASE64_STD.encode(get_keyring().public_key_bundle().kem_public_key.as_bytes());
             let response = CommunicationValue::new(CommunicationType::AppChallenge)
                 .with_id(cv.get_id())
-                .add_typed_default(
-                    DataType::PublicKey,
-                    DataValue::Str(our_pk),
-                )
+                .add_typed_default(DataType::PublicKey, DataValue::Str(our_pk))
                 .add_typed_default(DataType::Challenge, DataValue::Str(encrypted_challenge));
 
             log_cv_out!(response);
@@ -267,15 +263,11 @@ impl GeneralConnection {
                 .unwrap(),
             );
 
-            let our_pk = BASE64_STD.encode(
-                get_keyring().public_key_bundle().kem_public_key.as_bytes(),
-            );
+            let our_pk =
+                BASE64_STD.encode(get_keyring().public_key_bundle().kem_public_key.as_bytes());
             let response = CommunicationValue::new(CommunicationType::Challenge)
                 .with_id(cv.get_id())
-                .add_typed_default(
-                    DataType::PublicKey,
-                    DataValue::Str(our_pk),
-                )
+                .add_typed_default(DataType::PublicKey, DataValue::Str(our_pk))
                 .add_typed_default(DataType::Challenge, DataValue::Str(encrypted_challenge));
 
             log_cv_out!(response);
@@ -370,16 +362,12 @@ impl GeneralConnection {
                 CommunicationType::Challenge
             };
 
-            let our_pk = BASE64_STD.encode(
-                get_keyring().public_key_bundle().kem_public_key.as_bytes(),
-            );
+            let our_pk =
+                BASE64_STD.encode(get_keyring().public_key_bundle().kem_public_key.as_bytes());
             let response = CommunicationValue::new(challenge_type)
                 .with_id(cv.get_id())
                 .with_receiver(*self.session_id.read().await)
-                .add_typed_default(
-                    DataType::PublicKey,
-                    DataValue::Str(our_pk),
-                )
+                .add_typed_default(DataType::PublicKey, DataValue::Str(our_pk))
                 .add_typed_default(DataType::Challenge, DataValue::Str(encrypted_challenge));
 
             log_cv_out!(response);
@@ -440,7 +428,10 @@ impl GeneralConnection {
         match kind {
             ConnectionKind::Client => {
                 let notify = CommunicationValue::new(CommunicationType::UserConnected)
-                    .add_typed_default(DataType::UserId, DataValue::SignedNumber((id as i64).into()));
+                    .add_typed_default(
+                        DataType::UserId,
+                        DataValue::SignedNumber((id as i64).into()),
+                    );
                 get_omega_connection().send_message(&notify).await;
 
                 let user_id = id as i64;
@@ -451,7 +442,10 @@ impl GeneralConnection {
 
                 if rho.is_none() {
                     let get_user_msg = CommunicationValue::new(CommunicationType::GetUserData)
-                        .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
+                        .add_typed_default(
+                            DataType::UserId,
+                            DataValue::SignedNumber(user_id.into()),
+                        );
 
                     if let Ok(user_data_cv) = get_omega_connection()
                         .await_response(&get_user_msg, Some(Duration::from_secs(20)))
@@ -475,8 +469,14 @@ impl GeneralConnection {
                 if let Some(rho_conn) = rho {
                     let session_id = *self.session_id.read().await as i64;
                     let iota_msg = CommunicationValue::new(CommunicationType::ClientConnected)
-                        .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
-                        .add_typed_default(DataType::SessionId, DataValue::SignedNumber(session_id.into()));
+                        .add_typed_default(
+                            DataType::UserId,
+                            DataValue::SignedNumber(user_id.into()),
+                        )
+                        .add_typed_default(
+                            DataType::SessionId,
+                            DataValue::SignedNumber(session_id.into()),
+                        );
 
                     if let Ok(resp) = rho_conn
                         .get_iota_connection()
@@ -526,7 +526,9 @@ impl GeneralConnection {
                                             if timeout > 0 {
                                                 base_call_map.insert(
                                                     DataType::Timeout.to_id(&tm),
-                                                    DataValue::SignedNumber((timeout as i64).into()),
+                                                    DataValue::SignedNumber(
+                                                        (timeout as i64).into(),
+                                                    ),
                                                 );
                                             }
 
@@ -578,7 +580,8 @@ impl GeneralConnection {
                                             if let Some(DataValue::SignedNumber(id)) =
                                                 contact_map.get(&DataType::UserId.to_id(&tm))
                                             {
-                                                if let Some(call_list) = invites.get(&(*id as i64)) {
+                                                if let Some(call_list) = invites.get(&(*id as i64))
+                                                {
                                                     contact_map.insert(
                                                         DataType::Calls.to_id(&tm),
                                                         DataValue::Array(call_list.clone()),
@@ -592,8 +595,10 @@ impl GeneralConnection {
                                         }
                                     }
 
-                                    ident_resp = ident_resp
-                                        .add_typed_default(DataType::Calls, DataValue::Array(global_calls));
+                                    ident_resp = ident_resp.add_typed_default(
+                                        DataType::Calls,
+                                        DataValue::Array(global_calls),
+                                    );
                                     DataValue::Array(new_contacts)
                                 } else {
                                     v.clone()
@@ -672,7 +677,10 @@ impl GeneralConnection {
 
                 if rho.is_none() {
                     let get_user_msg = CommunicationValue::new(CommunicationType::GetUserData)
-                        .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
+                        .add_typed_default(
+                            DataType::UserId,
+                            DataValue::SignedNumber(user_id.into()),
+                        );
 
                     if let Ok(user_data_cv) = get_omega_connection()
                         .await_response(&get_user_msg, Some(Duration::from_secs(20)))

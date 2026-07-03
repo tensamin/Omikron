@@ -15,33 +15,32 @@ pub static WORKING_DIR: Lazy<PathBuf> =
     Lazy::new(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 use rustls::crypto::aws_lc_rs::default_provider;
 
-use base64::engine::general_purpose::STANDARD as BASE64_STD;
-use base64::Engine as _;
 use mtp::crypto::Keyring;
+use mtp::files::{load_keyring as load_keyring_file, save_keyring, save_public_key_bundle};
 
 use crate::{
-    calls::call_util::garbage_collect_calls,
-    omega::omega_connection::get_omega_connection,
-    rho::server::start,
-    util::logger::startup,
+    calls::call_util::garbage_collect_calls, omega::omega_connection::get_omega_connection,
+    rho::server::start, util::logger::startup,
 };
 
+const KEYRING_PATH: &str = "./omikron.mk";
+
 static KEYRING: Lazy<Keyring> = Lazy::new(|| {
-    if let Ok(encoded) = env::var("KEYRING") {
-        let bytes = BASE64_STD.decode(&encoded).expect("Invalid KEYRING base64");
-        Keyring::from_bytes(&bytes).expect("Invalid KEYRING data")
-    } else {
+    load_keyring_file(KEYRING_PATH).unwrap_or_else(|_| {
         let kr = Keyring::generate();
-        eprintln!(
-            "Generated KEYRING (save to env): {}",
-            BASE64_STD.encode(&kr.to_bytes())
-        );
+        save_keyring(&kr, KEYRING_PATH).expect("Failed to save generated keyring");
+        save_public_key_bundle(&kr.public_key_bundle(), KEYRING_PATH)
+            .expect("Failed to save generated public key bundle");
+        eprintln!("Generated new keyring at {}", KEYRING_PATH);
         kr
-    }
+    })
 });
 
 pub fn get_keyring() -> &'static Keyring {
     &KEYRING
+}
+pub fn load_keyring() -> Keyring {
+    Keyring::from_bytes(&KEYRING.to_bytes()).unwrap()
 }
 
 #[tokio::main]

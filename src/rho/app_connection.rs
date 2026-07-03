@@ -5,7 +5,7 @@ use crate::rho::{rho_connection::RhoConnection, rho_manager};
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err, log_in, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
-use mtp::transport::{Receiver, Sender};
+use mtp::host::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -129,7 +129,10 @@ impl AppConnection {
                             DataType::Avatar,
                             DataValue::Str(anonymous.get_avatar().await),
                         )
-                        .add_typed_default(DataType::UserState, DataValue::Str("online".to_string()));
+                        .add_typed_default(
+                            DataType::UserState,
+                            DataValue::Str("online".to_string()),
+                        );
 
                     self.send_message(&response).await;
 
@@ -183,7 +186,10 @@ impl AppConnection {
         // Send pong response
         let response = CommunicationValue::new(CommunicationType::Pong)
             .with_id(cv.get_id())
-            .add_typed_default(DataType::PingIota, DataValue::SignedNumber(iota_ping.into()));
+            .add_typed_default(
+                DataType::PingIota,
+                DataValue::SignedNumber(iota_ping.into()),
+            );
 
         self.send_message(&response).await;
     }

@@ -14,13 +14,13 @@ use mtp::codec::DataType;
 use mtp::codec::DataTypeId;
 use mtp::codec::DataValue;
 use mtp::codec::TypeMap;
-use mtp::transport::Receiver;
-use mtp::transport::Sender;
+use mtp::crypto::KemPublicKey;
+use mtp::host::Receiver;
+use mtp::host::Sender;
 use std::collections::BTreeMap;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
-use mtp::crypto::KemPublicKey;
 
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::omega::omega_connection::OmegaConnection;
@@ -265,7 +265,10 @@ impl IotaConnection {
                 if let Ok(uid) = k.parse::<i128>() {
                     map.insert(DataType::UserId.to_id(&tm), DataValue::SignedNumber(uid));
                 }
-                map.insert(DataType::LastPing.to_id(&tm), DataValue::SignedNumber(v.into()));
+                map.insert(
+                    DataType::LastPing.to_id(&tm),
+                    DataValue::SignedNumber(v.into()),
+                );
                 DataValue::container_from_map(&map)
             })
             .collect();
@@ -368,12 +371,20 @@ impl IotaConnection {
 
                 // Build base call container
                 let mut base_call_map: BTreeMap<DataTypeId, DataValue> = BTreeMap::new();
-                base_call_map.insert(DataType::CallId.to_id(&tm), DataValue::Str(call.call_id.to_string()));
-                base_call_map.insert(DataType::CallMembers.to_id(&tm), DataValue::Array(member_ids));
+                base_call_map.insert(
+                    DataType::CallId.to_id(&tm),
+                    DataValue::Str(call.call_id.to_string()),
+                );
+                base_call_map.insert(
+                    DataType::CallMembers.to_id(&tm),
+                    DataValue::Array(member_ids),
+                );
 
                 if timeout > 0 {
-                    base_call_map
-                        .insert(DataType::Timeout.to_id(&tm), DataValue::SignedNumber(timeout.into()));
+                    base_call_map.insert(
+                        DataType::Timeout.to_id(&tm),
+                        DataValue::SignedNumber(timeout.into()),
+                    );
                 }
 
                 if admin {
@@ -394,8 +405,10 @@ impl IotaConnection {
 
                     // Add secret if it exists for this pairing
                     if let Some(secret) = call.secrets.read().await.get(&(member_id, user_id)) {
-                        contact_call_map
-                            .insert(DataType::CallSecret.to_id(&tm), DataValue::Str(secret.clone()));
+                        contact_call_map.insert(
+                            DataType::CallSecret.to_id(&tm),
+                            DataValue::Str(secret.clone()),
+                        );
                     }
 
                     invites
@@ -423,14 +436,18 @@ impl IotaConnection {
                         let mut user_map: BTreeMap<DataTypeId, DataValue> =
                             entries.iter().cloned().collect();
 
-                        if let Some(DataValue::SignedNumber(id)) = user_map.get(&DataType::UserId.to_id(&tm)) {
+                        if let Some(DataValue::SignedNumber(id)) =
+                            user_map.get(&DataType::UserId.to_id(&tm))
+                        {
                             interested_ids.push(*id as i64);
 
                             if let Some(call_list) = invites.get(&(*id as i64))
                                 && !call_list.is_empty()
                             {
-                                user_map
-                                    .insert(DataType::Calls.to_id(&tm), DataValue::Array(call_list.clone()));
+                                user_map.insert(
+                                    DataType::Calls.to_id(&tm),
+                                    DataValue::Array(call_list.clone()),
+                                );
                             }
                         }
 

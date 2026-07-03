@@ -7,7 +7,7 @@ use crate::util::logger::PrintType;
 use crate::{data::user::UserStatus, omega::omega_connection::OmegaConnection};
 use crate::{log_cv_in, log_cv_out, log_err, log_in, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
-use mtp::transport::{Receiver, Sender};
+use mtp::host::{Receiver, Sender};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -158,11 +158,26 @@ impl ClientConnection {
                 } {
                     let response = CommunicationValue::new(CommunicationType::GetUserData)
                         .with_id(cv.get_id())
-                        .add_typed_default(DataType::Username, DataValue::Str(anonymous.get_user_name().await))
-                        .add_typed_default(DataType::UserId, DataValue::SignedNumber(anonymous.get_user_id().into()))
-                        .add_typed_default(DataType::Display, DataValue::Str(anonymous.get_display_name().await))
-                        .add_typed_default(DataType::Avatar, DataValue::Str(anonymous.get_avatar().await))
-                        .add_typed_default(DataType::UserState, DataValue::Str("online".to_string()));
+                        .add_typed_default(
+                            DataType::Username,
+                            DataValue::Str(anonymous.get_user_name().await),
+                        )
+                        .add_typed_default(
+                            DataType::UserId,
+                            DataValue::SignedNumber(anonymous.get_user_id().into()),
+                        )
+                        .add_typed_default(
+                            DataType::Display,
+                            DataValue::Str(anonymous.get_display_name().await),
+                        )
+                        .add_typed_default(
+                            DataType::Avatar,
+                            DataValue::Str(anonymous.get_avatar().await),
+                        )
+                        .add_typed_default(
+                            DataType::UserState,
+                            DataValue::Str("online".to_string()),
+                        );
 
                     self.send_message(&response).await;
 
@@ -198,8 +213,14 @@ impl ClientConnection {
                         let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
                             .with_id(cv.get_id())
                             .with_receiver(self.user_id)
-                            .add_typed_default(DataType::Message, DataValue::Str("Missing session_id".to_string()))
-                            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(expected_session_id));
+                            .add_typed_default(
+                                DataType::Message,
+                                DataValue::Str("Missing session_id".to_string()),
+                            )
+                            .add_typed_default(
+                                DataType::SessionId,
+                                DataValue::SignedNumber(expected_session_id),
+                            );
                         self.send_message(&response).await;
                         return;
                     };
@@ -208,8 +229,14 @@ impl ClientConnection {
                         let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
                             .with_id(cv.get_id())
                             .with_receiver(self.user_id)
-                            .add_typed_default(DataType::Message, DataValue::Str("session_id mismatch".to_string()))
-                            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(expected_session_id));
+                            .add_typed_default(
+                                DataType::Message,
+                                DataValue::Str("session_id mismatch".to_string()),
+                            )
+                            .add_typed_default(
+                                DataType::SessionId,
+                                DataValue::SignedNumber(expected_session_id),
+                            );
                         self.send_message(&response).await;
                         return;
                     }
@@ -218,13 +245,22 @@ impl ClientConnection {
                         let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
                             .with_id(cv.get_id())
                             .with_receiver(self.user_id)
-                            .add_typed_default(DataType::Message, DataValue::Str("session_id mismatch".to_string()))
-                            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(expected_session_id));
+                            .add_typed_default(
+                                DataType::Message,
+                                DataValue::Str("session_id mismatch".to_string()),
+                            )
+                            .add_typed_default(
+                                DataType::SessionId,
+                                DataValue::SignedNumber(expected_session_id),
+                            );
                         self.send_message(&response).await;
                         return;
                     }
                 } else {
-                    cv = cv.add_typed_default(DataType::SessionId, DataValue::SignedNumber(expected_session_id));
+                    cv = cv.add_typed_default(
+                        DataType::SessionId,
+                        DataValue::SignedNumber(expected_session_id),
+                    );
                 }
             }
 
@@ -266,7 +302,10 @@ impl ClientConnection {
         // Send pong response
         let response = CommunicationValue::new(CommunicationType::Pong)
             .with_id(cv.get_id())
-            .add_typed_default(DataType::PingIota, DataValue::SignedNumber(iota_ping.into()));
+            .add_typed_default(
+                DataType::PingIota,
+                DataValue::SignedNumber(iota_ping.into()),
+            );
 
         self.send_message(&response).await;
     }
@@ -289,7 +328,10 @@ impl ClientConnection {
 
     /// Handle call invite
     async fn handle_call_invite(self: Arc<Self>, cv: CommunicationValue) {
-        let receiver_id: i128 = cv.get_data(DataType::ReceiverId).as_signed_number().unwrap_or(0);
+        let receiver_id: i128 = cv
+            .get_data(DataType::ReceiverId)
+            .as_signed_number()
+            .unwrap_or(0);
         if receiver_id == 0 {
             self.send_error_response(cv.get_id(), CommunicationType::ErrorNoUserId)
                 .await;
@@ -334,9 +376,15 @@ impl ClientConnection {
                 // User is offline - send push notification for call invite
                 let push_cv = CommunicationValue::new(CommunicationType::PushNotification)
                     .with_receiver(receiver_id as u64)
-                    .add_typed_default(DataType::SenderId, DataValue::SignedNumber(sender_id.into()))
+                    .add_typed_default(
+                        DataType::SenderId,
+                        DataValue::SignedNumber(sender_id.into()),
+                    )
                     .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
-                    .add_typed_default(DataType::Notifications, DataValue::Str("call_invite".to_string()));
+                    .add_typed_default(
+                        DataType::Notifications,
+                        DataValue::Str("call_invite".to_string()),
+                    );
 
                 let omega_conn = get_omega_connection();
                 // Send fire-and-forget, don't await to avoid blocking
@@ -346,7 +394,10 @@ impl ClientConnection {
 
                 let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
                     .with_id(cv.get_id())
-                    .add_typed_default(DataType::ReceiverId, DataValue::SignedNumber(receiver_id.into()));
+                    .add_typed_default(
+                        DataType::ReceiverId,
+                        DataValue::SignedNumber(receiver_id.into()),
+                    );
                 self.send_message(&error_cv).await;
                 return;
             }
@@ -359,10 +410,19 @@ impl ClientConnection {
         let forward = CommunicationValue::new(CommunicationType::CallInvite)
             .with_receiver(receiver_id as u64)
             .with_sender(sender_id as u64)
-            .add_typed_default(DataType::CallSecret, cv.get_data(DataType::CallSecret).clone())
+            .add_typed_default(
+                DataType::CallSecret,
+                cv.get_data(DataType::CallSecret).clone(),
+            )
             .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
-            .add_typed_default(DataType::ReceiverId, DataValue::SignedNumber(receiver_id.into()))
-            .add_typed_default(DataType::SenderId, DataValue::SignedNumber(sender_id.into()));
+            .add_typed_default(
+                DataType::ReceiverId,
+                DataValue::SignedNumber(receiver_id.into()),
+            )
+            .add_typed_default(
+                DataType::SenderId,
+                DataValue::SignedNumber(sender_id.into()),
+            );
 
         target_rho.message_to_client(forward).await;
 
@@ -461,8 +521,14 @@ impl ClientConnection {
                 .await;
             return;
         };
-        let user_id = cv.get_data(DataType::UserId).as_signed_number().unwrap_or(0);
-        let untill = cv.get_data(DataType::Untill).as_signed_number().unwrap_or(0);
+        let user_id = cv
+            .get_data(DataType::UserId)
+            .as_signed_number()
+            .unwrap_or(0);
+        let untill = cv
+            .get_data(DataType::Untill)
+            .as_signed_number()
+            .unwrap_or(0);
 
         let Some(call) = call_manager::get_call(call_id).await else {
             self.send_error_response(cv.get_id(), CommunicationType::ErrorNotFound)
@@ -489,7 +555,10 @@ impl ClientConnection {
                 .await;
             return;
         };
-        let user_id = cv.get_data(DataType::UserId).as_signed_number().unwrap_or(0);
+        let user_id = cv
+            .get_data(DataType::UserId)
+            .as_signed_number()
+            .unwrap_or(0);
 
         let Some(call) = call_manager::get_call(call_id).await else {
             self.send_error_response(cv.get_id(), CommunicationType::ErrorNotFound)
@@ -546,7 +615,10 @@ impl ClientConnection {
                                 let response =
                                     CommunicationValue::new(CommunicationType::LoadTxtRecord)
                                         .with_id(cv.get_id())
-                                        .add_typed_default(DataType::Content, DataValue::Str(s.to_string()));
+                                        .add_typed_default(
+                                            DataType::Content,
+                                            DataValue::Str(s.to_string()),
+                                        );
                                 self.send_message(&response).await;
                                 return;
                             }
@@ -579,7 +651,10 @@ impl ClientConnection {
         );
 
         if cv.is_type(CommunicationType::AddConversation)
-            && cv.get_data(DataType::ChatPartnerId).as_signed_number().is_none()
+            && cv
+                .get_data(DataType::ChatPartnerId)
+                .as_signed_number()
+                .is_none()
         {
             let chat_partner_name = cv
                 .get_data(DataType::ChatPartnerName)
@@ -600,7 +675,10 @@ impl ClientConnection {
                 .await_response(
                     &CommunicationValue::new(CommunicationType::GetUserData)
                         .with_id(cv.clone().get_id())
-                        .add_typed_default(DataType::Username, DataValue::Str(chat_partner_name.clone())),
+                        .add_typed_default(
+                            DataType::Username,
+                            DataValue::Str(chat_partner_name.clone()),
+                        ),
                     Some(Duration::from_secs(20)),
                 )
                 .await;
@@ -665,7 +743,10 @@ impl ClientConnection {
             );
             let error_cv = CommunicationValue::new(CommunicationType::ErrorNoIota)
                 .with_id(msg_id)
-                .add_typed_default(DataType::UserId, DataValue::SignedNumber(sender_user_id.into()));
+                .add_typed_default(
+                    DataType::UserId,
+                    DataValue::SignedNumber(sender_user_id.into()),
+                );
             self.send_message(&error_cv).await;
         }
     }

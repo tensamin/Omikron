@@ -1,19 +1,18 @@
-use base64::engine::general_purpose::STANDARD as BASE64_STD;
-use base64::Engine as _;
-use mtp::crypto::decrypt_with;
-
 use crate::{
     data::user::UserStatus,
-    get_keyring, log, log_cv_in, log_cv_out, log_err, log_in,
+    load_keyring, log_cv_in, log_cv_out, log_err, log_in,
     rho::rho_manager::{self, RHO_CONNECTIONS, connection_count},
-    util::{
-        file_util::load_file_vec,
-        logger::PrintType,
-    },
+    util::logger::PrintType,
 };
 use dashmap::DashMap;
+use mtp::client::{Client, Receiver, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
-use mtp::transport::{Policy, Receiver, SendMode, Sender};
+use mtp::{
+    client::ClientConfig,
+    files::load_public_key_bundle,
+    host::{Policy, SendMode},
+};
+use mtp_transport::ConnectionHandle;
 use once_cell::sync::Lazy;
 use std::{collections::HashMap, env, sync::Arc, time::Duration};
 use tokio::{
@@ -21,6 +20,7 @@ use tokio::{
     task::JoinHandle,
     time::{Instant, sleep},
 };
+
 use uuid::Uuid;
 
 // ============================================================================
@@ -109,7 +109,6 @@ pub struct OmegaConnection {
     connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     host: String,
     port: u16,
-    server_cert: Vec<u8>,
     last_ping: Arc<Mutex<i64>>,
     heartbeat_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     message_send_times: Arc<Mutex<HashMap<Uuid, Instant>>>,
@@ -125,16 +124,9 @@ impl OmegaConnection {
         Self::with_host(&host, port)
     }
 
+    // omikron and omega are both served over publicly trusted (fullchain) certs on
+    // the same domain, so the client uses system root trust - no pinning needed.
     pub fn with_host(host: &str, port: u16) -> Self {
-        // Load server certificate from default location
-        let server_cert =
-            load_file_vec("certs", "cert.pem").expect("Failed to load server certificate");
-
-        Self::with_host_and_cert(host, port, server_cert)
-    }
-
-    // New constructor that accepts certificate directly
-    pub fn with_host_and_cert(host: &str, port: u16, server_cert: Vec<u8>) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
 
         OmegaConnection {
@@ -143,7 +135,6 @@ impl OmegaConnection {
             connection_loop_handle: Arc::new(Mutex::new(None)),
             host: host.to_string(),
             port,
-            server_cert,
             last_ping: Arc::new(Mutex::new(-1)),
             heartbeat_handle: Arc::new(Mutex::new(None)),
             message_send_times: Arc::new(Mutex::new(HashMap::new())),
@@ -265,12 +256,14 @@ impl OmegaConnection {
     async fn connect_once(self: Arc<Self>) -> Result<(), String> {
         *self.state.write().await = ConnectionState::Connecting;
 
-        let addr_str = format!("https://{}:{}", self.host, self.port);
-
-        let (sender, mut receiver) = mtp::transport::client::connect(
-            &addr_str,
-            None,
-            Policy {
+        let client_config = ClientConfig::new(format!("https://{}:{}", self.host, self.port))
+            .with_client_id(
+                env::var("ID")
+                    .unwrap_or("0".to_string())
+                    .parse::<u64>()
+                    .unwrap_or(0),
+            )
+            .with_policy(Policy {
                 send_mode: SendMode::SingleStreamPerMessage,
                 max_message_size: 1_000_000_000,
                 close_frame_len: u32::MAX,
@@ -285,20 +278,25 @@ impl OmegaConnection {
                 max_transient_recv_errors: 20,
                 transient_recv_backoff: Duration::from_millis(100),
                 receiver_queue_capacity: 1000,
-            },
-        )
-        .await
-        .map_err(|e| format!("Connection failed: {}", e))?;
+            });
+
+        let host_public_key = load_public_key_bundle("./omega.mpkb")
+            .map_err(|e| format!("Failed to load omega.mpkb: {}", e))?;
+
+        let mut connection =
+            Client::auth_connect(client_config, &load_keyring(), &host_public_key)
+                .await
+                .map_err(|e| format!("Connection failed: {}", e))?;
 
         log_in!(
             0,
             PrintType::Omega,
             "QUIC connection established to {}",
-            addr_str
+            format!("https://{}:{}", self.host, self.port)
         );
 
         // Store sender
-        let sender_arc = Arc::new(sender);
+        let sender_arc = Arc::new(connection.sender);
         *self.sender.write().await = Some(sender_arc.clone());
         *self.state.write().await = ConnectionState::Connected { identified: false };
 
@@ -308,11 +306,10 @@ impl OmegaConnection {
         // Start read loop
         let read_self = self.clone();
         let read_handle = tokio::spawn(async move {
-            read_self.read_loop(&mut receiver, sender_handle).await;
+            read_self
+                .read_loop(&mut connection.receiver, sender_handle)
+                .await;
         });
-
-        // Send identification
-        self.send_identification().await;
 
         // Start heartbeat
         let heartbeat_self = self.clone();
@@ -332,6 +329,8 @@ impl OmegaConnection {
             handle.abort();
         }
 
+        self.clone().sync_client_iota_status().await;
+
         match result {
             Ok(()) => {
                 // Check if we should reconnect
@@ -343,112 +342,6 @@ impl OmegaConnection {
             }
             Err(e) => Err(format!("Read loop error: {}", e)),
         }
-    }
-
-    // -------------------------------------------------------------------------
-    // Identification Handshake
-    // -------------------------------------------------------------------------
-
-    async fn send_identification(&self) {
-        let id = rand::random::<u32>();
-
-        let omikron_id = env::var("ID")
-            .unwrap_or("0".to_string())
-            .parse::<i64>()
-            .unwrap_or(0);
-
-        let identify_msg = CommunicationValue::new(CommunicationType::Identification)
-            .with_id(id)
-            .add_typed_default(DataType::OmikronId, DataValue::SignedNumber(omikron_id.into()));
-
-        WAITING_TASKS.insert(
-            id,
-            WaitingTask {
-                task: Box::new(|selfc, cv| {
-                    if cv.is_type(CommunicationType::ErrorNotFound) {
-                        log_err!(
-                            0,
-                            PrintType::Omega,
-                            "Identification failed: Omikron ID not found"
-                        );
-                        return false;
-                    }
-                    if !cv.is_type(CommunicationType::Challenge) {
-                        return false;
-                    }
-
-                    tokio::spawn(async move {
-                        if let Err(e) = selfc.handle_challenge(cv).await {
-                            log_err!(0, PrintType::Omega, "Challenge handling failed: {}", e);
-                        }
-                    });
-                    true
-                }),
-                inserted_at: Instant::now(),
-            },
-        );
-
-        self.send_message(&identify_msg).await;
-    }
-
-    async fn handle_challenge(&self, cv: CommunicationValue) -> Result<(), String> {
-        let challenge_b64 = cv
-            .get_data(DataType::Challenge)
-            .as_str()
-            .ok_or("Challenge not found")?;
-
-        let blob = BASE64_STD
-            .decode(challenge_b64)
-            .map_err(|e| format!("Base64 decode failed: {}", e))?;
-        let decrypted = decrypt_with(&blob, get_keyring(), b"challenge")
-            .map_err(|e| format!("Decryption failed: {:?}", e))?;
-        let decrypted_challenge =
-            String::from_utf8(decrypted).map_err(|_| "Decrypted challenge not valid UTF-8")?;
-
-        let response_msg = CommunicationValue::new(CommunicationType::ChallengeResponse)
-            .with_id(cv.get_id())
-            .add_typed_default(DataType::Challenge, DataValue::Str(decrypted_challenge));
-
-        let response_id = response_msg.get_id();
-
-        WAITING_TASKS.insert(
-            response_id,
-            WaitingTask {
-                task: Box::new(|selfc, final_cv| {
-                    if !final_cv.is_type(CommunicationType::IdentificationResponse) {
-                        log_err!(0, PrintType::Omega, "Expected identification_response");
-                        return false;
-                    }
-
-                    let accepted = final_cv
-                        .get_data(DataType::Accepted)
-                        .as_bool()
-                        .unwrap_or(false);
-
-                    if !accepted {
-                        log_err!(0, PrintType::Omega, "Omega did not accept identification");
-                        return false;
-                    }
-
-                    tokio::spawn(async move {
-                        let mut state = selfc.state.write().await;
-                        if let ConnectionState::Connected { identified: _ } = *state {
-                            *state = ConnectionState::Connected { identified: true };
-                        }
-                        drop(state);
-
-                        selfc.sync_client_iota_status().await;
-                    });
-
-                    log!(0, PrintType::Omega, "Successfully identified with Omega");
-                    true
-                }),
-                inserted_at: Instant::now(),
-            },
-        );
-
-        self.send_message(&response_msg).await;
-        Ok(())
     }
 
     async fn sync_client_iota_status(self: Arc<Self>) {
@@ -489,7 +382,7 @@ impl OmegaConnection {
     async fn read_loop(
         self: Arc<Self>,
         receiver: &mut Receiver,
-        sender_handle: Arc<mtp::transport::ConnectionHandle>,
+        sender_handle: Arc<ConnectionHandle>,
     ) {
         // Monitor both receiver and sender handle for close
         let mut close_rx = sender_handle.subscribe_close();
@@ -520,7 +413,7 @@ impl OmegaConnection {
                                     let mut user_ids: Vec<u64> = Vec::new();
                                     for value in users {
                                         if let DataValue::SignedNumber(user_id) = value {
-                                            user_ids.push(*user_id as u64);
+                                            user_ids.push(user_id.clone() as u64);
                                         }
                                     }
                                     let connections = crate::rho::rho_manager::RHO_CONNECTIONS.read().await;
