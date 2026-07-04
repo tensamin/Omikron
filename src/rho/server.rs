@@ -27,8 +27,11 @@ pub async fn get_by_connector_id(
     description: Option<String>,
 ) -> Option<PublicKeyBundle> {
     let request = match description.as_deref() {
-        Some("iota") => CommunicationValue::new(CommunicationType::GetIotaData)
-            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(client_id as i128)),
+        Some("iota") => {
+            println!("Iota connection request for client_id: {}", client_id);
+            CommunicationValue::new(CommunicationType::GetIotaData)
+                .add_typed_default(DataType::IotaId, DataValue::SignedNumber(client_id as i128))
+        }
         Some("client") => CommunicationValue::new(CommunicationType::GetUserData)
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(client_id as i128)),
         _ => return None,
@@ -59,9 +62,11 @@ pub async fn get_by_connector_id(
 
 /* Only Iota registration goes through mtp's Register flow; users are registered out of band. */
 pub async fn complete_register(pub_key: PublicKeyBundle, description: Option<String>) -> u64 {
+    println!("Iota register start");
     if description.as_deref() != Some("iota") {
         return 0;
     }
+    println!("Iota connection request");
 
     let request = CommunicationValue::new(CommunicationType::CompleteRegisterIota)
         .add_typed_default(
@@ -126,16 +131,21 @@ pub async fn start(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     .with_authentication_policy(AuthenticationPolicy::AllowAuthentication);
 
     let mut host: Host = Host::new(host_config).await?;
-    log!(0, PrintType::General, "Server listening on port {}", port);
+    log!(0, PrintType::General, "Server listening on port {}.", port);
 
     loop {
         let conn = match host.accept().await {
-            Ok(Some(conn)) => conn,
+            Ok(Some(conn)) => {
+                println!("Accepted connection");
+                conn
+            }
             Ok(None) => break,
             Err(e) => {
-                // A single client's failed/aborted handshake (bad auth, a
-                // probe, a mid-handshake disconnect) must not take down the
-                // whole listener - only that connection attempt is lost.
+                /*
+                 * A single client's failed/aborted handshake (bad auth, a
+                 * probe, a mid-handshake disconnect) must not take down the
+                 * whole listener, only that connection attempt is lost.
+                 */
                 log_err!(0, PrintType::General, "Rejected connection: {}", e);
                 continue;
             }

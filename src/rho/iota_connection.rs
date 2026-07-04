@@ -4,6 +4,7 @@ use crate::log_cv_in;
 use crate::log_cv_out;
 use crate::log_err;
 use crate::log_in;
+use crate::log_out;
 use crate::omega::omega_connection::get_omega_connection;
 use crate::rho::connection::GeneralConnection;
 use crate::util::logger::PrintType;
@@ -493,6 +494,7 @@ impl IotaConnection {
     }
 
     pub async fn handle_close(&self) {
+        log_out!(self.iota_id as i64, PrintType::Iota, "Iota {} disconnected", self.iota_id);
         if let Some(rho_conn) = self.get_rho_connection().await {
             rho_conn.close_iota_connection().await;
         }

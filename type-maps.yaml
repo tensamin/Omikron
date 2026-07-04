@@ -1,46 +1,6 @@
 # The version a Client should use
 protocol_version: "1.0"
 
-# Note that markers 0 to 31 are reserved for default use, manually working with them is not recommended
-# Fixed CommunicationType markers are:
-#   Error: 0
-#   ErrorParsing: 1
-#   ErrorBadVersion: 2
-#   Disconnect: 3
-#   Redirect: 4
-#   Shutdown: 5
-#   BadRequest: 6
-#   Unauthorized: 7
-#   Forbidden: 8
-#   NotFound: 9
-#   TooManyRequests: 10
-#   InternalServerError: 11
-#   BadGateway: 12
-#   ServiceUnavailable: 13
-#   GatewayTimeout: 14
-#   Identification: 15
-#   IdentificationResponse: 16
-#   Register: 17
-#   RegisterResponse: 18
-#   Ping: 19
-#   Pong: 20
-#
-# Fixed Data Type markers are:
-#   Error: 0
-#   ErrorParsing: 1
-#   ErrorMessage: 2
-#   Version: 3
-#   Description: 4
-#   Timestamp: 5
-#   Id: 6
-#   ClientNonce: 7
-#   ServerNonce: 8
-#   PublicKeys: 9
-#   Signature: 10
-#   Connected: 11
-#
-# If a Type can't be used it will be mapped to 0
-
 type_maps:
   "1.0": # Protocol version 1.0
     CommunicationTypes:

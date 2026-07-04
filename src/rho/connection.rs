@@ -296,6 +296,8 @@ impl GeneralConnection {
                 client.start();
             }
             ConnectionKind::Iota => {
+                log_in!(id as i64, PrintType::Iota, "Iota {} connected", id);
+
                 let notify = CommunicationValue::new(CommunicationType::IotaConnected)
                     .add_typed_default(DataType::IotaId, DataValue::SignedNumber(id.into()));
                 get_omega_connection().send_message(&notify).await;
