@@ -1,39 +1,94 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STD;
+
 use crate::load_keyring;
 use crate::{
-    log,
+    log, log_err,
+    omega::omega_connection::get_omega_connection,
     rho::connection::GeneralConnection,
     util::{file_util::load_file_vec, logger::PrintType},
 };
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::PublicKeyBundle;
 use mtp::host::{AuthenticationPolicy, Host, HostConfig, Policy, SendMode};
 
+/*
+ * Resolves the PublicKeyBundle mtp needs to verify a login's signed
+ * challenge response. "iota"/"client" ids are looked up through Omega, the
+ * source of truth for both kinds of registered keys. Any other description
+ * (including "anonymous") never resolves, which routes the connection
+ * through mtp's unauthenticated fallback instead of rejecting it outright.
+ */
 pub async fn get_by_connector_id(
-    _client_id: u64,
+    client_id: u64,
     description: Option<String>,
 ) -> Option<PublicKeyBundle> {
-    if let Some(description) = description {
-        if description == "iota" {
-            todo!()
-        } else if description == "client" {
-            todo!()
-        } else if description == "anonymous" {
-            todo!()
-        } else if description == "app" {
-            todo!()
+    let request = match description.as_deref() {
+        Some("iota") => CommunicationValue::new(CommunicationType::GetIotaData)
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(client_id as i128)),
+        Some("client") => CommunicationValue::new(CommunicationType::GetUserData)
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(client_id as i128)),
+        _ => return None,
+    };
+
+    let response = match get_omega_connection()
+        .await_response(&request, Some(Duration::from_secs(20)))
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            log_err!(
+                client_id as i64,
+                PrintType::General,
+                "Failed to look up public key for connector (description={:?}): {}",
+                description,
+                e
+            );
+            return None;
         }
-    }
-    None
+    };
+
+    let bytes = BASE64_STD
+        .decode(response.get_data(DataType::PublicKey).as_str()?)
+        .ok()?;
+    PublicKeyBundle::from_bytes(&bytes).ok()
 }
-pub async fn complete_register(_pub_key: PublicKeyBundle, description: Option<String>) -> u64 {
-    if let Some(description) = description {
-        if description == "iota" {
-            todo!()
-        }
+
+/* Only Iota registration goes through mtp's Register flow; users are registered out of band. */
+pub async fn complete_register(pub_key: PublicKeyBundle, description: Option<String>) -> u64 {
+    if description.as_deref() != Some("iota") {
+        return 0;
     }
-    0
+
+    let request = CommunicationValue::new(CommunicationType::CompleteRegisterIota)
+        .add_typed_default(
+            DataType::PublicKey,
+            DataValue::Str(BASE64_STD.encode(pub_key.as_bytes())),
+        );
+
+    let response = match get_omega_connection()
+        .await_response(&request, Some(Duration::from_secs(20)))
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => {
+            log_err!(
+                0,
+                PrintType::General,
+                "Failed to complete Iota registration: {}",
+                e
+            );
+            return 0;
+        }
+    };
+
+    match response.get_data(DataType::IotaId) {
+        DataValue::SignedNumber(id) => *id as u64,
+        _ => 0,
+    }
 }
 
 pub async fn start(port: u16) -> Result<(), Box<dyn std::error::Error>> {
@@ -73,9 +128,28 @@ pub async fn start(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let mut host: Host = Host::new(host_config).await?;
     log!(0, PrintType::General, "Server listening on port {}", port);
 
-    while let Ok(Some(conn)) = host.accept().await {
+    loop {
+        let conn = match host.accept().await {
+            Ok(Some(conn)) => conn,
+            Ok(None) => break,
+            Err(e) => {
+                // A single client's failed/aborted handshake (bad auth, a
+                // probe, a mid-handshake disconnect) must not take down the
+                // whole listener - only that connection attempt is lost.
+                log_err!(0, PrintType::General, "Rejected connection: {}", e);
+                continue;
+            }
+        };
+
         tokio::spawn(async move {
-            let conn = GeneralConnection::new(conn.sender, conn.receiver);
+            let Some(conn) = GeneralConnection::new(conn) else {
+                log_err!(
+                    0,
+                    PrintType::General,
+                    "Rejected connection: unrecognized or unauthenticated description"
+                );
+                return;
+            };
             conn.handle().await;
         });
     }

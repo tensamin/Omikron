@@ -1,21 +1,11 @@
-use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue};
-use mtp::host::{Receiver, Sender};
-use rand::{Rng, distributions::Alphanumeric};
 use std::{collections::BTreeMap, collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STD;
-use mtp::crypto::{
-    EncryptionType, KemPublicKey, PublicKeyBundle, SignaturePqPublicKey, SignaturePublicKey,
-    encrypt_for,
-};
-
 use crate::{
     anonymous_clients::anonymous_client_connection::AnonymousClientConnection,
     calls::call_manager,
-    get_keyring, log_cv_in, log_cv_out, log_err, log_in, log_out,
+    log_cv_out, log_err, log_in, log_out,
     omega::omega_connection::get_omega_connection,
     rho::{
         app_connection::AppConnection, client_connection::ClientConnection,
@@ -23,7 +13,17 @@ use crate::{
     },
     util::logger::PrintType,
 };
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue};
+use mtp::host::{AuthState, Connection as MTPHostConnection, Receiver, Sender};
 
+/*
+ * How a connection identified itself during the mtp handshake driven by
+ * `server.rs` ("iota" / "client" authenticated logins, "anonymous"
+ * unauthenticated). `Phi` (third-party apps) predates that handshake and is
+ * not reachable through it, since mtp's host only recognizes its own
+ * `Identification`/`Register` hello frames; it is kept only so
+ * `app_connection.rs` still compiles.
+ */
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum ConnectionKind {
@@ -37,395 +37,57 @@ pub struct GeneralConnection {
     pub sender: Arc<Sender>,
     pub receiver: Arc<Receiver>,
 
-    identified: Arc<RwLock<bool>>,
-    challenged: Arc<RwLock<bool>>,
-    challenge: Arc<RwLock<String>>,
-    challenge_cv_id: Arc<RwLock<u32>>,
+    connection_kind: ConnectionKind,
+    id: u64,
 
-    connection_kind: Arc<RwLock<Option<ConnectionKind>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
-    id: Arc<RwLock<u64>>,
     pub session_id: Arc<RwLock<u64>>,
     pub app_identifier: Arc<RwLock<Option<String>>>,
     pub app_session: Arc<RwLock<Option<Uuid>>>,
     pub client_version: Arc<RwLock<String>>,
-
-    pub_key: Arc<RwLock<Option<Vec<u8>>>>,
 }
+
 impl GeneralConnection {
-    pub fn new(sender: Sender, receiver: Receiver) -> Arc<Self> {
-        Arc::new(Self {
-            sender: Arc::new(sender),
-            receiver: Arc::new(receiver),
-            identified: Arc::new(RwLock::new(false)),
-            challenged: Arc::new(RwLock::new(false)),
-            challenge: Arc::new(RwLock::new(String::new())),
-            challenge_cv_id: Arc::new(RwLock::new(0)),
-            connection_kind: Arc::new(RwLock::new(None)),
+    /*
+     * `conn` has already been authenticated (or deliberately left
+     * unauthenticated) by `mtp::host::Host::accept`, via the
+     * `get_by_connector_id`/`complete_register` callbacks in `server.rs`
+     * keyed off `conn.description`. There is no separate application-level
+     * challenge step anymore; a connection whose description doesn't resolve
+     * to a known, appropriately-authenticated kind is rejected here instead
+     * of being handed off to a connection handler.
+     */
+    pub fn new(conn: MTPHostConnection) -> Option<Arc<Self>> {
+        let kind = match (conn.description.as_deref(), &conn.auth_state) {
+            (Some("iota"), AuthState::Authenticated) => ConnectionKind::Iota,
+            (Some("client"), AuthState::Authenticated) => ConnectionKind::Client,
+            (Some("anonymous"), _) => ConnectionKind::AnonymousClient,
+            _ => return None,
+        };
+
+        Some(Arc::new(Self {
+            sender: Arc::new(conn.sender),
+            receiver: Arc::new(conn.receiver),
+            connection_kind: kind,
+            id: conn.client_id,
             rho_connection: Arc::new(RwLock::new(None)),
-            id: Arc::new(RwLock::new(0)),
-            session_id: Arc::new(RwLock::new(0)),
+            session_id: Arc::new(RwLock::new(conn.client_id)),
             app_identifier: Arc::new(RwLock::new(None)),
             app_session: Arc::new(RwLock::new(None)),
-            client_version: Arc::new(RwLock::new(mtp::codec::PROTOCOL_VERSION.to_string())),
-            pub_key: Arc::new(RwLock::new(None)),
-        })
+            client_version: Arc::new(RwLock::new(conn.version.to_string())),
+        }))
     }
-}
-impl GeneralConnection {
+
     pub async fn handle(self: Arc<Self>) {
         log_in!(0, PrintType::General, "General connection handler started");
-
-        while let Ok(cv) = self.receiver.receive().await {
-            log_cv_in!(cv);
-
-            if !*self.identified.read().await {
-                self.handle_identification(cv).await;
-                continue;
-            }
-
-            if !*self.challenged.read().await {
-                self.handle_challenge_response(cv).await;
-            }
-
-            if *self.challenged.read().await {
-                let self_clone = self.clone();
-                tokio::spawn(async move {
-                    self_clone.migrate().await;
-                });
-                break;
-            }
-        }
-
+        self.migrate().await;
         log_out!(0, PrintType::General, "General connection handler stopped");
-    }
-    async fn handle_identification(self: &Arc<Self>, cv: CommunicationValue) {
-        if let Some(version) = cv.get_data(DataType::Version).as_str() {
-            *self.client_version.write().await = version.to_string();
-        }
-
-        if cv.is_type(CommunicationType::RegisterIota) {
-            if let DataValue::Str(pub_key) = cv.get_data(DataType::PublicKey) {
-                let msg = CommunicationValue::new(CommunicationType::CompleteRegisterIota)
-                    .add_typed_default(DataType::PublicKey, DataValue::Str(pub_key.clone()));
-
-                let response = get_omega_connection()
-                    .await_response(&msg, Some(Duration::from_secs(20)))
-                    .await;
-
-                if let Ok(response_cv) = response {
-                    if let DataValue::SignedNumber(iota_id) = response_cv.get_data(DataType::IotaId)
-                    {
-                        let success_msg = CommunicationValue::new(CommunicationType::Success)
-                            .with_id(cv.get_id())
-                            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(*iota_id));
-
-                        log_cv_out!(success_msg);
-                        let _ = self.sender.send(&success_msg).await;
-                    } else {
-                        let err_msg =
-                            CommunicationValue::new(CommunicationType::ErrorInvalidOmikronId)
-                                .with_id(cv.get_id());
-                        let _ = self.sender.send(&err_msg).await;
-                    }
-                }
-            }
-            return;
-        }
-
-        if cv.is_type(CommunicationType::AppIdentification) {
-            let app_identifier = cv
-                .get_data(DataType::AppIdentifier)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let app_session_id_str = cv.get_data(DataType::AppSession).as_str().unwrap_or("");
-            let app_session_id = Uuid::parse_str(app_session_id_str).unwrap_or(Uuid::new_v4());
-            let pub_key_str = cv.get_data(DataType::AppPublicKey).as_str().unwrap_or("");
-            let user_id = cv.get_data(DataType::UserId).as_number().unwrap_or(0);
-
-            *self.id.write().await = user_id as u64;
-            *self.app_identifier.write().await = Some(app_identifier);
-            *self.app_session.write().await = Some(app_session_id);
-            *self.connection_kind.write().await = Some(ConnectionKind::Phi);
-
-            let kem_bytes = match BASE64_STD.decode(pub_key_str) {
-                Ok(b) => b,
-                Err(_) => return,
-            };
-            *self.pub_key.write().await = Some(kem_bytes.clone());
-
-            let challenge: String = rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(32)
-                .map(char::from)
-                .collect();
-
-            *self.challenge.write().await = challenge.clone();
-            *self.identified.write().await = true;
-
-            let peer_bundle = PublicKeyBundle::new(
-                KemPublicKey::new(kem_bytes),
-                SignaturePqPublicKey::new(vec![]),
-                SignaturePublicKey::new(vec![]),
-            );
-            let encrypted_challenge = BASE64_STD.encode(
-                &encrypt_for(
-                    EncryptionType::MlKemChaCha20Poly1305,
-                    &peer_bundle,
-                    challenge.as_bytes(),
-                    b"challenge",
-                )
-                .unwrap(),
-            );
-
-            let our_pk =
-                BASE64_STD.encode(get_keyring().public_key_bundle().kem_public_key.as_bytes());
-            let response = CommunicationValue::new(CommunicationType::AppChallenge)
-                .with_id(cv.get_id())
-                .add_typed_default(DataType::PublicKey, DataValue::Str(our_pk))
-                .add_typed_default(DataType::Challenge, DataValue::Str(encrypted_challenge));
-
-            log_cv_out!(response);
-            let _ = self.sender.send(&response).await;
-            return;
-        }
-
-        if !cv.is_type(CommunicationType::Identification) {
-            return;
-        }
-
-        if let DataValue::SignedNumber(iota_id) = cv.get_data(DataType::IotaId) {
-            *self.id.write().await = *iota_id as u64;
-            *self.connection_kind.write().await = Some(ConnectionKind::Iota);
-
-            let get_pub_key_msg = CommunicationValue::new(CommunicationType::GetIotaData)
-                .add_typed_default(DataType::IotaId, DataValue::SignedNumber(*iota_id));
-
-            let response_cv = get_omega_connection()
-                .await_response(&get_pub_key_msg, Some(Duration::from_secs(20)))
-                .await;
-
-            let response_cv = match response_cv {
-                Ok(r) => r,
-                Err(_) => {
-                    log_err!(
-                        *iota_id as i64,
-                        PrintType::Iota,
-                        "Failed to get Iota data from Omega for iota_id={}",
-                        iota_id
-                    );
-                    return;
-                }
-            };
-
-            let base64_pub = response_cv
-                .get_data(DataType::PublicKey)
-                .as_str()
-                .unwrap_or("");
-
-            let kem_bytes = match BASE64_STD.decode(base64_pub) {
-                Ok(b) => b,
-                Err(_) => {
-                    log_err!(
-                        *iota_id as i64,
-                        PrintType::Iota,
-                        "Failed to decode public key for iota_id={}",
-                        iota_id
-                    );
-                    return;
-                }
-            };
-
-            *self.pub_key.write().await = Some(kem_bytes.clone());
-
-            let challenge: String = rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(32)
-                .map(char::from)
-                .collect();
-
-            *self.challenge.write().await = challenge.clone();
-            *self.identified.write().await = true;
-
-            let peer_bundle = PublicKeyBundle::new(
-                KemPublicKey::new(kem_bytes),
-                SignaturePqPublicKey::new(vec![]),
-                SignaturePublicKey::new(vec![]),
-            );
-            let encrypted_challenge = BASE64_STD.encode(
-                &encrypt_for(
-                    EncryptionType::MlKemChaCha20Poly1305,
-                    &peer_bundle,
-                    challenge.as_bytes(),
-                    b"challenge",
-                )
-                .unwrap(),
-            );
-
-            let our_pk =
-                BASE64_STD.encode(get_keyring().public_key_bundle().kem_public_key.as_bytes());
-            let response = CommunicationValue::new(CommunicationType::Challenge)
-                .with_id(cv.get_id())
-                .add_typed_default(DataType::PublicKey, DataValue::Str(our_pk))
-                .add_typed_default(DataType::Challenge, DataValue::Str(encrypted_challenge));
-
-            log_cv_out!(response);
-            let _ = self.sender.send(&response).await;
-        } else if let DataValue::SignedNumber(user_id) = cv.get_data(DataType::UserId) {
-            *self.id.write().await = *user_id as u64;
-            *self.session_id.write().await = match cv.get_data(DataType::SessionId) {
-                DataValue::SignedNumber(s) => *s as u64,
-                _ => cv.get_sender(),
-            };
-
-            #[allow(unused_assignments)]
-            let mut base64_pub = String::new();
-
-            if cv.is_type(CommunicationType::AppIdentification) {
-                *self.connection_kind.write().await = Some(ConnectionKind::Phi);
-
-                if let DataValue::Str(app_id) = cv.get_data(DataType::AppIdentifier) {
-                    *self.app_identifier.write().await = Some(app_id.clone());
-                }
-                if let DataValue::Str(app_sess) = cv.get_data(DataType::AppSession) {
-                    if let Ok(uuid) = uuid::Uuid::parse_str(&app_sess) {
-                        *self.app_session.write().await = Some(uuid);
-                    }
-                }
-
-                base64_pub = cv
-                    .get_data(DataType::AppPublicKey)
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-            } else {
-                *self.connection_kind.write().await = Some(ConnectionKind::Client);
-
-                let get_pub_key_msg = CommunicationValue::new(CommunicationType::GetUserData)
-                    .add_typed_default(DataType::UserId, DataValue::SignedNumber(*user_id));
-
-                let response_cv = get_omega_connection()
-                    .await_response(&get_pub_key_msg, Some(Duration::from_secs(20)))
-                    .await;
-
-                let response_cv = match response_cv {
-                    Ok(r) => r,
-                    Err(_) => {
-                        return;
-                    }
-                };
-
-                base64_pub = response_cv
-                    .get_data(DataType::PublicKey)
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-            }
-
-            let kem_bytes = match BASE64_STD.decode(&base64_pub) {
-                Ok(b) => b,
-                Err(_) => {
-                    return;
-                }
-            };
-
-            *self.pub_key.write().await = Some(kem_bytes.clone());
-
-            let challenge: String = rand::thread_rng()
-                .sample_iter(&Alphanumeric)
-                .take(32)
-                .map(char::from)
-                .collect();
-
-            *self.challenge.write().await = challenge.clone();
-            *self.identified.write().await = true;
-
-            let peer_bundle = PublicKeyBundle::new(
-                KemPublicKey::new(kem_bytes),
-                SignaturePqPublicKey::new(vec![]),
-                SignaturePublicKey::new(vec![]),
-            );
-            let encrypted_challenge = BASE64_STD.encode(
-                &encrypt_for(
-                    EncryptionType::MlKemChaCha20Poly1305,
-                    &peer_bundle,
-                    challenge.as_bytes(),
-                    b"challenge",
-                )
-                .unwrap(),
-            );
-
-            let challenge_type = if cv.is_type(CommunicationType::AppIdentification) {
-                CommunicationType::AppChallenge
-            } else {
-                CommunicationType::Challenge
-            };
-
-            let our_pk =
-                BASE64_STD.encode(get_keyring().public_key_bundle().kem_public_key.as_bytes());
-            let response = CommunicationValue::new(challenge_type)
-                .with_id(cv.get_id())
-                .with_receiver(*self.session_id.read().await)
-                .add_typed_default(DataType::PublicKey, DataValue::Str(our_pk))
-                .add_typed_default(DataType::Challenge, DataValue::Str(encrypted_challenge));
-
-            log_cv_out!(response);
-            let _ = self.sender.send(&response).await;
-        }
-    }
-    async fn handle_challenge_response(self: &Arc<Self>, cv: CommunicationValue) {
-        let id = *self.id.read().await as i64;
-
-        if !cv.is_type(CommunicationType::ChallengeResponse)
-            && !cv.is_type(CommunicationType::AppChallengeResponse)
-        {
-            return;
-        }
-
-        if let DataValue::Str(response) = cv.get_data(DataType::Challenge) {
-            let expected = self.challenge.read().await.clone();
-
-            if *response == expected {
-                *self.challenged.write().await = true;
-                *self.challenge_cv_id.write().await = cv.get_id();
-            } else {
-                log_err!(
-                    id,
-                    PrintType::Iota,
-                    "Challenge response mismatch expected={} actual={}",
-                    expected,
-                    response
-                );
-                let err_msg = CommunicationValue::new(CommunicationType::ErrorInvalidChallenge)
-                    .with_id(cv.get_id())
-                    .add_typed_default(
-                        DataType::Message,
-                        DataValue::Str(
-                            "Challenge response mismatch; authentication rejected".to_string(),
-                        ),
-                    );
-                let _ = self.sender.send(&err_msg).await;
-            }
-        } else {
-            log_err!(
-                id,
-                PrintType::Iota,
-                "Challenge response missing challenge payload"
-            );
-        }
     }
 
     async fn migrate(self: &Arc<Self>) -> bool {
-        let kind = match *self.connection_kind.read().await {
-            Some(kind) => kind,
-            None => {
-                return false;
-            }
-        };
-        let id = *self.id.read().await;
+        let id = self.id;
 
-        match kind {
+        match self.connection_kind {
             ConnectionKind::Client => {
                 let notify = CommunicationValue::new(CommunicationType::UserConnected)
                     .add_typed_default(
@@ -484,9 +146,15 @@ impl GeneralConnection {
                         .await_response(&iota_msg, Some(Duration::from_secs(20)))
                         .await
                     {
+                        /*
+                         * mtp's handshake already confirmed this login; this
+                         * message is an unsolicited push carrying the initial
+                         * contacts/calls state, not a reply to a client-side
+                         * request id (the old raw hello frame this used to
+                         * reply to no longer reaches application code).
+                         */
                         let mut ident_resp =
-                            CommunicationValue::new(CommunicationType::IdentificationResponse)
-                                .with_id(*self.challenge_cv_id.read().await);
+                            CommunicationValue::new(CommunicationType::IdentificationResponse);
                         let tm = mtp::codec::TypeMap::latest();
                         for (k, v) in resp.iter_typed_data() {
                             let value_to_add = if k == Some(DataType::Contacts) {
@@ -658,13 +326,7 @@ impl GeneralConnection {
                     }
                 }
 
-                let ident_resp = CommunicationValue::new(CommunicationType::IdentificationResponse)
-                    .with_id(*self.challenge_cv_id.read().await)
-                    .add_typed_default(DataType::Accepted, DataValue::Bool(true));
-
-                log_cv_out!(ident_resp);
-                let _ = self.sender.send(&ident_resp).await;
-
+                // mtp's handshake already confirmed this login/registration to the Iota.
                 iota.clone().start();
             }
             ConnectionKind::AnonymousClient => {
@@ -707,13 +369,6 @@ impl GeneralConnection {
                     rho_conn.bind_user_id(user_id).await;
                     rho_conn.add_app_connection(app_conn.clone()).await;
                 }
-
-                let response =
-                    CommunicationValue::new(CommunicationType::AppIdentificationResponse)
-                        .with_id(*self.challenge_cv_id.read().await)
-                        .with_receiver(*self.session_id.read().await);
-
-                let _ = self.sender.send(&response).await;
 
                 app_conn.start();
             }

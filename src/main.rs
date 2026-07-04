@@ -24,12 +24,13 @@ use crate::{
 };
 
 const KEYRING_PATH: &str = "./omikron.mk";
+const PUBLIC_KEY_PATH: &str = "./omikron.mpkb";
 
 static KEYRING: Lazy<Keyring> = Lazy::new(|| {
     load_keyring_file(KEYRING_PATH).unwrap_or_else(|_| {
         let kr = Keyring::generate();
         save_keyring(&kr, KEYRING_PATH).expect("Failed to save generated keyring");
-        save_public_key_bundle(&kr.public_key_bundle(), KEYRING_PATH)
+        save_public_key_bundle(&kr.public_key_bundle(), PUBLIC_KEY_PATH)
             .expect("Failed to save generated public key bundle");
         eprintln!("Generated new keyring at {}", KEYRING_PATH);
         kr

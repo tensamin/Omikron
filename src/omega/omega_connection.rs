@@ -318,6 +318,11 @@ impl OmegaConnection {
         });
         *self.heartbeat_handle.lock().await = Some(heartbeat_handle);
 
+        // Tell omega our current state now that we're actually connected -
+        // doing this after teardown (as before) sent into a sender that had
+        // already been cleared, silently dropping the sync every time.
+        self.clone().sync_client_iota_status().await;
+
         // Wait for read loop to complete (connection closed)
         let result = read_handle.await;
 
@@ -328,8 +333,6 @@ impl OmegaConnection {
         if let Some(handle) = self.heartbeat_handle.lock().await.take() {
             handle.abort();
         }
-
-        self.clone().sync_client_iota_status().await;
 
         match result {
             Ok(()) => {
