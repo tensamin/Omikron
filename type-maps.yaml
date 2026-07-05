@@ -99,6 +99,13 @@ type_maps:
       AppChallengeResponse: 133
       AppIdentificationResponse: 134
       LoadTxtRecord: 135
+      SetEncryptedDeviceSecret: 139
+      GetEncryptedDeviceSecret: 140
+      EncryptedDeviceSecretResponse: 141
+      EncryptedMessage: 142
+      EncryptedMessageAck: 143
+      EncryptedMessagesGet: 144
+      EncryptedMessagesResponse: 145
     DataTypes:
       ErrorType: 32
       ErrorProtocol: 33
@@ -199,3 +206,25 @@ type_maps:
       AppData: 131
       TauriToken: 132
       Challenge: 133
+      EncryptedPayload: 134
+      SecurePayload: 135
+      DeviceId: 136
+      ClientId: 137
+      SecretId: 142
+      VersionNumber: 143
+      EncryptedSecret: 144
+      WrappingPublicKeyId: 145
+      WrappingScheme: 146
+      UpdatedAt: 147
+      MessageId: 148
+      ConversationId: 149
+      SenderClientId: 150
+      RecipientClientId: 151
+      SenderUserId: 152
+      RecipientUserId: 153
+      EncryptionVersion: 154
+      HasMore: 155
+      NextCursor: 156
+      Since: 157
+      Limit: 158
+      PeerClientId: 159
