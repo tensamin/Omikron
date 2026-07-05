@@ -99,13 +99,10 @@ type_maps:
       AppChallengeResponse: 133
       AppIdentificationResponse: 134
       LoadTxtRecord: 135
-      SetEncryptedDeviceSecret: 139
-      GetEncryptedDeviceSecret: 140
-      EncryptedDeviceSecretResponse: 141
-      EncryptedMessage: 142
-      EncryptedMessageAck: 143
-      EncryptedMessagesGet: 144
-      EncryptedMessagesResponse: 145
+      SetChatSecret: 139
+      GetChatSecret: 140
+      ChatSecretResponse: 141
+      ChatSecretForward: 142
     DataTypes:
       ErrorType: 32
       ErrorProtocol: 33
@@ -213,18 +210,9 @@ type_maps:
       SecretId: 142
       VersionNumber: 143
       EncryptedSecret: 144
-      WrappingPublicKeyId: 145
       WrappingScheme: 146
       UpdatedAt: 147
-      MessageId: 148
-      ConversationId: 149
-      SenderClientId: 150
-      RecipientClientId: 151
+      ChatId: 148
+      KemCiphertext: 149
       SenderUserId: 152
       RecipientUserId: 153
-      EncryptionVersion: 154
-      HasMore: 155
-      NextCursor: 156
-      Since: 157
-      Limit: 158
-      PeerClientId: 159
