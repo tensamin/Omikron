@@ -19,12 +19,15 @@ use mtp::crypto::KemPublicKey;
 use mtp::host::Receiver;
 use mtp::host::Sender;
 use std::collections::BTreeMap;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, sync::LazyLock, time::Duration};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
 use super::{rho_connection::RhoConnection, rho_manager};
 use crate::omega::omega_connection::OmegaConnection;
+
+static PENDING_CHAT_SECRETS: LazyLock<DashMap<u64, Vec<CommunicationValue>>> =
+    LazyLock::new(DashMap::new);
 
 #[allow(dead_code)]
 pub struct IotaConnection {
@@ -101,6 +104,10 @@ impl IotaConnection {
             let user_ids_i64: Vec<i64> = user_ids.into_iter().map(|u| u as i64).collect();
             rho_conn.set_user_ids(user_ids_i64).await;
         }
+
+        for user_id in self.get_user_ids().await {
+            self.flush_pending_chat_secrets(user_id).await;
+        }
     }
 
     pub async fn add_user_id(&self, user_id: u64) {
@@ -117,7 +124,31 @@ impl IotaConnection {
             if let Some(rho_conn) = self.get_rho_connection().await {
                 rho_conn.add_user_id(user_id as i64).await;
             }
+
+            self.flush_pending_chat_secrets(user_id).await;
         }
+    }
+
+    async fn flush_pending_chat_secrets(&self, user_id: u64) {
+        let Some((_, messages)) = PENDING_CHAT_SECRETS.remove(&user_id) else {
+            return;
+        };
+
+        for message in messages {
+            self.send_message(&message).await;
+        }
+    }
+
+    fn store_pending_chat_secret(cv: CommunicationValue) {
+        let receiver_id = cv.get_receiver();
+        if receiver_id == 0 || !cv.is_type(CommunicationType::SetChatSecret) {
+            return;
+        }
+
+        PENDING_CHAT_SECRETS
+            .entry(receiver_id)
+            .or_default()
+            .push(cv);
     }
 
     /// Get current ping
@@ -301,6 +332,16 @@ impl IotaConnection {
             if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id as i64).await {
                 target_rho.message_to_iota(cv).await;
             } else {
+                if cv.is_type(CommunicationType::SetChatSecret) {
+                    Self::store_pending_chat_secret(cv.clone());
+                    let success = CommunicationValue::new(CommunicationType::Success)
+                        .with_id(cv.get_id())
+                        .with_sender(cv.get_sender())
+                        .with_receiver(cv.get_sender());
+                    self.send_message(&success).await;
+                    return;
+                }
+
                 let error = CommunicationValue::new(CommunicationType::ErrorNoIota)
                     .with_id(cv.get_id())
                     .with_sender(cv.get_sender());

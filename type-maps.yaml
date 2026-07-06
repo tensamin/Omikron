@@ -99,6 +99,7 @@ type_maps:
       AppChallengeResponse: 133
       AppIdentificationResponse: 134
       LoadTxtRecord: 135
+      ErrorNotSet: 136
       SetChatSecret: 139
       GetChatSecret: 140
       ChatSecretResponse: 141
@@ -216,3 +217,4 @@ type_maps:
       KemCiphertext: 149
       SenderUserId: 152
       RecipientUserId: 153
+      Recipients: 154
