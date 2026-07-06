@@ -207,7 +207,16 @@ impl GeneralConnection {
                                                 );
                                             }
 
-                                            // Add to global calls (without contact-specific secret)
+                                            if let Some(secret) =
+                                                call.get_secret_for_user(user_id as u64).await
+                                            {
+                                                base_call_map.insert(
+                                                    DataType::CallSecret.to_id(&tm),
+                                                    secret.to_data_value(),
+                                                );
+                                            }
+
+                                            // Add to global calls with only this user's recipient-specific secret.
                                             global_calls.push(DataValue::container_from_map(
                                                 &base_call_map,
                                             ));
@@ -218,19 +227,7 @@ impl GeneralConnection {
                                                     continue;
                                                 }
 
-                                                let mut contact_call_map = base_call_map.clone();
-
-                                                if let Some(secret) = call
-                                                    .secrets
-                                                    .read()
-                                                    .await
-                                                    .get(&(member_id, user_id as u64))
-                                                {
-                                                    contact_call_map.insert(
-                                                        DataType::CallSecret.to_id(&tm),
-                                                        DataValue::Str(secret.clone()),
-                                                    );
-                                                }
+                                                let contact_call_map = base_call_map.clone();
 
                                                 invites
                                                     .entry(member_id as i64)

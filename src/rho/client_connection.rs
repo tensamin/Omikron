@@ -1,5 +1,5 @@
 use crate::anonymous_clients::anonymous_manager;
-use crate::calls::{call_manager, call_util};
+use crate::calls::{call_group::call_invite_secret_from_cv, call_manager, call_util};
 use crate::omega::omega_connection::get_omega_connection;
 use crate::rho::connection::GeneralConnection;
 use crate::rho::{rho_connection::RhoConnection, rho_manager};
@@ -354,15 +354,26 @@ impl ClientConnection {
             }
         };
 
-        let secret = cv
-            .get_data(DataType::CallSecret)
-            .as_str()
-            .map(|s| s.to_string());
+        let secret = match call_invite_secret_from_cv(&cv) {
+            Some(secret) => secret,
+            None => {
+                self.send_error_response(cv.get_id(), CommunicationType::BadRequest)
+                    .await;
+                return;
+            }
+        };
         let invited =
-            call_manager::add_invite(call_id, self.user_id, receiver_id as u64, secret).await;
+            call_manager::add_invite(call_id, self.user_id, receiver_id as u64, secret.clone())
+                .await;
         if !invited {
             self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidCallId)
                 .await;
+            return;
+        }
+
+        if !call_manager::should_forward_invite(self.user_id, receiver_id as u64) {
+            let response = CommunicationValue::new(CommunicationType::Success).with_id(cv.get_id());
+            self.send_message(&response).await;
             return;
         }
 
@@ -410,10 +421,7 @@ impl ClientConnection {
         let forward = CommunicationValue::new(CommunicationType::CallInvite)
             .with_receiver(receiver_id as u64)
             .with_sender(sender_id as u64)
-            .add_typed_default(
-                DataType::CallSecret,
-                cv.get_data(DataType::CallSecret).clone(),
-            )
+            .add_typed_default(DataType::CallSecret, secret.to_data_value())
             .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
             .add_typed_default(
                 DataType::ReceiverId,
