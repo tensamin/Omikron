@@ -531,7 +531,12 @@ impl IotaConnection {
     }
 
     pub async fn handle_close(&self) {
-        log_out!(self.iota_id as i64, PrintType::Iota, "Iota {} disconnected", self.iota_id);
+        log_out!(
+            self.iota_id as i64,
+            PrintType::Iota,
+            "Iota {} disconnected",
+            self.iota_id
+        );
         if let Some(rho_conn) = self.get_rho_connection().await {
             rho_conn.close_iota_connection().await;
         }

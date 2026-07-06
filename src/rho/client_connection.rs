@@ -328,10 +328,7 @@ impl ClientConnection {
 
     /// Handle call invite
     async fn handle_call_invite(self: Arc<Self>, cv: CommunicationValue) {
-        let receiver_id: i128 = cv
-            .get_data(DataType::ReceiverId)
-            .as_signed_number()
-            .unwrap_or(0);
+        let receiver_id: i128 = cv.get_data(DataType::ReceiverId).as_number().unwrap_or(0);
         if receiver_id == 0 {
             self.send_error_response(cv.get_id(), CommunicationType::ErrorNoUserId)
                 .await;

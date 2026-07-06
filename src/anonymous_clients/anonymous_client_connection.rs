@@ -341,10 +341,7 @@ impl AnonymousClientConnection {
 
     /// Handle call invite
     async fn handle_call_invite(self: Arc<Self>, cv: CommunicationValue) {
-        let receiver_id: i64 = cv
-            .get_data(DataType::ReceiverId)
-            .as_signed_number()
-            .unwrap_or(0) as i64;
+        let receiver_id: i64 = cv.get_data(DataType::ReceiverId).as_number().unwrap_or(0) as i64;
         if receiver_id == 0 {
             self.send_error_response(&cv.get_id(), CommunicationType::ErrorNoUserId)
                 .await;
@@ -438,9 +435,12 @@ impl AnonymousClientConnection {
             .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
             .add_typed_default(
                 DataType::ReceiverId,
-                DataValue::Str(receiver_id.to_string()),
+                DataValue::SignedNumber(receiver_id.into()),
             )
-            .add_typed_default(DataType::SenderId, DataValue::Str(sender_id.to_string()));
+            .add_typed_default(
+                DataType::SenderId,
+                DataValue::SignedNumber(sender_id.into()),
+            );
 
         target_rho.message_to_client(forward).await;
 
