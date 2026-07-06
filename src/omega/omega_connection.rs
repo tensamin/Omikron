@@ -283,10 +283,9 @@ impl OmegaConnection {
         let host_public_key = load_public_key_bundle("./omega.mpkb")
             .map_err(|e| format!("Failed to load omega.mpkb: {}", e))?;
 
-        let mut connection =
-            Client::auth_connect(client_config, &load_keyring(), &host_public_key)
-                .await
-                .map_err(|e| format!("Connection failed: {}", e))?;
+        let mut connection = Client::auth_connect(client_config, &load_keyring(), &host_public_key)
+            .await
+            .map_err(|e| format!("Connection failed: {}", e))?;
 
         log_in!(
             0,

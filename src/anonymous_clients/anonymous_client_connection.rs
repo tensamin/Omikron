@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::anonymous_clients::anonymous_manager::{self, generate_username};
-use crate::calls::call_manager;
+use crate::calls::{call_group::call_invite_secret_from_cv, call_manager};
 use crate::data::user::UserStatus;
 use crate::omega::omega_connection::{OmegaConnection, get_omega_connection};
 use crate::rho::connection::GeneralConnection;
@@ -341,10 +341,7 @@ impl AnonymousClientConnection {
 
     /// Handle call invite
     async fn handle_call_invite(self: Arc<Self>, cv: CommunicationValue) {
-        let receiver_id: i64 = cv
-            .get_data(DataType::ReceiverId)
-            .as_signed_number()
-            .unwrap_or(0) as i64;
+        let receiver_id: i64 = cv.get_data(DataType::ReceiverId).as_number().unwrap_or(0) as i64;
         if receiver_id == 0 {
             self.send_error_response(&cv.get_id(), CommunicationType::ErrorNoUserId)
                 .await;
@@ -367,15 +364,26 @@ impl AnonymousClientConnection {
             }
         };
 
-        let secret = cv
-            .get_data(DataType::CallSecret)
-            .as_str()
-            .map(|s| s.to_string());
+        let secret = match call_invite_secret_from_cv(&cv) {
+            Some(secret) => secret,
+            None => {
+                self.send_error_response(&cv.get_id(), CommunicationType::BadRequest)
+                    .await;
+                return;
+            }
+        };
         let invited =
-            call_manager::add_invite(call_id, self.user_id, receiver_id as u64, secret).await;
+            call_manager::add_invite(call_id, self.user_id, receiver_id as u64, secret.clone())
+                .await;
         if !invited {
             self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidCallId)
                 .await;
+            return;
+        }
+
+        if !call_manager::should_forward_invite(self.user_id, receiver_id as u64) {
+            let response = CommunicationValue::new(CommunicationType::Success).with_id(cv.get_id());
+            self.send_message(&response).await;
             return;
         }
 
@@ -423,12 +431,16 @@ impl AnonymousClientConnection {
         let forward = CommunicationValue::new(CommunicationType::CallInvite)
             .with_receiver(receiver_id as u64)
             .with_sender(sender_id)
+            .add_typed_default(DataType::CallSecret, secret.to_data_value())
             .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
             .add_typed_default(
                 DataType::ReceiverId,
-                DataValue::Str(receiver_id.to_string()),
+                DataValue::SignedNumber(receiver_id.into()),
             )
-            .add_typed_default(DataType::SenderId, DataValue::Str(sender_id.to_string()));
+            .add_typed_default(
+                DataType::SenderId,
+                DataValue::SignedNumber(sender_id.into()),
+            );
 
         target_rho.message_to_client(forward).await;
 

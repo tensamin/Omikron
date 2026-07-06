@@ -213,6 +213,8 @@ fn format_data_container(data: Vec<(DataTypeId, DataValue)>, version: Version) -
                 DataValue::BoolFalse => format!("{}=false", key_str),
 
                 DataValue::SignedNumber(num) => format!("{}={}", key_str, num),
+                DataValue::UnsignedNumber(num) => format!("{}={}", key_str, num),
+                DataValue::Bytes(bytes) => format!("{}=<{} bytes>", key_str, bytes.len()),
 
                 _ => "".to_string(),
             }
@@ -244,6 +246,8 @@ fn format_array(arr: Vec<DataValue>, version: Version) -> String {
             DataValue::BoolFalse => "false".to_string(),
 
             DataValue::SignedNumber(num) => num.to_string(),
+            DataValue::UnsignedNumber(num) => num.to_string(),
+            DataValue::Bytes(bytes) => format!("<{} bytes>", bytes.len()),
 
             _ => String::new(),
         })

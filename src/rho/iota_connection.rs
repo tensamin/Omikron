@@ -433,7 +433,11 @@ impl IotaConnection {
                     base_call_map.insert(DataType::HasAdmin.to_id(&tm), DataValue::Bool(true));
                 }
 
-                // Add to global calls (without contact-specific secret)
+                if let Some(secret) = call.get_secret_for_user(user_id).await {
+                    base_call_map.insert(DataType::CallSecret.to_id(&tm), secret.to_data_value());
+                }
+
+                // Add to global calls with only this user's recipient-specific secret.
                 global_calls.push(DataValue::container_from_map(&base_call_map));
 
                 // Attach this call to EVERY member of the call (other than ourselves)
@@ -443,15 +447,7 @@ impl IotaConnection {
                         continue;
                     }
 
-                    let mut contact_call_map = base_call_map.clone();
-
-                    // Add secret if it exists for this pairing
-                    if let Some(secret) = call.secrets.read().await.get(&(member_id, user_id)) {
-                        contact_call_map.insert(
-                            DataType::CallSecret.to_id(&tm),
-                            DataValue::Str(secret.clone()),
-                        );
-                    }
+                    let contact_call_map = base_call_map.clone();
 
                     invites
                         .entry(member_id as i64)
@@ -535,7 +531,12 @@ impl IotaConnection {
     }
 
     pub async fn handle_close(&self) {
-        log_out!(self.iota_id as i64, PrintType::Iota, "Iota {} disconnected", self.iota_id);
+        log_out!(
+            self.iota_id as i64,
+            PrintType::Iota,
+            "Iota {} disconnected",
+            self.iota_id
+        );
         if let Some(rho_conn) = self.get_rho_connection().await {
             rho_conn.close_iota_connection().await;
         }
