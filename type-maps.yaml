@@ -218,3 +218,4 @@ type_maps:
       SenderUserId: 152
       RecipientUserId: 153
       Recipients: 154
+      ReplyId: 155
