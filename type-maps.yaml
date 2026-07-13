@@ -148,6 +148,7 @@ type_maps:
       MessageReactionAdd: 146
       MessageReactionRemove: 147
       MessageReactionLive: 148
+      MessageDeleteLive: 150
     DataTypes:
       ErrorType: 32
       ErrorProtocol: 33
@@ -264,5 +265,5 @@ type_maps:
       Recipients: 154
       Edited: 155
       Reactions: 156
-      Reaction:
+      Reaction: 157
       ReplyId: 158
