@@ -53,8 +53,7 @@
       "inputs": {
         "flake-parts": "flake-parts",
         "nixpkgs": "nixpkgs",
-        "rust-overlay": "rust-overlay",
-        "ttp": "ttp"
+        "rust-overlay": "rust-overlay"
       }
     },
     "rust-overlay": {
@@ -75,22 +74,6 @@
         "owner": "oxalica",
         "repo": "rust-overlay",
         "type": "github"
-      }
-    },
-    "ttp": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1780494955,
-        "narHash": "sha256-i2VRRF6yNips3c4JHgfvmvMxb0HTkTCn69lmsKZLHRw=",
-        "ref": "refs/heads/main",
-        "rev": "23438fa8f884e6ad0d32ca1004c0dedcce0cc8d2",
-        "revCount": 125,
-        "type": "git",
-        "url": "https://git.methanium.net/tensamin/ttp.git"
-      },
-      "original": {
-        "type": "git",
-        "url": "https://git.methanium.net/tensamin/ttp.git"
       }
     }
   },
