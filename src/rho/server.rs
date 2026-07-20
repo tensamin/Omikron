@@ -13,7 +13,8 @@ use crate::{
 };
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::PublicKeyBundle;
-use mtp::host::{AuthenticationPolicy, Host, HostConfig, Policy, SendMode};
+use mtp::host::{AuthenticationPolicy, HostConfig, Policy, SendMode};
+use mtp::webserver::{MTPWebServer, WebServerConfig};
 
 /*
  * Resolves the PublicKeyBundle mtp needs to verify a login's signed
@@ -107,22 +108,21 @@ pub async fn start(port: u16) -> Result<(), Box<dyn std::error::Error>> {
         cert_pem,
         key_pem,
     )
-    .with_policy(Policy {
-        send_mode: SendMode::SingleStreamPerMessage,
-        max_message_size: 1_000_000_000,
-        close_frame_len: u32::MAX,
-        application_close_code: 0,
-        open_stream_timeout: Duration::from_millis(2_000),
-        write_timeout: Duration::from_millis(2_000),
-        accept_stream_timeout: Duration::from_millis(10_000),
-        read_timeout: Duration::from_millis(30_000),
-        keep_alive_interval: Some(Duration::from_secs(6)),
-        max_idle_timeout: Some(Duration::from_secs(30)),
-        force_close_delay: Duration::from_millis(300),
-        max_transient_recv_errors: 20,
-        transient_recv_backoff: Duration::from_millis(100),
-        receiver_queue_capacity: 1000,
-    })
+    .with_policy(
+        Policy::default()
+            .with_send_mode(SendMode::SingleStreamPerMessage)
+            .with_max_message_size(1_000_000_000)
+            .with_timeouts(
+                Duration::from_millis(2_000),
+                Duration::from_millis(2_000),
+                Duration::from_millis(30_000),
+            )
+            .with_keep_alive(Some(Duration::from_secs(6)))
+            .with_max_idle_timeout(Some(Duration::from_secs(30)))
+            .with_receiver_queue_capacity(1000)
+            .with_max_concurrent_stream_tasks(10)
+            .with_persistent_stream_retries(5, Duration::from_secs(5)),
+    )
     .with_authentication(
         load_keyring(),
         Box::new(|user_id, description| Box::pin(get_by_connector_id(user_id, description))),
@@ -130,7 +130,9 @@ pub async fn start(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_authentication_policy(AuthenticationPolicy::AllowAuthentication);
 
-    let mut host: Host = Host::new(host_config).await?;
+    let web_config = WebServerConfig::new()
+        .route("/", |_request, response| async move { response.body("OK") })?;
+    let mut host = MTPWebServer::new(host_config, web_config).await?;
     log!(0, PrintType::General, "Server listening on port {}.", port);
 
     loop {

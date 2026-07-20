@@ -6,7 +6,7 @@ use crate::log_err;
 use crate::log_in;
 use crate::log_out;
 use crate::omega::omega_connection::get_omega_connection;
-use crate::rho::connection::GeneralConnection;
+use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
 use crate::util::logger::PrintType;
 use dashmap::DashMap;
 use mtp::codec::CommunicationType;
@@ -16,8 +16,6 @@ use mtp::codec::DataTypeId;
 use mtp::codec::DataValue;
 use mtp::codec::TypeMap;
 use mtp::crypto::KemPublicKey;
-use mtp::host::Receiver;
-use mtp::host::Sender;
 use std::collections::BTreeMap;
 use std::{collections::HashMap, sync::Arc, sync::LazyLock, time::Duration};
 use tokio::sync::RwLock;
@@ -33,8 +31,8 @@ static PENDING_CHAT_SECRETS: LazyLock<DashMap<u64, Vec<CommunicationValue>>> =
 pub struct IotaConnection {
     pub iota_id: u64,
     pub client_version: String,
-    pub sender: Arc<Sender>,
-    pub receiver: Arc<Receiver>,
+    pub sender: Arc<MtpSender>,
+    pub receiver: Arc<MtpReceiver>,
     pub user_ids: Arc<RwLock<Vec<u64>>>,
     pub ping: Arc<RwLock<i64>>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,

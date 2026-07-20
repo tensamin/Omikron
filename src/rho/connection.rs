@@ -14,7 +14,11 @@ use crate::{
     util::logger::PrintType,
 };
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue};
-use mtp::host::{AuthState, Connection as MTPHostConnection, Receiver, Sender};
+use mtp::host::AuthState;
+use mtp::webserver::{WebMTPConnection, WebMtpReceiver, WebMtpSender};
+
+pub type MtpSender = WebMtpSender;
+pub type MtpReceiver = WebMtpReceiver;
 
 /*
  * How a connection identified itself during the mtp handshake driven by
@@ -34,8 +38,8 @@ pub enum ConnectionKind {
 }
 
 pub struct GeneralConnection {
-    pub sender: Arc<Sender>,
-    pub receiver: Arc<Receiver>,
+    pub sender: Arc<MtpSender>,
+    pub receiver: Arc<MtpReceiver>,
 
     connection_kind: ConnectionKind,
     id: u64,
@@ -50,14 +54,14 @@ pub struct GeneralConnection {
 impl GeneralConnection {
     /*
      * `conn` has already been authenticated (or deliberately left
-     * unauthenticated) by `mtp::host::Host::accept`, via the
+     * unauthenticated) by `mtp::webserver::MTPWebServer::accept`, via the
      * `get_by_connector_id`/`complete_register` callbacks in `server.rs`
      * keyed off `conn.description`. There is no separate application-level
      * challenge step anymore; a connection whose description doesn't resolve
      * to a known, appropriately-authenticated kind is rejected here instead
      * of being handed off to a connection handler.
      */
-    pub fn new(conn: MTPHostConnection) -> Option<Arc<Self>> {
+    pub fn new(conn: WebMTPConnection) -> Option<Arc<Self>> {
         let kind = match (conn.description.as_deref(), &conn.auth_state) {
             (Some("iota"), AuthState::Authenticated) => ConnectionKind::Iota,
             (Some("client"), AuthState::Authenticated) => ConnectionKind::Client,

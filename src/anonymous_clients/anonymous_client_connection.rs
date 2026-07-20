@@ -1,5 +1,4 @@
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
-use mtp::host::{Receiver, Sender};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +9,7 @@ use crate::anonymous_clients::anonymous_manager::{self, generate_username};
 use crate::calls::{call_group::call_invite_secret_from_cv, call_manager};
 use crate::data::user::UserStatus;
 use crate::omega::omega_connection::{OmegaConnection, get_omega_connection};
-use crate::rho::connection::GeneralConnection;
+use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
 use crate::rho::rho_manager;
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_out};
@@ -18,8 +17,8 @@ use crate::{log_cv_in, log_cv_out, log_out};
 pub struct AnonymousClientConnection {
     user_id: u64,
 
-    pub sender: Arc<Sender>,
-    pub receiver: Arc<Receiver>,
+    pub sender: Arc<MtpSender>,
+    pub receiver: Arc<MtpReceiver>,
     pub ping: Arc<RwLock<i64>>,
     pub interested_users: Arc<RwLock<Vec<i64>>>,
     is_open: Arc<RwLock<bool>>,

@@ -1,17 +1,17 @@
 use crate::anonymous_clients::anonymous_manager;
 use crate::calls::{call_group::call_invite_secret_from_cv, call_manager, call_util};
 use crate::omega::omega_connection::get_omega_connection;
-use crate::rho::connection::GeneralConnection;
+use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
 use crate::rho::{rho_connection::RhoConnection, rho_manager};
 use crate::util::logger::PrintType;
 use crate::{data::user::UserStatus, omega::omega_connection::OmegaConnection};
 use crate::{log_cv_in, log_cv_out, log_err, log_in, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
-use mtp::host::{Receiver, Sender};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+use trust_dns_resolver::TokioAsyncResolver;
 use uuid::Uuid;
 
 pub struct ClientConnection {
@@ -19,8 +19,8 @@ pub struct ClientConnection {
     pub session_id: u64,
     pub client_version: String,
 
-    pub sender: Arc<Sender>,
-    pub receiver: Arc<Receiver>,
+    pub sender: Arc<MtpSender>,
+    pub receiver: Arc<MtpReceiver>,
     pub ping: Arc<RwLock<i64>>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
@@ -611,27 +611,52 @@ impl ClientConnection {
 
     async fn handle_load_txt_record(self: Arc<Self>, cv: CommunicationValue) {
         if let Some(path) = cv.get_data(DataType::Path).as_str() {
-            if let Ok(builder) = hickory_resolver::Resolver::builder_tokio() {
-                let resolver = builder.build();
-                if let Ok(lookup) = resolver.txt_lookup(path).await {
-                    for record in lookup.iter() {
-                        for txt_data in record.txt_data() {
-                            if let Ok(s) = std::str::from_utf8(txt_data) {
-                                let response =
-                                    CommunicationValue::new(CommunicationType::LoadTxtRecord)
-                                        .with_id(cv.get_id())
-                                        .add_typed_default(
-                                            DataType::Content,
-                                            DataValue::Str(s.to_string()),
-                                        );
-                                self.send_message(&response).await;
-                                return;
-                            }
-                        }
+            let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
+                Ok(r) => r,
+                Err(_) => {
+                    let path_data = cv.get_data(DataType::Path).clone();
+                    let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
+                        .with_id(cv.get_id())
+                        .add_typed_default(DataType::Path, path_data);
+                    self.send_message(&error_cv).await;
+                    return;
+                }
+            };
+
+            match resolver.txt_lookup(path).await {
+                Ok(txt_lookup) => {
+                    if let Some(txt_record) = txt_lookup.iter().next() {
+                        let record_text: String = txt_record
+                            .txt_data()
+                            .iter()
+                            .map(|b| String::from_utf8_lossy(b))
+                            .collect();
+
+                        let response = CommunicationValue::new(CommunicationType::LoadTxtRecord)
+                            .with_id(cv.get_id())
+                            .add_typed_default(DataType::Content, DataValue::Str(record_text));
+                        self.send_message(&response).await;
+                        return;
                     }
+
+                    let path_data = cv.get_data(DataType::Path).clone();
+                    let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
+                        .with_id(cv.get_id())
+                        .add_typed_default(DataType::Path, path_data);
+                    self.send_message(&error_cv).await;
+                }
+                Err(_) => {
+                    let path_data = cv.get_data(DataType::Path).clone();
+                    let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
+                        .with_id(cv.get_id())
+                        .add_typed_default(DataType::Path, path_data);
+                    self.send_message(&error_cv).await;
                 }
             }
+
+            return;
         }
+
         let path_data = cv.get_data(DataType::Path).clone();
         let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
             .with_id(cv.get_id())

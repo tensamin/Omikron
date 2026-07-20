@@ -1,11 +1,10 @@
 use crate::anonymous_clients::anonymous_manager;
 use crate::omega::omega_connection::get_omega_connection;
-use crate::rho::connection::GeneralConnection;
+use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
 use crate::rho::{rho_connection::RhoConnection, rho_manager};
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err, log_in, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
-use mtp::host::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -17,8 +16,8 @@ pub struct AppConnection {
     pub app_session: Uuid,
     pub client_version: String,
 
-    pub sender: Arc<Sender>,
-    pub receiver: Arc<Receiver>,
+    pub sender: Arc<MtpSender>,
+    pub receiver: Arc<MtpReceiver>,
     pub ping: Arc<RwLock<i64>>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,

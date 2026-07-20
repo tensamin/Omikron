@@ -16,7 +16,7 @@ pub static WORKING_DIR: Lazy<PathBuf> =
 use rustls::crypto::aws_lc_rs::default_provider;
 
 use mtp::crypto::Keyring;
-use mtp::files::{load_keyring as load_keyring_file, save_keyring, save_public_key_bundle};
+use mtp::files::{load_keyring_raw, save_keyring_raw, save_public_key_bundle};
 
 use crate::{
     calls::call_util::garbage_collect_calls, omega::omega_connection::get_omega_connection,
@@ -27,9 +27,9 @@ const KEYRING_PATH: &str = "./omikron.mk";
 const PUBLIC_KEY_PATH: &str = "./omikron.mpkb";
 
 static KEYRING: Lazy<Keyring> = Lazy::new(|| {
-    load_keyring_file(KEYRING_PATH).unwrap_or_else(|_| {
+    load_keyring_raw(KEYRING_PATH).unwrap_or_else(|_| {
         let kr = Keyring::generate();
-        save_keyring(&kr, KEYRING_PATH).expect("Failed to save generated keyring");
+        save_keyring_raw(&kr, KEYRING_PATH).expect("Failed to save generated keyring");
         save_public_key_bundle(&kr.public_key_bundle(), PUBLIC_KEY_PATH)
             .expect("Failed to save generated public key bundle");
         eprintln!("Generated new keyring at {}", KEYRING_PATH);
@@ -56,7 +56,7 @@ async fn main() {
     let rho_port = env::var("RHO_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(959);
+        .unwrap_or(443);
 
     get_omega_connection();
     tokio::spawn(async move {

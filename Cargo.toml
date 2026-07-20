@@ -5,13 +5,11 @@ edition = "2024"
 
 [dependencies]
 mtp = { git = "https://git.methanium.net/Methanium/mtp.git", features = [
-    "host",
+    "web-server",
     "client",
     "crypto",
     "files",
 ] }
-# Needed directly for `ConnectionHandle`, which `mtp-client` does not re-export.
-# Pulled in transitively already via `mtp`, so this just names the same crate/commit.
 mtp-transport = { git = "https://git.methanium.net/Methanium/mtp.git" }
 
 ansi_term = "*"
@@ -21,7 +19,7 @@ dashmap = "*"
 futures = "*"
 once_cell = "1.21.4"
 rand = "0.8"
-rustls = { version = "0.23.40", default-features = false, features = [
+rustls = { version = "0.23.42", default-features = false, features = [
     "std",
     "tls12",
     "aws-lc-rs",
@@ -32,10 +30,10 @@ log = "0.4"
 dotenv = "0.15.0"
 strum = "0.28.0"
 strum_macros = "0.28.0"
-livekit-api = { version = "0.5.0", features = ["native-tls"] }
-livekit-protocol = "0.7.8"
-thiserror = "2.0.18"
-hickory-resolver = "0.25.2"
-serde = "1.0.228"
-serde_json = "1.0.149"
+livekit-api = { version = "0.5.6", features = ["native-tls"] }
+livekit-protocol = "0.7.10"
+thiserror = "2.0.19"
+trust-dns-resolver = "0.23.2"
+serde = "1.0.229"
+serde_json = "1.0.150"
 json = "0.12.4"

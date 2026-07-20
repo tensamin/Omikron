@@ -109,7 +109,7 @@
 
               rhoPort = lib.mkOption {
                 type = lib.types.port;
-                default = 959;
+                default = 443;
                 description = "Port the Omikron server listens on for incoming QUIC connections.";
               };
 

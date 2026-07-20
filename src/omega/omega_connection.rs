@@ -263,22 +263,21 @@ impl OmegaConnection {
                     .parse::<u64>()
                     .unwrap_or(0),
             )
-            .with_policy(Policy {
-                send_mode: SendMode::SingleStreamPerMessage,
-                max_message_size: 1_000_000_000,
-                close_frame_len: u32::MAX,
-                application_close_code: 0,
-                open_stream_timeout: Duration::from_millis(2_000),
-                write_timeout: Duration::from_millis(2_000),
-                accept_stream_timeout: Duration::from_millis(10_000),
-                read_timeout: Duration::from_millis(30_000),
-                keep_alive_interval: Some(Duration::from_secs(6)),
-                max_idle_timeout: Some(Duration::from_secs(30)),
-                force_close_delay: Duration::from_millis(300),
-                max_transient_recv_errors: 20,
-                transient_recv_backoff: Duration::from_millis(100),
-                receiver_queue_capacity: 1000,
-            });
+            .with_policy(
+                Policy::default()
+                    .with_send_mode(SendMode::SingleStreamPerMessage)
+                    .with_max_message_size(1_000_000_000)
+                    .with_timeouts(
+                        Duration::from_millis(2_000),
+                        Duration::from_millis(2_000),
+                        Duration::from_millis(30_000),
+                    )
+                    .with_keep_alive(Some(Duration::from_secs(6)))
+                    .with_max_idle_timeout(Some(Duration::from_secs(30)))
+                    .with_receiver_queue_capacity(1000)
+                    .with_max_concurrent_stream_tasks(10)
+                    .with_persistent_stream_retries(5, Duration::from_secs(5)),
+            );
 
         let host_public_key = load_public_key_bundle("./omega.mpkb")
             .map_err(|e| format!("Failed to load omega.mpkb: {}", e))?;
