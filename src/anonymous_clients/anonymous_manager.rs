@@ -1,7 +1,6 @@
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use rand::Rng;
-use rand::seq::SliceRandom;
+use rand::prelude::{IndexedRandom, RngExt};
 use std::sync::Arc;
 
 use crate::anonymous_clients::anonymous_client_connection::AnonymousClientConnection;
@@ -45,11 +44,11 @@ pub fn generate_username() -> String {
     let adjectives = ["Swift", "Clever", "Brave", "Sneaky", "Fierce"];
     let nouns = ["Tiger", "Eagle", "Shark", "Wolf", "Dragon"];
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let adj = adjectives.choose(&mut rng).unwrap();
     let noun = nouns.choose(&mut rng).unwrap();
 
-    let number: u16 = rng.gen_range(0..10000);
+    let number: u16 = rng.random_range(0..10000);
 
     format!("{}{}{}", adj, noun, number)
 }

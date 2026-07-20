@@ -1,19 +1,18 @@
-use std::{collections::BTreeMap, collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
     anonymous_clients::anonymous_client_connection::AnonymousClientConnection,
-    calls::call_manager,
+    app_state::AppState,
     log_cv_out, log_err, log_in, log_out,
-    omega::omega_connection::get_omega_connection,
     rho::{
         app_connection::AppConnection, client_connection::ClientConnection,
-        iota_connection::IotaConnection, rho_connection::RhoConnection, rho_manager,
+        iota_connection::IotaConnection, rho_connection::RhoConnection,
     },
     util::logger::PrintType,
 };
-use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue};
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::host::AuthState;
 use mtp::webserver::{WebMTPConnection, WebMtpReceiver, WebMtpSender};
 
@@ -38,6 +37,7 @@ pub enum ConnectionKind {
 }
 
 pub struct GeneralConnection {
+    pub state: Arc<AppState>,
     pub sender: Arc<MtpSender>,
     pub receiver: Arc<MtpReceiver>,
 
@@ -61,7 +61,7 @@ impl GeneralConnection {
      * to a known, appropriately-authenticated kind is rejected here instead
      * of being handed off to a connection handler.
      */
-    pub fn new(conn: WebMTPConnection) -> Option<Arc<Self>> {
+    pub fn new(conn: WebMTPConnection, state: Arc<AppState>) -> Option<Arc<Self>> {
         let kind = match (conn.description.as_deref(), &conn.auth_state) {
             (Some("iota"), AuthState::Authenticated) => ConnectionKind::Iota,
             (Some("client"), AuthState::Authenticated) => ConnectionKind::Client,
@@ -70,6 +70,7 @@ impl GeneralConnection {
         };
 
         Some(Arc::new(Self {
+            state,
             sender: Arc::new(conn.sender),
             receiver: Arc::new(conn.receiver),
             connection_kind: kind,
@@ -89,293 +90,181 @@ impl GeneralConnection {
     }
 
     async fn migrate(self: &Arc<Self>) -> bool {
-        let id = self.id;
-
         match self.connection_kind {
-            ConnectionKind::Client => {
-                let notify = CommunicationValue::new(CommunicationType::UserConnected)
-                    .add_typed_default(
-                        DataType::UserId,
-                        DataValue::SignedNumber((id as i64).into()),
-                    );
-                get_omega_connection().send_message(&notify).await;
-
-                let user_id = id as i64;
-
-                let client = ClientConnection::from_general(self.clone(), id).await;
-
-                let mut rho = rho_manager::get_rho_con_for_user(user_id).await;
-
-                if rho.is_none() {
-                    let get_user_msg = CommunicationValue::new(CommunicationType::GetUserData)
-                        .add_typed_default(
-                            DataType::UserId,
-                            DataValue::SignedNumber(user_id.into()),
-                        );
-
-                    if let Ok(user_data_cv) = get_omega_connection()
-                        .await_response(&get_user_msg, Some(Duration::from_secs(20)))
-                        .await
-                    {
-                        if let DataValue::SignedNumber(iota_id) =
-                            user_data_cv.get_data(DataType::IotaId)
-                        {
-                            if let Some(bound_rho) =
-                                rho_manager::bind_user_to_iota(user_id, *iota_id as i64).await
-                            {
-                                bound_rho.bind_user_id(user_id).await;
-                                rho = Some(bound_rho);
-                            }
-                        }
-                    }
-                }
-
-                *self.rho_connection.write().await = rho.clone();
-
-                if let Some(rho_conn) = rho {
-                    let session_id = *self.session_id.read().await as i64;
-                    let iota_msg = CommunicationValue::new(CommunicationType::ClientConnected)
-                        .add_typed_default(
-                            DataType::UserId,
-                            DataValue::SignedNumber(user_id.into()),
-                        )
-                        .add_typed_default(
-                            DataType::SessionId,
-                            DataValue::SignedNumber(session_id.into()),
-                        );
-
-                    if let Ok(resp) = rho_conn
-                        .get_iota_connection()
-                        .clone()
-                        .await_response(&iota_msg, Some(Duration::from_secs(20)))
-                        .await
-                    {
-                        /*
-                         * mtp's handshake already confirmed this login; this
-                         * message is an unsolicited push carrying the initial
-                         * contacts/calls state, not a reply to a client-side
-                         * request id (the old raw hello frame this used to
-                         * reply to no longer reaches application code).
-                         */
-                        let mut ident_resp =
-                            CommunicationValue::new(CommunicationType::IdentificationResponse);
-                        let tm = mtp::codec::TypeMap::latest();
-                        for (k, v) in resp.iter_typed_data() {
-                            let value_to_add = if k == Some(DataType::Contacts) {
-                                if let Some(contacts) = v.as_array() {
-                                    let call_groups =
-                                        call_manager::get_call_groups(user_id as u64).await;
-                                    let mut invites: HashMap<i64, Vec<DataValue>> = HashMap::new();
-                                    let mut global_calls: Vec<DataValue> = Vec::new();
-
-                                    for call in call_groups {
-                                        let members = call.members.read().await;
-
-                                        let call_self =
-                                            members.iter().find(|m| m.user_id == user_id as u64);
-
-                                        if let Some(call_self) = call_self {
-                                            let timeout = *call_self.timeout.read().await;
-                                            let admin = call_self.has_admin();
-
-                                            // List of all members in the call
-                                            let member_ids: Vec<DataValue> = members
-                                                .iter()
-                                                .map(|m| DataValue::SignedNumber(m.user_id.into()))
-                                                .collect();
-
-                                            let mut base_call_map: BTreeMap<DataTypeId, DataValue> =
-                                                BTreeMap::new();
-                                            base_call_map.insert(
-                                                DataType::CallId.to_id(&tm),
-                                                DataValue::Str(call.call_id.to_string()),
-                                            );
-                                            base_call_map.insert(
-                                                DataType::CallMembers.to_id(&tm),
-                                                DataValue::Array(member_ids),
-                                            );
-
-                                            if timeout > 0 {
-                                                base_call_map.insert(
-                                                    DataType::Timeout.to_id(&tm),
-                                                    DataValue::SignedNumber(
-                                                        (timeout as i64).into(),
-                                                    ),
-                                                );
-                                            }
-
-                                            if admin {
-                                                base_call_map.insert(
-                                                    DataType::HasAdmin.to_id(&tm),
-                                                    DataValue::Bool(true),
-                                                );
-                                            }
-
-                                            if let Some(secret) =
-                                                call.get_secret_for_user(user_id as u64).await
-                                            {
-                                                base_call_map.insert(
-                                                    DataType::CallSecret.to_id(&tm),
-                                                    secret.to_data_value(),
-                                                );
-                                            }
-
-                                            // Add to global calls with only this user's recipient-specific secret.
-                                            global_calls.push(DataValue::container_from_map(
-                                                &base_call_map,
-                                            ));
-
-                                            for member in members.iter() {
-                                                let member_id = member.user_id;
-                                                if member_id == user_id as u64 {
-                                                    continue;
-                                                }
-
-                                                let contact_call_map = base_call_map.clone();
-
-                                                invites
-                                                    .entry(member_id as i64)
-                                                    .or_insert_with(Vec::new)
-                                                    .push(DataValue::container_from_map(
-                                                        &contact_call_map,
-                                                    ));
-                                            }
-                                        }
-                                    }
-
-                                    let mut new_contacts: Vec<DataValue> = Vec::new();
-                                    for contact in contacts {
-                                        if let Some(mut contact_map) = contact.as_map() {
-                                            if let Some(DataValue::SignedNumber(id)) =
-                                                contact_map.get(&DataType::UserId.to_id(&tm))
-                                            {
-                                                if let Some(call_list) = invites.get(&(*id as i64))
-                                                {
-                                                    contact_map.insert(
-                                                        DataType::Calls.to_id(&tm),
-                                                        DataValue::Array(call_list.clone()),
-                                                    );
-                                                }
-                                            }
-                                            new_contacts
-                                                .push(DataValue::container_from_map(&contact_map));
-                                        } else {
-                                            new_contacts.push(contact.clone());
-                                        }
-                                    }
-
-                                    ident_resp = ident_resp.add_typed_default(
-                                        DataType::Calls,
-                                        DataValue::Array(global_calls),
-                                    );
-                                    DataValue::Array(new_contacts)
-                                } else {
-                                    v.clone()
-                                }
-                            } else {
-                                v.clone()
-                            };
-
-                            if let Some(dt) = k {
-                                ident_resp = ident_resp.add_typed_default(dt, value_to_add);
-                            }
-                        }
-                        log_cv_out!(ident_resp);
-                        let _ = self.sender.send(&ident_resp).await;
-                        rho_conn.bind_user_id(user_id).await;
-                        rho_conn.add_client_connection(client.clone()).await;
-                    }
-                } else {
-                    log_err!(
-                        user_id,
-                        PrintType::Client,
-                        "No RhoConnection found for user {}, client not attached to iota",
-                        id
-                    );
-                }
-
-                client.start();
-            }
-            ConnectionKind::Iota => {
-                log_in!(id as i64, PrintType::Iota, "Iota {} connected", id);
-
-                let notify = CommunicationValue::new(CommunicationType::IotaConnected)
-                    .add_typed_default(DataType::IotaId, DataValue::SignedNumber(id.into()));
-                get_omega_connection().send_message(&notify).await;
-
-                let iota = IotaConnection::from_general(self.clone(), id).await;
-
-                let rho = Arc::new(RhoConnection::new(iota.clone(), Vec::new()).await);
-
-                iota.set_rho_connection(rho.clone()).await;
-
-                rho_manager::add_rho(rho).await;
-
-                let get_iota_msg = CommunicationValue::new(CommunicationType::GetIotaData)
-                    .add_typed_default(DataType::IotaId, DataValue::SignedNumber(id.into()));
-
-                if let Ok(iota_data_cv) = get_omega_connection()
-                    .await_response(&get_iota_msg, Some(Duration::from_secs(20)))
-                    .await
-                {
-                    if let DataValue::Array(users) = iota_data_cv.get_data(DataType::UserIds) {
-                        let mut user_ids: Vec<u64> = Vec::new();
-                        for value in users {
-                            if let DataValue::SignedNumber(user_id) = value {
-                                user_ids.push(*user_id as u64);
-                            }
-                        }
-                        iota.set_user_ids(user_ids).await;
-                    }
-                }
-
-                // mtp's handshake already confirmed this login/registration to the Iota.
-                iota.clone().start();
-            }
-            ConnectionKind::AnonymousClient => {
-                let client = AnonymousClientConnection::from_general(self.clone(), id).await;
-                client.start();
-            }
-            ConnectionKind::Phi => {
-                let user_id = id as i64;
-                let mut rho = rho_manager::get_rho_con_for_user(user_id).await;
-
-                if rho.is_none() {
-                    let get_user_msg = CommunicationValue::new(CommunicationType::GetUserData)
-                        .add_typed_default(
-                            DataType::UserId,
-                            DataValue::SignedNumber(user_id.into()),
-                        );
-
-                    if let Ok(user_data_cv) = get_omega_connection()
-                        .await_response(&get_user_msg, Some(Duration::from_secs(20)))
-                        .await
-                    {
-                        if let DataValue::SignedNumber(iota_id) =
-                            user_data_cv.get_data(DataType::IotaId)
-                        {
-                            if let Some(bound_rho) =
-                                rho_manager::bind_user_to_iota(user_id, *iota_id as i64).await
-                            {
-                                bound_rho.bind_user_id(user_id).await;
-                                rho = Some(bound_rho);
-                            }
-                        }
-                    }
-                }
-
-                *self.rho_connection.write().await = rho.clone();
-
-                let app_conn = AppConnection::from_general(self.clone(), id).await;
-
-                if let Some(rho_conn) = rho {
-                    rho_conn.bind_user_id(user_id).await;
-                    rho_conn.add_app_connection(app_conn.clone()).await;
-                }
-
-                app_conn.start();
-            }
+            ConnectionKind::Client => self.migrate_client().await,
+            ConnectionKind::Iota => self.migrate_iota().await,
+            ConnectionKind::AnonymousClient => self.migrate_anonymous_client().await,
+            ConnectionKind::Phi => self.migrate_phi().await,
         }
         true
+    }
+
+    async fn migrate_client(self: &Arc<Self>) {
+        let id = self.id;
+        let user_id = id as i64;
+        self.notify_user_connected(user_id).await;
+
+        let client = ClientConnection::from_general(self.clone(), id).await;
+        let rho = self.find_user_rho(user_id).await;
+        *self.rho_connection.write().await = rho.clone();
+
+        if let Some(rho_conn) = rho {
+            if let Some(response) = self.request_initial_client_state(&rho_conn, user_id).await {
+                let response = self.add_call_state(response, user_id).await;
+                log_cv_out!(response);
+                let _ = self.sender.send(&response).await;
+                rho_conn.bind_user_id(user_id).await;
+                rho_conn.add_client_connection(client.clone()).await;
+            }
+        } else {
+            log_err!(
+                user_id,
+                PrintType::Client,
+                "No RhoConnection found for user {}, client not attached to iota",
+                id
+            );
+        }
+
+        client.start();
+    }
+
+    async fn notify_user_connected(&self, user_id: i64) {
+        let notify = CommunicationValue::new(CommunicationType::UserConnected)
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
+        self.state.omega.clone().send_message(&notify).await;
+    }
+
+    async fn find_user_rho(&self, user_id: i64) -> Option<Arc<RhoConnection>> {
+        if let Some(rho) = self.state.rho.get_for_user(user_id).await {
+            return Some(rho);
+        }
+
+        let get_user_msg = CommunicationValue::new(CommunicationType::GetUserData)
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
+        let Ok(user_data_cv) = self
+            .state
+            .omega
+            .clone()
+            .await_response(&get_user_msg, Some(Duration::from_secs(20)))
+            .await
+        else {
+            return None;
+        };
+
+        let DataValue::SignedNumber(iota_id) = user_data_cv.get_data(DataType::IotaId) else {
+            return None;
+        };
+        let rho = self
+            .state
+            .rho
+            .bind_user_to_iota(user_id, *iota_id as i64)
+            .await?;
+        rho.bind_user_id(user_id).await;
+        Some(rho)
+    }
+
+    async fn request_initial_client_state(
+        &self,
+        rho: &Arc<RhoConnection>,
+        user_id: i64,
+    ) -> Option<CommunicationValue> {
+        let session_id = *self.session_id.read().await as i64;
+        let request = CommunicationValue::new(CommunicationType::ClientConnected)
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
+            .add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id.into()),
+            );
+        rho.get_iota_connection()
+            .clone()
+            .await_response(&request, Some(Duration::from_secs(20)))
+            .await
+            .ok()
+    }
+
+    async fn add_call_state(
+        &self,
+        response: CommunicationValue,
+        user_id: i64,
+    ) -> CommunicationValue {
+        let mut output = CommunicationValue::new(CommunicationType::IdentificationResponse);
+
+        for (key, value) in response.iter_typed_data() {
+            if key == Some(DataType::Contacts) {
+                if let Some(contacts) = value.as_array() {
+                    let (contacts, global_calls) = self
+                        .state
+                        .call_state_aggregator
+                        .augment_contacts(user_id as u64, contacts.clone())
+                        .await;
+                    output =
+                        output.add_typed_default(DataType::Contacts, DataValue::Array(contacts));
+                    output =
+                        output.add_typed_default(DataType::Calls, DataValue::Array(global_calls));
+                    continue;
+                }
+            }
+            if let Some(data_type) = key {
+                output = output.add_typed_default(data_type, value.clone());
+            }
+        }
+        output
+    }
+
+    async fn migrate_iota(self: &Arc<Self>) {
+        let id = self.id;
+        log_in!(id as i64, PrintType::Iota, "Iota {} connected", id);
+        let notify = CommunicationValue::new(CommunicationType::IotaConnected)
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(id.into()));
+        self.state.omega.clone().send_message(&notify).await;
+
+        let iota = IotaConnection::from_general(self.clone(), id).await;
+        let rho = Arc::new(RhoConnection::new(iota.clone(), Vec::new()).await);
+        iota.set_rho_connection(rho.clone()).await;
+        self.state.rho.add(rho).await;
+        self.load_iota_users(&iota, id).await;
+        iota.start();
+    }
+
+    async fn load_iota_users(&self, iota: &Arc<IotaConnection>, iota_id: u64) {
+        let request = CommunicationValue::new(CommunicationType::GetIotaData)
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()));
+        let Ok(response) = self
+            .state
+            .omega
+            .clone()
+            .await_response(&request, Some(Duration::from_secs(20)))
+            .await
+        else {
+            return;
+        };
+        let DataValue::Array(users) = response.get_data(DataType::UserIds) else {
+            return;
+        };
+        let user_ids = users
+            .iter()
+            .filter_map(|value| match value {
+                DataValue::SignedNumber(id) => Some(*id as u64),
+                _ => None,
+            })
+            .collect();
+        iota.set_user_ids(user_ids).await;
+    }
+
+    async fn migrate_anonymous_client(self: &Arc<Self>) {
+        let client = AnonymousClientConnection::from_general(self.clone(), self.id).await;
+        client.start();
+    }
+
+    async fn migrate_phi(self: &Arc<Self>) {
+        let user_id = self.id as i64;
+        let rho = self.find_user_rho(user_id).await;
+        *self.rho_connection.write().await = rho.clone();
+        let app_conn = AppConnection::from_general(self.clone(), self.id).await;
+        if let Some(rho_conn) = rho {
+            rho_conn.bind_user_id(user_id).await;
+            rho_conn.add_app_connection(app_conn.clone()).await;
+        }
+        app_conn.start();
     }
 }

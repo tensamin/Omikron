@@ -6,15 +6,16 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::anonymous_clients::anonymous_manager::{self, generate_username};
-use crate::calls::{call_group::call_invite_secret_from_cv, call_manager};
+use crate::app_state::AppState;
+use crate::calls::call_group::call_invite_secret_from_cv;
 use crate::data::user::UserStatus;
-use crate::omega::omega_connection::{OmegaConnection, get_omega_connection};
 use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
-use crate::rho::rho_manager;
+use crate::util::data_type_id;
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_out};
 
 pub struct AnonymousClientConnection {
+    pub state: Arc<AppState>,
     user_id: u64,
 
     pub sender: Arc<MtpSender>,
@@ -25,12 +26,14 @@ pub struct AnonymousClientConnection {
     pub user_name: Arc<RwLock<String>>,
     pub display_name: Arc<RwLock<String>>,
     pub avatar: Arc<RwLock<String>>,
+    message_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AnonymousClientConnection {
     pub async fn from_general(general: Arc<GeneralConnection>, user_id: u64) -> Arc<Self> {
         let username: String = generate_username();
         Arc::new(Self {
+            state: general.state.clone(),
             user_id: user_id,
 
             ping: Arc::new(RwLock::new(0)),
@@ -41,6 +44,7 @@ impl AnonymousClientConnection {
             user_name: Arc::new(RwLock::new(username.to_lowercase())),
             display_name: Arc::new(RwLock::new(username)),
             avatar: Arc::new(RwLock::new(String::new())),
+            message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
         })
     }
     pub fn start(self: Arc<Self>) {
@@ -102,7 +106,11 @@ impl AnonymousClientConnection {
 
     /// Handle incoming message from client
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(permit) = self.message_slots.clone().acquire_owned().await else {
+            return;
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             if cv.is_type(CommunicationType::Ping) {
                 self.handle_ping(cv).await;
                 return;
@@ -113,7 +121,7 @@ impl AnonymousClientConnection {
                 let call_id = Uuid::parse_str(cv.get_data(DataType::CallId).as_str().unwrap_or(""))
                     .unwrap_or(Uuid::new_v4());
 
-                let call = if let Some(call) = call_manager::get_call(call_id).await {
+                let call = if let Some(call) = self.state.call_manager.get_call(call_id).await {
                     if call.is_anonymous().await {
                         call
                     } else {
@@ -135,7 +143,10 @@ impl AnonymousClientConnection {
 
                 let mut invited = Vec::new();
                 for call_invitee in call.members.read().await.clone() {
-                    let call_invitee_cv = get_omega_connection()
+                    let Ok(call_invitee_cv) = self
+                        .state
+                        .omega
+                        .clone()
                         .await_response(
                             &CommunicationValue::new(CommunicationType::GetUserData)
                                 .add_typed_default(
@@ -145,7 +156,9 @@ impl AnonymousClientConnection {
                             Some(Duration::from_secs(2)),
                         )
                         .await
-                        .unwrap();
+                    else {
+                        continue;
+                    };
                     let mut json_invitee = Vec::new();
                     let _ = json_invitee.push((
                         DataType::UserId,
@@ -167,18 +180,21 @@ impl AnonymousClientConnection {
                     let _ = invited.push(DataValue::Container(
                         json_invitee
                             .iter()
-                            .map(|(k, v)| (k.to_id(&TypeMap::latest()), v.clone()))
+                            .map(|(k, v)| (data_type_id(*k, &TypeMap::latest()), v.clone()))
                             .collect(),
                     ));
                 }
 
-                let token = call.create_anonymous_token(self.get_user_id()).await;
+                let token = match call.create_anonymous_token(self.get_user_id()).await {
+                    Ok(Some(token)) => token,
+                    Ok(None) | Err(_) => return,
+                };
 
                 let mut serialized = Vec::new();
                 let _ = serialized.push((DataType::CallId, DataValue::Str(call_id.to_string())));
                 let _ = serialized.push((DataType::CallInvited, DataValue::Array(invited.clone())));
                 let _ = serialized.push((DataType::CallMembers, DataValue::Array(invited)));
-                let _ = serialized.push((DataType::CallToken, DataValue::Str(token.unwrap())));
+                let _ = serialized.push((DataType::CallToken, DataValue::Str(token)));
                 self.clone()
                     .send_message(
                         &&CommunicationValue::new(CommunicationType::IdentificationResponse)
@@ -204,7 +220,9 @@ impl AnonymousClientConnection {
                                 DataValue::Container(
                                     serialized
                                         .iter()
-                                        .map(|(k, v)| (k.to_id(&TypeMap::latest()), v.clone()))
+                                        .map(|(k, v)| {
+                                            (data_type_id(*k, &TypeMap::latest()), v.clone())
+                                        })
                                         .collect(),
                                 ),
                             ),
@@ -304,7 +322,10 @@ impl AnonymousClientConnection {
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
         let client_for_closure = self.clone();
         tokio::spawn(async move {
-            let response_cv = get_omega_connection()
+            let response_cv = self
+                .state
+                .omega
+                .clone()
                 .await_response(&cv.with_sender(self.user_id), Some(Duration::from_secs(20)))
                 .await;
             if let Ok(response_cv) = response_cv {
@@ -333,7 +354,9 @@ impl AnonymousClientConnection {
     async fn handle_client_changed(self: Arc<Self>, cv: CommunicationValue) {
         if let DataValue::Str(status_str) = cv.get_data(DataType::UserState) {
             let user_status = UserStatus::from_str(&status_str).unwrap_or(UserStatus::user_online);
-            OmegaConnection::client_changed(self.user_id as i64, self.user_id as i64, user_status)
+            self.state
+                .omega
+                .client_changed(self.user_id as i64, self.user_id as i64, user_status)
                 .await;
         }
     }
@@ -371,23 +394,29 @@ impl AnonymousClientConnection {
                 return;
             }
         };
-        let invited =
-            call_manager::add_invite(call_id, self.user_id, receiver_id as u64, secret.clone())
-                .await;
+        let invited = self
+            .state
+            .call_manager
+            .add_invite(call_id, self.user_id, receiver_id as u64, secret.clone())
+            .await;
         if !invited {
             self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidCallId)
                 .await;
             return;
         }
 
-        if !call_manager::should_forward_invite(self.user_id, receiver_id as u64) {
+        if !self
+            .state
+            .call_manager
+            .should_forward_invite(self.user_id, receiver_id as u64)
+        {
             let response = CommunicationValue::new(CommunicationType::Success).with_id(cv.get_id());
             self.send_message(&response).await;
             return;
         }
 
         // Find target RhoConnection
-        let target_rho = match rho_manager::get_rho_con_for_user(receiver_id).await {
+        let target_rho = match self.state.rho.get_for_user(receiver_id).await {
             Some(rho) => rho,
             _ => {
                 // Get sender user ID
@@ -406,7 +435,7 @@ impl AnonymousClientConnection {
                         DataValue::Str("call_invite".to_string()),
                     );
 
-                let omega_conn = get_omega_connection();
+                let omega_conn = self.state.omega.clone();
                 // Send fire-and-forget, don't await to avoid blocking
                 tokio::spawn(async move {
                     let _ = omega_conn.send_message(&push_cv).await;
@@ -467,22 +496,39 @@ impl AnonymousClientConnection {
             }
         };
 
-        if let Some(token) = call_manager::get_call_token(user_id, call_id).await {
-            let response = CommunicationValue::new(CommunicationType::CallToken)
-                .with_id(cv.get_id())
-                .with_receiver(user_id)
-                .add_typed_default(DataType::CallToken, DataValue::Str(token.to_string()));
-            self.send_message(&response).await;
-        } else {
-            let error_cv = CommunicationValue::new(CommunicationType::ErrorNoCallId)
-                .with_id(cv.get_id())
-                .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));
-            self.send_message(&error_cv).await;
-            return;
+        match self
+            .state
+            .call_manager
+            .get_call_token(user_id, call_id)
+            .await
+        {
+            Ok(token) => {
+                let response = CommunicationValue::new(CommunicationType::CallToken)
+                    .with_id(cv.get_id())
+                    .with_receiver(user_id)
+                    .add_typed_default(DataType::CallToken, DataValue::Str(token));
+                self.send_message(&response).await;
+            }
+            Err(error) => {
+                log::warn!(
+                    "Unable to create anonymous call token for {}: {}",
+                    call_id,
+                    error
+                );
+                let error_cv = CommunicationValue::new(CommunicationType::ErrorNoCallId)
+                    .with_id(cv.get_id())
+                    .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));
+                self.send_message(&error_cv).await;
+            }
         }
     }
     async fn handle_call_timeout_user(self: Arc<Self>, cv: CommunicationValue) {
-        let call_id = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or("")).unwrap();
+        let Ok(call_id) = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or(""))
+        else {
+            self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidCallId)
+                .await;
+            return;
+        };
         let user_id = cv
             .get_data(DataType::UserId)
             .as_signed_number()
@@ -492,39 +538,46 @@ impl AnonymousClientConnection {
             .as_signed_number()
             .unwrap_or(0);
 
-        let call = call_manager::get_call(call_id).await;
-        if let Some(call) = call {
-            if call
-                .get_caller(self.get_user_id())
-                .await
-                .unwrap()
-                .has_admin()
-            {
-                call.get_caller(user_id as u64)
-                    .await
-                    .unwrap()
-                    .set_timeout(untill.try_into().unwrap())
-                    .await;
+        let Some(call) = self.state.call_manager.get_call(call_id).await else {
+            self.send_error_response(&cv.get_id(), CommunicationType::ErrorNotFound)
+                .await;
+            return;
+        };
+        let Some(caller) = call.get_caller(self.get_user_id()).await else {
+            self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidUserId)
+                .await;
+            return;
+        };
+        if caller.has_admin() {
+            if let Some(target) = call.get_caller(user_id as u64).await {
+                target.set_timeout(untill as i64).await;
             }
         }
     }
     async fn handle_call_disconnect_user(self: Arc<Self>, cv: CommunicationValue) {
-        let call_id = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or("")).unwrap();
+        let Ok(call_id) = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or(""))
+        else {
+            self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidCallId)
+                .await;
+            return;
+        };
         let user_id = cv
             .get_data(DataType::UserId)
             .as_signed_number()
             .unwrap_or(0);
 
-        let call = call_manager::get_call(call_id).await;
-        if let Some(call) = call {
-            if call
-                .get_caller(self.get_user_id())
-                .await
-                .unwrap()
-                .has_admin()
-            {
-                call.remove_caller(user_id as u64).await;
-            }
+        let Some(call) = self.state.call_manager.get_call(call_id).await else {
+            self.send_error_response(&cv.get_id(), CommunicationType::ErrorNotFound)
+                .await;
+            return;
+        };
+        let Some(caller) = call.get_caller(self.get_user_id()).await else {
+            self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidUserId)
+                .await;
+            return;
+        };
+        if caller.has_admin() {
+            call.remove_caller(user_id as u64).await;
         }
     }
 
@@ -586,6 +639,7 @@ impl AnonymousClientConnection {
 impl Clone for AnonymousClientConnection {
     fn clone(&self) -> Self {
         Self {
+            state: self.state.clone(),
             sender: Arc::clone(&self.sender),
             receiver: Arc::clone(&self.receiver),
             user_id: self.user_id,
@@ -595,6 +649,7 @@ impl Clone for AnonymousClientConnection {
             user_name: Arc::clone(&self.user_name),
             display_name: Arc::clone(&self.display_name),
             avatar: Arc::clone(&self.avatar),
+            message_slots: Arc::clone(&self.message_slots),
         }
     }
 }

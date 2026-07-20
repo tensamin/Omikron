@@ -1,13 +1,14 @@
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue, TypeMap};
 use serde_json::Map;
 
-use std::{collections::BTreeMap, env, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::{
-    calls::{call_util, caller::Caller},
-    omega::omega_connection::get_omega_connection,
+    calls::{call_util::LiveKitService, caller::Caller, error::CallError},
+    omega::omega_connection::OmegaConnection,
+    util::data_type_id,
 };
 
 pub struct CallGroup {
@@ -17,6 +18,7 @@ pub struct CallGroup {
     pub anonymous_joining: RwLock<bool>,
     pub short_link: RwLock<Option<String>>,
     pub secrets: RwLock<BTreeMap<u64, CallSecretEnvelope>>,
+    livekit: Arc<LiveKitService>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,27 +34,27 @@ impl CallSecretEnvelope {
     pub fn from_data_value(value: &DataValue) -> Option<Self> {
         let tm = TypeMap::latest();
         let secret_id = value
-            .get_field(DataType::SecretId.to_id(&tm))?
+            .get_field(data_type_id(DataType::SecretId, &tm))?
             .as_str()?
             .to_string();
         let version_number = value
-            .get_field(DataType::VersionNumber.to_id(&tm))?
+            .get_field(data_type_id(DataType::VersionNumber, &tm))?
             .as_signed_number()
             .and_then(|n| i64::try_from(n).ok())
             .or_else(|| {
                 value
-                    .get_field(DataType::VersionNumber.to_id(&tm))?
+                    .get_field(data_type_id(DataType::VersionNumber, &tm))?
                     .as_number()
                     .and_then(|n| i64::try_from(n).ok())
             })?;
         let encrypted_secret = value
-            .get_field(DataType::EncryptedSecret.to_id(&tm))?
+            .get_field(data_type_id(DataType::EncryptedSecret, &tm))?
             .as_bytes()?;
         let kem_ciphertext = value
-            .get_field(DataType::KemCiphertext.to_id(&tm))?
+            .get_field(data_type_id(DataType::KemCiphertext, &tm))?
             .as_bytes()?;
         let wrapping_scheme = value
-            .get_field(DataType::WrappingScheme.to_id(&tm))?
+            .get_field(data_type_id(DataType::WrappingScheme, &tm))?
             .as_str()?
             .to_string();
 
@@ -69,23 +71,23 @@ impl CallSecretEnvelope {
         let tm = TypeMap::latest();
         let mut map: BTreeMap<DataTypeId, DataValue> = BTreeMap::new();
         map.insert(
-            DataType::SecretId.to_id(&tm),
+            data_type_id(DataType::SecretId, &tm),
             DataValue::Str(self.secret_id.clone()),
         );
         map.insert(
-            DataType::VersionNumber.to_id(&tm),
+            data_type_id(DataType::VersionNumber, &tm),
             DataValue::SignedNumber(self.version_number.into()),
         );
         map.insert(
-            DataType::EncryptedSecret.to_id(&tm),
+            data_type_id(DataType::EncryptedSecret, &tm),
             DataValue::Bytes(self.encrypted_secret.clone()),
         );
         map.insert(
-            DataType::KemCiphertext.to_id(&tm),
+            data_type_id(DataType::KemCiphertext, &tm),
             DataValue::Bytes(self.kem_ciphertext.clone()),
         );
         map.insert(
-            DataType::WrappingScheme.to_id(&tm),
+            data_type_id(DataType::WrappingScheme, &tm),
             DataValue::Str(self.wrapping_scheme.clone()),
         );
         DataValue::container_from_map(&map)
@@ -98,6 +100,14 @@ pub fn call_invite_secret_from_cv(cv: &CommunicationValue) -> Option<CallSecretE
 
 impl CallGroup {
     pub fn new(call_id: Uuid, user: Arc<Caller>) -> Self {
+        Self::new_with_service(call_id, user, Arc::new(LiveKitService::new(None)))
+    }
+
+    pub fn new_with_service(
+        call_id: Uuid,
+        user: Arc<Caller>,
+        livekit: Arc<LiveKitService>,
+    ) -> Self {
         CallGroup {
             call_id,
             members: RwLock::new(vec![user]),
@@ -105,6 +115,7 @@ impl CallGroup {
             anonymous_joining: RwLock::new(false),
             short_link: RwLock::new(None),
             secrets: RwLock::new(BTreeMap::new()),
+            livekit,
         }
     }
 
@@ -126,7 +137,7 @@ impl CallGroup {
     }
 
     pub async fn update_admins(&self) {
-        let call_metadata = match call_util::get_room_metadata(self.call_id).await {
+        let call_metadata = match self.livekit.get_room_metadata(self.call_id).await {
             Ok(metadata) => metadata,
             Err(_) => "{}".to_string(),
         };
@@ -150,17 +161,31 @@ impl CallGroup {
 
         call_metadata.insert("admins".to_string(), serde_json::json!(admin_ids));
 
-        let _ = call_util::set_room_metadata(
-            self.call_id,
-            serde_json::Value::Object(call_metadata).to_string(),
-        )
-        .await;
+        if let Err(error) = self
+            .livekit
+            .set_room_metadata(
+                self.call_id,
+                serde_json::Value::Object(call_metadata).to_string(),
+            )
+            .await
+        {
+            log::warn!(
+                "Unable to update administrators for call {}: {}",
+                self.call_id,
+                error
+            );
+        }
     }
 
-    pub async fn set_anonymous_joining(&self, enable: bool) {
+    pub async fn set_anonymous_joining(
+        &self,
+        enable: bool,
+        omega: &OmegaConnection,
+        omikron_id: u64,
+    ) {
         *self.anonymous_joining.write().await = enable;
 
-        let call_metadata = match call_util::get_room_metadata(self.call_id).await {
+        let call_metadata = match self.livekit.get_room_metadata(self.call_id).await {
             Ok(metadata) => metadata,
             Err(_) => "{}".to_string(),
         };
@@ -175,22 +200,27 @@ impl CallGroup {
 
         call_metadata.insert("anonymous_joining".to_string(), serde_json::json!(enable));
 
-        let _ = call_util::set_room_metadata(
-            self.call_id,
-            serde_json::Value::Object(call_metadata).to_string(),
-        )
-        .await;
+        if let Err(error) = self
+            .livekit
+            .set_room_metadata(
+                self.call_id,
+                serde_json::Value::Object(call_metadata).to_string(),
+            )
+            .await
+        {
+            log::warn!(
+                "Unable to update anonymous access for call {}: {}",
+                self.call_id,
+                error
+            );
+        }
 
         if self.short_link.read().await.is_none() {
             let long_link = format!(
                 "https://app.tensamin.net/call/anonymous?call_id={}&omikron_id={}",
-                self.call_id,
-                env::var("ID")
-                    .unwrap_or("0".to_string())
-                    .parse::<i64>()
-                    .unwrap_or(0),
+                self.call_id, omikron_id,
             );
-            let response_cv = get_omega_connection()
+            let response_cv = omega
                 .await_response(
                     &CommunicationValue::new(CommunicationType::ShortenLink)
                         .add_typed_default(DataType::Link, DataValue::Str(long_link)),
@@ -198,33 +228,33 @@ impl CallGroup {
                 )
                 .await;
             if let Ok(response) = response_cv {
-                *self.short_link.write().await = Some(
-                    response
-                        .get_data(DataType::Link)
-                        .as_str()
-                        .unwrap()
-                        .to_string(),
-                );
-                log::info!(
-                    "Shortened link for call {} is {}",
-                    self.call_id,
-                    self.short_link.read().await.as_ref().unwrap()
-                );
+                if let Some(link) = response.get_data(DataType::Link).as_str() {
+                    *self.short_link.write().await = Some(link.to_string());
+                    log::info!("Shortened link for call {}", self.call_id);
+                }
             }
         }
     }
 
-    pub async fn create_anonymous_token(&self, user_id: u64) -> Option<String> {
+    pub async fn create_anonymous_token(&self, user_id: u64) -> Result<Option<String>, CallError> {
         if self.is_anonymous().await {
-            if let Ok(token) = call_util::create_token(user_id, self.call_id, false) {
-                return Some(token);
-            }
+            return self
+                .livekit
+                .create_token(user_id, self.call_id, false)
+                .map(Some);
         }
-        None
+        Ok(None)
     }
 
     pub async fn remove_caller(&self, user_id: u64) {
-        let _ = call_util::remove_participant(self.call_id, user_id).await;
+        if let Err(error) = self.livekit.remove_participant(self.call_id, user_id).await {
+            log::warn!(
+                "Unable to remove user {} from call {}: {}",
+                user_id,
+                self.call_id,
+                error
+            );
+        }
         self.members
             .write()
             .await
@@ -263,19 +293,19 @@ mod tests {
         let tm = TypeMap::latest();
         let mut map: BTreeMap<DataTypeId, DataValue> = BTreeMap::new();
         map.insert(
-            DataType::SecretId.to_id(&tm),
+            data_type_id(DataType::SecretId, &tm),
             DataValue::Str("call:test:main".to_string()),
         );
         map.insert(
-            DataType::VersionNumber.to_id(&tm),
+            data_type_id(DataType::VersionNumber, &tm),
             DataValue::SignedNumber(1),
         );
         map.insert(
-            DataType::EncryptedSecret.to_id(&tm),
+            data_type_id(DataType::EncryptedSecret, &tm),
             DataValue::Bytes(vec![1, 2, 3]),
         );
         map.insert(
-            DataType::WrappingScheme.to_id(&tm),
+            data_type_id(DataType::WrappingScheme, &tm),
             DataValue::Str("mtp-call-secret-kem-chacha20poly1305-hkdf-sha256-v1".to_string()),
         );
 

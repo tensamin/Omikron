@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::calls::call_util;
+use crate::calls::{call_util::LiveKitService, error::CallError};
 
 pub struct Caller {
     pub user_id: u64,
@@ -39,11 +39,7 @@ impl Caller {
     pub async fn set_timeout(&self, timeout: i64) {
         *self.timeout.write().await = timeout;
     }
-    pub fn create_token(&self) -> String {
-        if let Ok(token) = call_util::create_token(self.user_id, self.call_id, self.has_admin()) {
-            token
-        } else {
-            String::new()
-        }
+    pub fn create_token(&self, livekit: &LiveKitService) -> Result<String, CallError> {
+        livekit.create_token(self.user_id, self.call_id, self.has_admin())
     }
 }

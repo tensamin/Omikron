@@ -1,0 +1,133 @@
+use std::env;
+
+use thiserror::Error;
+
+const DEFAULT_RHO_PORT: u16 = 443;
+const DEFAULT_OMEGA_HOST: &str = "tensamin.net";
+const DEFAULT_OMEGA_PORT: u16 = 9187;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveKitConfig {
+    pub hostname: String,
+    pub api_key: String,
+    pub api_secret: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Config {
+    pub rho_port: u16,
+    pub omega_host: String,
+    pub omega_port: u16,
+    pub omikron_id: u64,
+    pub livekit: Option<LiveKitConfig>,
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum ConfigError {
+    #[error("{name} must be a valid {kind}")]
+    InvalidValue {
+        name: &'static str,
+        kind: &'static str,
+    },
+    #[error("LIVEKIT_HOSTNAME, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET must be set together")]
+    IncompleteLiveKitCredentials,
+}
+
+impl Config {
+    pub fn from_environment() -> Result<Self, ConfigError> {
+        let rho_port = parse_or_default("RHO_PORT", DEFAULT_RHO_PORT)?;
+        let omega_port = parse_or_default("OMEGA_PORT", DEFAULT_OMEGA_PORT)?;
+        let omikron_id = parse_or_default("ID", 0_u64)?;
+        let omega_host = env::var("OMEGA_HOST")
+            .unwrap_or_else(|_| DEFAULT_OMEGA_HOST.to_string())
+            .trim()
+            .to_string();
+
+        if omega_host.is_empty() {
+            return Err(ConfigError::InvalidValue {
+                name: "OMEGA_HOST",
+                kind: "non-empty host name",
+            });
+        }
+
+        Ok(Self {
+            rho_port,
+            omega_host,
+            omega_port,
+            omikron_id,
+            livekit: livekit_from_environment()?,
+        })
+    }
+}
+
+fn parse_or_default<T>(name: &'static str, default: T) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr,
+{
+    match env::var(name) {
+        Ok(value) => value.trim().parse().map_err(|_| ConfigError::InvalidValue {
+            name,
+            kind: "number",
+        }),
+        Err(_) => Ok(default),
+    }
+}
+
+fn livekit_from_environment() -> Result<Option<LiveKitConfig>, ConfigError> {
+    livekit_from_values(
+        env::var("LIVEKIT_HOSTNAME").ok(),
+        env::var("LIVEKIT_API_KEY").ok(),
+        env::var("LIVEKIT_API_SECRET").ok(),
+    )
+}
+
+fn livekit_from_values(
+    hostname: Option<String>,
+    api_key: Option<String>,
+    api_secret: Option<String>,
+) -> Result<Option<LiveKitConfig>, ConfigError> {
+    match (hostname, api_key, api_secret) {
+        (None, None, None) => Ok(None),
+        (Some(hostname), Some(api_key), Some(api_secret))
+            if !hostname.trim().is_empty()
+                && !api_key.trim().is_empty()
+                && !api_secret.trim().is_empty() =>
+        {
+            Ok(Some(LiveKitConfig {
+                hostname,
+                api_key,
+                api_secret,
+            }))
+        }
+        _ => Err(ConfigError::IncompleteLiveKitCredentials),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn livekit_credentials_must_be_complete() {
+        assert_eq!(
+            livekit_from_values(Some("host".to_string()), Some("key".to_string()), None),
+            Err(ConfigError::IncompleteLiveKitCredentials)
+        );
+    }
+
+    #[test]
+    fn complete_livekit_credentials_are_loaded() {
+        assert_eq!(
+            livekit_from_values(
+                Some("https://livekit.example".to_string()),
+                Some("key".to_string()),
+                Some("secret".to_string()),
+            ),
+            Ok(Some(LiveKitConfig {
+                hostname: "https://livekit.example".to_string(),
+                api_key: "key".to_string(),
+                api_secret: "secret".to_string(),
+            }))
+        );
+    }
+}

@@ -1,11 +1,13 @@
 mod anonymous_clients;
+mod app_state;
 mod calls;
+mod config;
 mod data;
 mod omega;
 mod rho;
+mod services;
 mod util;
 
-use std::env;
 use std::path::PathBuf;
 
 use dotenv::dotenv;
@@ -19,29 +21,30 @@ use mtp::crypto::Keyring;
 use mtp::files::{load_keyring_raw, save_keyring_raw, save_public_key_bundle};
 
 use crate::{
-    calls::call_util::garbage_collect_calls, omega::omega_connection::get_omega_connection,
-    rho::server::start, util::logger::startup,
+    app_state::AppState,
+    calls::{call_manager::CallManager, call_util::LiveKitService},
+    config::Config,
+    omega::omega_connection::{OmegaConnection, start_task_cleanup_loop},
+    rho::rho_manager::RhoManager,
+    rho::server::start,
+    util::logger::startup,
 };
 
 const KEYRING_PATH: &str = "./omikron.mk";
 const PUBLIC_KEY_PATH: &str = "./omikron.mpkb";
 
-static KEYRING: Lazy<Keyring> = Lazy::new(|| {
-    load_keyring_raw(KEYRING_PATH).unwrap_or_else(|_| {
-        let kr = Keyring::generate();
-        save_keyring_raw(&kr, KEYRING_PATH).expect("Failed to save generated keyring");
-        save_public_key_bundle(&kr.public_key_bundle(), PUBLIC_KEY_PATH)
-            .expect("Failed to save generated public key bundle");
-        eprintln!("Generated new keyring at {}", KEYRING_PATH);
-        kr
-    })
-});
-
-pub fn get_keyring() -> &'static Keyring {
-    &KEYRING
-}
-pub fn load_keyring() -> Keyring {
-    Keyring::from_bytes(&KEYRING.to_bytes()).unwrap()
+fn load_keyring() -> Result<Keyring, String> {
+    match load_keyring_raw(KEYRING_PATH) {
+        Ok(keyring) => Ok(keyring),
+        Err(_) => {
+            let kr = Keyring::generate();
+            save_keyring_raw(&kr, KEYRING_PATH).map_err(|error| error.to_string())?;
+            save_public_key_bundle(&kr.public_key_bundle(), PUBLIC_KEY_PATH)
+                .map_err(|error| error.to_string())?;
+            eprintln!("Generated new keyring at {}", KEYRING_PATH);
+            Ok(kr)
+        }
+    }
 }
 
 #[tokio::main]
@@ -53,18 +56,51 @@ async fn main() {
     dotenv().ok();
     startup();
 
-    let rho_port = env::var("RHO_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(443);
+    let config = match Config::from_environment() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Invalid configuration: {error}");
+            return;
+        }
+    };
 
-    get_omega_connection();
+    let keyring = match load_keyring() {
+        Ok(keyring) => keyring,
+        Err(error) => {
+            eprintln!("Unable to load keyring: {error}");
+            return;
+        }
+    };
+
+    let omega_keyring = match keyring_for_omega(&keyring) {
+        Ok(keyring) => keyring,
+        Err(error) => {
+            eprintln!("Unable to copy keyring for Omega: {error}");
+            return;
+        }
+    };
+    let rho = std::sync::Arc::new(RhoManager::new());
+    let omega = std::sync::Arc::new(OmegaConnection::from_config(
+        &config,
+        omega_keyring,
+        rho.clone(),
+    ));
+    omega.clone().start().await;
+    start_task_cleanup_loop(omega.clone());
+    let livekit = std::sync::Arc::new(LiveKitService::new(config.livekit.clone()));
+    let call_manager = std::sync::Arc::new(CallManager::new(livekit.clone()));
+    let state = AppState::new(config.clone(), keyring, omega, rho, call_manager, livekit);
     tokio::spawn(async move {
-        if let Err(e) = start(rho_port).await {
+        if let Err(e) = start(state).await {
             log_err!(0, util::logger::PrintType::General, "{}", e);
         }
     });
-    garbage_collect_calls();
 
-    tokio::signal::ctrl_c().await.unwrap();
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        eprintln!("Unable to wait for shutdown signal: {error}");
+    }
+}
+
+fn keyring_for_omega(keyring: &Keyring) -> Result<Keyring, String> {
+    Keyring::from_bytes(&keyring.to_bytes()).map_err(|error| error.to_string())
 }

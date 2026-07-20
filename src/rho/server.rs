@@ -1,13 +1,14 @@
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STD;
 
-use crate::load_keyring;
 use crate::{
+    app_state::AppState,
     log, log_err,
-    omega::omega_connection::get_omega_connection,
+    omega::omega_connection::OmegaConnection,
     rho::connection::GeneralConnection,
     util::{file_util::load_file_vec, logger::PrintType},
 };
@@ -24,6 +25,7 @@ use mtp::webserver::{MTPWebServer, WebServerConfig};
  * through mtp's unauthenticated fallback instead of rejecting it outright.
  */
 pub async fn get_by_connector_id(
+    omega: Arc<OmegaConnection>,
     client_id: u64,
     description: Option<String>,
 ) -> Option<PublicKeyBundle> {
@@ -38,7 +40,7 @@ pub async fn get_by_connector_id(
         _ => return None,
     };
 
-    let response = match get_omega_connection()
+    let response = match omega
         .await_response(&request, Some(Duration::from_secs(20)))
         .await
     {
@@ -62,7 +64,11 @@ pub async fn get_by_connector_id(
 }
 
 /* Only Iota registration goes through mtp's Register flow; users are registered out of band. */
-pub async fn complete_register(pub_key: PublicKeyBundle, description: Option<String>) -> u64 {
+pub async fn complete_register(
+    omega: Arc<OmegaConnection>,
+    pub_key: PublicKeyBundle,
+    description: Option<String>,
+) -> u64 {
     println!("Iota register start");
     if description.as_deref() != Some("iota") {
         return 0;
@@ -75,7 +81,7 @@ pub async fn complete_register(pub_key: PublicKeyBundle, description: Option<Str
             DataValue::Str(BASE64_STD.encode(pub_key.as_bytes())),
         );
 
-    let response = match get_omega_connection()
+    let response = match omega
         .await_response(&request, Some(Duration::from_secs(20)))
         .await
     {
@@ -97,14 +103,14 @@ pub async fn complete_register(pub_key: PublicKeyBundle, description: Option<Str
     }
 }
 
-pub async fn start(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
     let cert_pem = load_file_vec("certs", "cert.pem").expect("Error loading Pemfile");
 
     let key_pem = load_file_vec("certs", "key.pem").expect("Error loading Keyfile");
 
     let host_config = HostConfig::new(
         IpAddr::from(Ipv4Addr::new(0, 0, 0, 0)),
-        port,
+        state.config.rho_port,
         cert_pem,
         key_pem,
     )
@@ -124,16 +130,33 @@ pub async fn start(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             .with_persistent_stream_retries(5, Duration::from_secs(5)),
     )
     .with_authentication(
-        load_keyring(),
-        Box::new(|user_id, description| Box::pin(get_by_connector_id(user_id, description))),
-        Box::new(|pub_key, description| Box::pin(complete_register(pub_key, description))),
+        state
+            .keyring_for_host()
+            .map_err(|error| format!("Unable to copy keyring for host: {error}"))?,
+        Box::new({
+            let omega = state.omega.clone();
+            move |user_id, description| {
+                Box::pin(get_by_connector_id(omega.clone(), user_id, description))
+            }
+        }),
+        Box::new({
+            let omega = state.omega.clone();
+            move |pub_key, description| {
+                Box::pin(complete_register(omega.clone(), pub_key, description))
+            }
+        }),
     )
     .with_authentication_policy(AuthenticationPolicy::AllowAuthentication);
 
     let web_config = WebServerConfig::new()
         .route("/", |_request, response| async move { response.body("OK") })?;
     let mut host = MTPWebServer::new(host_config, web_config).await?;
-    log!(0, PrintType::General, "Server listening on port {}.", port);
+    log!(
+        0,
+        PrintType::General,
+        "Server listening on port {}.",
+        state.config.rho_port
+    );
 
     loop {
         let conn = match host.accept().await {
@@ -153,8 +176,9 @@ pub async fn start(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        let state = state.clone();
         tokio::spawn(async move {
-            let Some(conn) = GeneralConnection::new(conn) else {
+            let Some(conn) = GeneralConnection::new(conn, state) else {
                 log_err!(
                     0,
                     PrintType::General,

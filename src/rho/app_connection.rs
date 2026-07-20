@@ -1,7 +1,7 @@
 use crate::anonymous_clients::anonymous_manager;
-use crate::omega::omega_connection::get_omega_connection;
+use crate::app_state::AppState;
 use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
-use crate::rho::{rho_connection::RhoConnection, rho_manager};
+use crate::rho::rho_connection::RhoConnection;
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err, log_in, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub struct AppConnection {
+    pub state: Arc<AppState>,
     pub user_id: u64,
     pub app_identifier: String,
     pub app_session: Uuid,
@@ -27,6 +28,7 @@ pub struct AppConnection {
 impl AppConnection {
     pub async fn from_general(general: Arc<GeneralConnection>, user_id: u64) -> Arc<Self> {
         Arc::new(Self {
+            state: general.state.clone(),
             ping: Arc::new(RwLock::new(0)),
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: general.rho_connection.clone(),
@@ -154,7 +156,10 @@ impl AppConnection {
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
         let app_for_closure = self.clone();
         tokio::spawn(async move {
-            let response_cv = get_omega_connection()
+            let response_cv = self
+                .state
+                .omega
+                .clone()
                 .await_response(&cv.with_sender(self.user_id), Some(Duration::from_secs(20)))
                 .await;
             if let Ok(response_cv) = response_cv {
@@ -169,7 +174,7 @@ impl AppConnection {
         if let DataValue::SignedNumber(last_ping) = cv.get_data(DataType::LastPing) {
             let current = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis();
             let mut ping_guard = self.ping.write().await;
             *ping_guard = (current as i128 - *last_ping) as i64;
@@ -227,7 +232,10 @@ impl AppConnection {
                 return;
             }
 
-            let load_uuid_response = get_omega_connection()
+            let load_uuid_response = self
+                .state
+                .omega
+                .clone()
                 .await_response(
                     &CommunicationValue::new(CommunicationType::GetUserData)
                         .with_id(cv.clone().get_id())
@@ -328,7 +336,7 @@ impl AppConnection {
     /// Handle connection close
     pub async fn handle_close(&self) {
         let user_id = self.get_user_id().await;
-        if let Some(rho_conn) = rho_manager::get_rho_con_for_user(user_id as i64).await {
+        if let Some(rho_conn) = self.state.rho.get_for_user(user_id as i64).await {
             rho_conn.close_app_connection(Arc::new(self.clone())).await;
         }
     }
@@ -338,6 +346,7 @@ impl AppConnection {
 impl Clone for AppConnection {
     fn clone(&self) -> Self {
         Self {
+            state: self.state.clone(),
             sender: Arc::clone(&self.sender),
             receiver: Arc::clone(&self.receiver),
             user_id: self.user_id,

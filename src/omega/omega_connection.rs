@@ -1,8 +1,6 @@
 use crate::{
-    data::user::UserStatus,
-    load_keyring, log_cv_in, log_cv_out, log_err, log_in,
-    rho::rho_manager::{self, RHO_CONNECTIONS, connection_count},
-    util::logger::PrintType,
+    config::Config, data::user::UserStatus, log_cv_in, log_cv_out, log_err, log_in,
+    rho::rho_manager::RhoManager, util::logger::PrintType,
 };
 use dashmap::DashMap;
 use mtp::client::{Client, Receiver, Sender};
@@ -13,8 +11,7 @@ use mtp::{
     host::{Policy, SendMode},
 };
 use mtp_transport::ConnectionHandle;
-use once_cell::sync::Lazy;
-use std::{collections::HashMap, env, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, RwLock, mpsc, watch},
     task::JoinHandle,
@@ -23,32 +20,15 @@ use tokio::{
 
 use uuid::Uuid;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
-const OMEGA_HOST_DEFAULT: &str = "tensamin.net";
-const OMEGA_PORT_DEFAULT: u16 = 9187;
-
-fn omega_host_and_port() -> (String, u16) {
-    let host = env::var("OMEGA_HOST")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| OMEGA_HOST_DEFAULT.to_string());
-
-    let port = env::var("OMEGA_PORT")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(OMEGA_PORT_DEFAULT);
-
-    (host, port)
-}
-
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
+const MAX_CONCURRENT_REQUESTS: usize = 128;
+const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
+const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
 // ============================================================================
 // Waiting Task System
@@ -59,13 +39,40 @@ pub struct WaitingTask {
     pub inserted_at: Instant,
 }
 
-pub static WAITING_TASKS: Lazy<DashMap<u32, WaitingTask>> = Lazy::new(DashMap::new);
+struct CircuitBreaker {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+}
 
-pub fn start_task_cleanup_loop() {
-    tokio::spawn(async {
+impl CircuitBreaker {
+    fn allow_request(&mut self) -> bool {
+        if self.open_until.is_some_and(|until| until > Instant::now()) {
+            return false;
+        }
+        self.open_until = None;
+        true
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.open_until = None;
+    }
+
+    fn record_failure(&mut self) {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            self.open_until = Some(Instant::now() + CIRCUIT_BREAKER_COOLDOWN);
+        }
+    }
+}
+
+pub fn start_task_cleanup_loop(omega: Arc<OmegaConnection>) {
+    tokio::spawn(async move {
         loop {
             sleep(TASK_CLEANUP_INTERVAL).await;
-            WAITING_TASKS.retain(|_, v| v.inserted_at.elapsed() < TASK_MAX_AGE);
+            omega
+                .waiting_tasks
+                .retain(|_, v| v.inserted_at.elapsed() < TASK_MAX_AGE);
         }
     });
 }
@@ -109,6 +116,7 @@ pub struct OmegaConnection {
     connection_loop_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     host: String,
     port: u16,
+    omikron_id: u64,
     last_ping: Arc<Mutex<i64>>,
     heartbeat_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     message_send_times: Arc<Mutex<HashMap<Uuid, Instant>>>,
@@ -116,31 +124,42 @@ pub struct OmegaConnection {
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     // Track if we should reconnect on close
     reconnect_on_close: Arc<RwLock<bool>>,
+    request_slots: tokio::sync::Semaphore,
+    circuit_breaker: Mutex<CircuitBreaker>,
+    keyring: mtp::crypto::Keyring,
+    rho: Arc<RhoManager>,
+    waiting_tasks: DashMap<u32, WaitingTask>,
 }
 
 impl OmegaConnection {
-    pub fn new() -> Self {
-        let (host, port) = omega_host_and_port();
-        Self::with_host(&host, port)
-    }
-
-    // omikron and omega are both served over publicly trusted (fullchain) certs on
-    // the same domain, so the client uses system root trust - no pinning needed.
-    pub fn with_host(host: &str, port: u16) -> Self {
+    pub fn from_config(
+        config: &Config,
+        keyring: mtp::crypto::Keyring,
+        rho: Arc<RhoManager>,
+    ) -> Self {
         let (shutdown_tx, _) = watch::channel(false);
 
         OmegaConnection {
             state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             sender: Arc::new(RwLock::new(None)),
             connection_loop_handle: Arc::new(Mutex::new(None)),
-            host: host.to_string(),
-            port,
+            host: config.omega_host.clone(),
+            port: config.omega_port,
+            omikron_id: config.omikron_id,
             last_ping: Arc::new(Mutex::new(-1)),
             heartbeat_handle: Arc::new(Mutex::new(None)),
             message_send_times: Arc::new(Mutex::new(HashMap::new())),
             connection_id: Uuid::new_v4(),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             reconnect_on_close: Arc::new(RwLock::new(true)),
+            request_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS),
+            circuit_breaker: Mutex::new(CircuitBreaker {
+                consecutive_failures: 0,
+                open_until: None,
+            }),
+            keyring,
+            rho,
+            waiting_tasks: DashMap::new(),
         }
     }
 
@@ -190,7 +209,7 @@ impl OmegaConnection {
 
         // Close sender if connected
         if let Some(sender) = self.sender.read().await.as_ref() {
-            sender.close();
+            sender.close().await;
         }
 
         *self.state.write().await = ConnectionState::Disconnected;
@@ -257,12 +276,7 @@ impl OmegaConnection {
         *self.state.write().await = ConnectionState::Connecting;
 
         let client_config = ClientConfig::new(format!("https://{}:{}", self.host, self.port))
-            .with_client_id(
-                env::var("ID")
-                    .unwrap_or("0".to_string())
-                    .parse::<u64>()
-                    .unwrap_or(0),
-            )
+            .with_client_id(self.omikron_id)
             .with_policy(
                 Policy::default()
                     .with_send_mode(SendMode::SingleStreamPerMessage)
@@ -282,7 +296,7 @@ impl OmegaConnection {
         let host_public_key = load_public_key_bundle("./omega.mpkb")
             .map_err(|e| format!("Failed to load omega.mpkb: {}", e))?;
 
-        let mut connection = Client::auth_connect(client_config, &load_keyring(), &host_public_key)
+        let mut connection = Client::auth_connect(client_config, &self.keyring, &host_public_key)
             .await
             .map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -349,13 +363,14 @@ impl OmegaConnection {
         let mut connected_iota_ids: Vec<DataValue> = Vec::new();
         let mut connected_user_ids: Vec<DataValue> = Vec::new();
 
-        let rho_connections_reader = RHO_CONNECTIONS.read().await;
+        let iota_ids = self.rho.iota_ids().await;
+        let rho_connections = self.rho.connections().await;
 
-        for iota_id in rho_connections_reader.keys() {
-            connected_iota_ids.push(DataValue::SignedNumber((*iota_id).into()));
+        for iota_id in iota_ids {
+            connected_iota_ids.push(DataValue::SignedNumber(iota_id.into()));
         }
 
-        for rho in rho_connections_reader.values() {
+        for rho in rho_connections {
             for client_conn in rho.get_client_connections().await {
                 connected_user_ids.push(DataValue::SignedNumber(
                     client_conn.get_user_id().await.into(),
@@ -363,14 +378,12 @@ impl OmegaConnection {
             }
         }
 
-        drop(rho_connections_reader);
-
         let sync_msg = CommunicationValue::new(CommunicationType::SyncClientIotaStatus)
             .add_typed_default(DataType::IotaIds, DataValue::Array(connected_iota_ids))
             .add_typed_default(DataType::UserIds, DataValue::Array(connected_user_ids))
             .add_typed_default(
                 DataType::RhoConnections,
-                DataValue::SignedNumber(connection_count().await as i128),
+                DataValue::SignedNumber(self.rho.connection_count().await as i128),
             );
 
         self.send_message(&sync_msg).await;
@@ -403,7 +416,7 @@ impl OmegaConnection {
                             }
 
                             let msg_id = cv.get_id();
-                            if let Some((_, task)) = WAITING_TASKS.remove(&msg_id) {
+                            if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
                                 if (task.task)(self.clone(), cv.clone()) {
                                     continue;
                                 }
@@ -411,20 +424,20 @@ impl OmegaConnection {
 
                             if cv.is_type(CommunicationType::IotaUserData) {
                                 if let DataValue::Array(users) = cv.get_data(DataType::UserIds) {
-                                    let mut user_ids: Vec<u64> = Vec::new();
+                                    let mut user_ids = Vec::new();
                                     for value in users {
                                         if let DataValue::SignedNumber(user_id) = value {
-                                            user_ids.push(user_id.clone() as u64);
+                                            if let Ok(user_id) = i64::try_from(*user_id) {
+                                                user_ids.push(user_id);
+                                            }
                                         }
                                     }
-                                    let connections = crate::rho::rho_manager::RHO_CONNECTIONS.read().await;
                                     if let Some(iota_id) = cv.get_data(DataType::IotaId).as_number() {
-                                        if let Some(rho) = connections.get(&(iota_id as i64)) {
-                                            rho.get_iota_connection().set_user_ids(user_ids).await;
-                                        }
+                                        self.rho.replace_users_for_iota(iota_id as i64, user_ids).await;
                                     } else {
-                                        for rho in connections.values() {
-                                            rho.get_iota_connection().set_user_ids(user_ids.clone()).await;
+                                        let iota_ids = self.rho.iota_ids().await;
+                                        for iota_id in iota_ids {
+                                            self.rho.replace_users_for_iota(iota_id, user_ids.clone()).await;
                                         }
                                     }
                                 }
@@ -516,7 +529,7 @@ impl OmegaConnection {
                 drop(sender_guard);
                 // Trigger reconnection by closing the connection state
                 if let Some(sender) = self.sender.write().await.take() {
-                    sender.close();
+                    sender.close().await;
                 }
                 return;
             }
@@ -561,12 +574,37 @@ impl OmegaConnection {
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
+        let _permit = self
+            .request_slots
+            .acquire()
+            .await
+            .map_err(|_| "Omega request queue is unavailable".to_string())?;
+
+        if !self.circuit_breaker.lock().await.allow_request() {
+            return Err("Omega circuit breaker is open".to_string());
+        }
+
+        let result = self.await_response_inner(cv, timeout_duration).await;
+        let mut breaker = self.circuit_breaker.lock().await;
+        if result.is_ok() {
+            breaker.record_success();
+        } else {
+            breaker.record_failure();
+        }
+        result
+    }
+
+    async fn await_response_inner(
+        &self,
+        cv: &CommunicationValue,
+        timeout_duration: Option<Duration>,
+    ) -> Result<CommunicationValue, String> {
         self.await_connection(timeout_duration).await?;
 
         let (tx, mut rx) = mpsc::channel(1);
         let msg_id = cv.get_id();
 
-        WAITING_TASKS.insert(
+        self.waiting_tasks.insert(
             msg_id,
             WaitingTask {
                 task: Box::new(move |_, response_cv| {
@@ -588,7 +626,7 @@ impl OmegaConnection {
             Ok(Some(response_cv)) => Ok(response_cv),
             Ok(_) => Err("Channel closed".to_string()),
             Err(_) => {
-                WAITING_TASKS.remove(&msg_id);
+                self.waiting_tasks.remove(&msg_id);
                 Err("Request timed out".to_string())
             }
         }
@@ -604,13 +642,13 @@ impl OmegaConnection {
     }
 
     #[allow(dead_code)]
-    pub async fn close_iota(iota_id: i64) {
+    pub async fn close_iota(&self, iota_id: i64) {
         let cv = CommunicationValue::new(CommunicationType::IotaDisconnected)
             .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()));
-        OMEGA_CONNECTION.send_message(&cv).await;
+        self.send_message(&cv).await;
     }
 
-    pub async fn client_changed(_iota_id: i64, user_id: i64, state: UserStatus) {
+    pub async fn client_changed(&self, _iota_id: i64, user_id: i64, state: UserStatus) {
         let msg_type = match state {
             UserStatus::iota_offline => CommunicationType::UserDisconnected,
             UserStatus::user_offline => CommunicationType::UserDisconnected,
@@ -621,10 +659,10 @@ impl OmegaConnection {
         let cv = CommunicationValue::new(msg_type)
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
             .add_typed_default(DataType::UserState, DataValue::Str(state.to_string()));
-        OMEGA_CONNECTION.send_message(&cv).await;
+        self.send_message(&cv).await;
     }
 
-    pub async fn user_states(user_id: i64, user_ids: Vec<i64>) {
+    pub async fn user_states(&self, user_id: i64, user_ids: Vec<i64>) {
         let user_ids = user_ids
             .iter()
             .map(|v| DataValue::SignedNumber((*v).into()))
@@ -634,13 +672,15 @@ impl OmegaConnection {
             .add_typed_default(DataType::UserIds, DataValue::Array(user_ids));
         let msg_id = cv.get_id();
 
-        WAITING_TASKS.insert(
+        let rho_manager = self.rho.clone();
+        self.waiting_tasks.insert(
             msg_id,
             WaitingTask {
                 task: Box::new(
                     move |_: Arc<OmegaConnection>, response: CommunicationValue| {
+                        let rho_manager = rho_manager.clone();
                         tokio::spawn(async move {
-                            let rho = rho_manager::get_rho_con_for_user(user_id).await;
+                            let rho = rho_manager.get_for_user(user_id).await;
                             if let Some(rho) = rho {
                                 for client in rho.get_client_connections_for_user(user_id).await {
                                     client.send_message(&response).await;
@@ -654,28 +694,6 @@ impl OmegaConnection {
             },
         );
 
-        OMEGA_CONNECTION.send_message(&cv).await;
+        self.send_message(&cv).await;
     }
-}
-
-// ============================================================================
-// Global Instance
-// ============================================================================
-
-static OMEGA_CONNECTION: Lazy<Arc<OmegaConnection>> = Lazy::new(|| {
-    let conn = Arc::new(OmegaConnection::new());
-
-    // Start the connection manager immediately
-    let conn_clone = conn.clone();
-    tokio::spawn(async move {
-        conn_clone.start().await;
-    });
-
-    start_task_cleanup_loop();
-
-    conn
-});
-
-pub fn get_omega_connection() -> Arc<OmegaConnection> {
-    OMEGA_CONNECTION.clone()
 }

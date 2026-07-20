@@ -1,139 +1,175 @@
-use livekit_api::services::room::CreateRoomOptions;
+use std::{str::FromStr, sync::Arc, time::Duration};
+
 use livekit_api::{
     access_token::{self},
-    services::room::RoomClient,
+    services::room::{CreateRoomOptions, RoomClient},
 };
 use livekit_protocol::Room;
-use std::env;
-use std::str::FromStr;
-use std::time::Duration;
 use uuid::Uuid;
 
-use crate::{calls::call_manager::CALL_GROUPS, log, log_err, util::logger::PrintType};
+use crate::{
+    calls::{call_manager::CallManager, error::CallError},
+    config::LiveKitConfig,
+    log, log_err,
+    util::logger::PrintType,
+};
 
-pub fn get_livekit() -> Result<(String, String, String), ()> {
-    let hostname = match env::var("LIVEKI_HOSTNAME") {
-        Ok(secret) => secret,
-        Err(_) => {
-            log_err!(0, PrintType::General, "LIVEKI_HOSTNAME not set!");
-            return Err(());
-        }
-    };
-    let api_key = match env::var("LIVEKIT_API_KEY") {
-        Ok(key) => key,
-        Err(_) => {
-            log_err!(0, PrintType::General, "LIVEKIT_API_KEY not set!");
-            return Err(());
-        }
-    };
-    let api_secret = match env::var("LIVEKIT_API_SECRET") {
-        Ok(secret) => secret,
-        Err(_) => {
-            log_err!(0, PrintType::General, "LIVEKIT_API_SECRET not set!");
-            return Err(());
-        }
-    };
-    Ok((hostname, api_key, api_secret))
+const LIVEKIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub struct LiveKitService {
+    config: Option<LiveKitConfig>,
 }
 
-pub async fn create_room(call_id: Uuid) -> Result<(), ()> {
-    let (hostname, api_key, api_secret) = get_livekit()?;
-    let room_service = RoomClient::with_api_key(&hostname, &api_key, &api_secret);
+impl LiveKitService {
+    pub fn new(config: Option<LiveKitConfig>) -> Self {
+        Self { config }
+    }
 
-    let options = CreateRoomOptions::default();
+    fn livekit_config(&self) -> Result<&LiveKitConfig, CallError> {
+        self.config.as_ref().ok_or(CallError::NotConfigured)
+    }
 
-    room_service
-        .create_room(&call_id.to_string(), options)
+    fn room_client(&self) -> Result<RoomClient, CallError> {
+        let config = self.livekit_config()?;
+        Ok(RoomClient::with_api_key(
+            &config.hostname,
+            &config.api_key,
+            &config.api_secret,
+        ))
+    }
+
+    pub async fn create_room(&self, call_id: Uuid) -> Result<(), CallError> {
+        tokio::time::timeout(
+            LIVEKIT_REQUEST_TIMEOUT,
+            self.room_client()?
+                .create_room(&call_id.to_string(), CreateRoomOptions::default()),
+        )
         .await
-        .map_err(|_| ())?;
-
-    Ok(())
-}
-
-pub fn create_token(user_id: u64, call_id: Uuid, has_admin: bool) -> Result<String, ()> {
-    let (_, api_key, api_secret) = get_livekit()?;
-
-    let token = access_token::AccessToken::with_api_key(&api_key, &api_secret)
-        .with_identity(&user_id.to_string())
-        .with_grants(access_token::VideoGrants {
-            room_join: true,
-            can_update_own_metadata: true,
-            room_admin: has_admin,
-            room: call_id.to_string(),
-            ..Default::default()
-        })
-        .to_jwt();
-    if let Ok(token) = token {
-        Ok(token)
-    } else {
-        Err(())
+        .map_err(|_| CallError::RequestTimedOut { call_id })?
+        .map_err(|error| CallError::RoomCreationFailed {
+            call_id,
+            detail: error.to_string(),
+        })?;
+        Ok(())
     }
-}
-#[allow(dead_code)]
-pub async fn get_room(call_id: Uuid) -> Result<(RoomClient, Room), ()> {
-    if let Ok((hostname, api_key, api_secret)) = get_livekit() {
-        let room_service = RoomClient::with_api_key(&hostname, &api_key, &api_secret);
-        let rooms = room_service.list_rooms(Vec::new()).await;
-        if let Ok(rooms) = rooms {
-            for room in rooms {
-                if room.name == call_id.to_string() {
-                    return Ok((room_service, room));
+
+    pub fn create_token(
+        &self,
+        user_id: u64,
+        call_id: Uuid,
+        has_admin: bool,
+    ) -> Result<String, CallError> {
+        let config = self.livekit_config()?;
+        access_token::AccessToken::with_api_key(&config.api_key, &config.api_secret)
+            .with_identity(&user_id.to_string())
+            .with_grants(access_token::VideoGrants {
+                room_join: true,
+                can_update_own_metadata: true,
+                room_admin: has_admin,
+                room: call_id.to_string(),
+                ..Default::default()
+            })
+            .to_jwt()
+            .map_err(|error| CallError::TokenCreationFailed {
+                detail: error.to_string(),
+            })
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_room(&self, call_id: Uuid) -> Result<(RoomClient, Room), CallError> {
+        let room_service = self.room_client()?;
+        let rooms =
+            tokio::time::timeout(LIVEKIT_REQUEST_TIMEOUT, room_service.list_rooms(Vec::new()))
+                .await
+                .map_err(|_| CallError::RequestTimedOut { call_id })?
+                .map_err(|error| CallError::RoomLookupFailed {
+                    detail: error.to_string(),
+                })?;
+
+        rooms
+            .into_iter()
+            .find(|room| room.name == call_id.to_string())
+            .map(|room| (room_service, room))
+            .ok_or(CallError::RoomNotFound { call_id })
+    }
+
+    pub async fn remove_participant(&self, call_id: Uuid, user_id: u64) -> Result<(), CallError> {
+        tokio::time::timeout(
+            LIVEKIT_REQUEST_TIMEOUT,
+            self.room_client()?
+                .remove_participant(&call_id.to_string(), &user_id.to_string()),
+        )
+        .await
+        .map_err(|_| CallError::RequestTimedOut { call_id })?
+        .map_err(|error| CallError::ParticipantRemovalFailed {
+            call_id,
+            user_id,
+            detail: error.to_string(),
+        })?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_room_metadata(&self, call_id: Uuid) -> Result<String, CallError> {
+        let (_, room) = self.get_room(call_id).await?;
+        Ok(room.metadata)
+    }
+
+    pub async fn set_room_metadata(
+        &self,
+        call_id: Uuid,
+        metadata: String,
+    ) -> Result<(), CallError> {
+        tokio::time::timeout(
+            LIVEKIT_REQUEST_TIMEOUT,
+            self.room_client()?
+                .update_room_metadata(&call_id.to_string(), &metadata),
+        )
+        .await
+        .map_err(|_| CallError::RequestTimedOut { call_id })?
+        .map_err(|error| CallError::MetadataUpdateFailed {
+            call_id,
+            detail: error.to_string(),
+        })?;
+        Ok(())
+    }
+
+    pub fn garbage_collect_calls(self: Arc<Self>, manager: Arc<CallManager>) {
+        tokio::spawn(async move {
+            loop {
+                match self.room_client() {
+                    Ok(room_service) => clean_calls(&manager, room_service).await,
+                    Err(CallError::NotConfigured) => return,
+                    Err(error) => log_err!(0, PrintType::Call, "Call cleanup skipped: {error}"),
                 }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-        }
+        });
     }
-    return Err(());
 }
 
-pub async fn remove_participant(call_id: Uuid, user_id: u64) -> Result<(), ()> {
-    if let Ok((hostname, api_key, api_secret)) = get_livekit() {
-        let room_service = RoomClient::with_api_key(&hostname, &api_key, &api_secret);
-        if let Ok(_) = room_service
-            .remove_participant(&call_id.to_string(), &user_id.to_string())
+pub async fn clean_calls(manager: &CallManager, room_service: RoomClient) {
+    let rooms =
+        match tokio::time::timeout(LIVEKIT_REQUEST_TIMEOUT, room_service.list_rooms(Vec::new()))
             .await
         {
-            return Ok(());
-        }
-    }
-    return Err(());
-}
-
-#[allow(dead_code)]
-pub async fn get_room_metadata(call_id: Uuid) -> Result<String, ()> {
-    if let Ok((_, room)) = get_room(call_id).await {
-        Ok(room.metadata)
-    } else {
-        Err(())
-    }
-}
-
-pub async fn set_room_metadata(call_id: Uuid, metadata: String) -> Result<(), ()> {
-    let (hostname, api_key, api_secret) = get_livekit()?;
-    let room_service = RoomClient::with_api_key(&hostname, &api_key, &api_secret);
-
-    room_service
-        .update_room_metadata(&call_id.to_string(), &metadata)
-        .await
-        .map_err(|_| ())?;
-
-    Ok(())
-}
-
-pub fn garbage_collect_calls() {
-    tokio::spawn(async move {
-        loop {
-            if let Ok((hostname, api_key, api_secret)) = get_livekit() {
-                let room_service = RoomClient::with_api_key(&hostname, &api_key, &api_secret);
-                clean_calls(room_service).await;
+            Ok(Ok(rooms)) => rooms,
+            Ok(Err(error)) => {
+                log_err!(
+                    0,
+                    PrintType::Call,
+                    "Unable to list LiveKit rooms during cleanup: {error}"
+                );
+                return;
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    });
-}
-pub async fn clean_calls(room_service: RoomClient) {
-    let rooms = room_service.list_rooms(Vec::new()).await.unwrap();
-    let mut call_ids: Vec<Uuid> = Vec::new();
-    let mut no_users: Vec<Uuid> = Vec::new();
+            Err(_) => {
+                log_err!(0, PrintType::Call, "LiveKit room cleanup timed out");
+                return;
+            }
+        };
+
+    let mut call_ids = Vec::new();
+    let mut no_users = Vec::new();
     for room in rooms {
         if let Ok(id) = Uuid::from_str(&room.name) {
             if room.num_participants == 0 {
@@ -142,23 +178,35 @@ pub async fn clean_calls(room_service: RoomClient) {
             call_ids.push(id);
         }
     }
-    let size_pre = CALL_GROUPS.len();
-    for (id, _) in CALL_GROUPS.clone().into_iter() {
+
+    let size_pre = manager.groups.len();
+    let tracked_calls = manager
+        .groups
+        .iter()
+        .map(|entry| *entry.key())
+        .collect::<Vec<_>>();
+    for id in tracked_calls {
         if !call_ids.contains(&id) {
-            CALL_GROUPS.remove(&id);
+            manager.groups.remove(&id);
         }
     }
-    for (_, cg) in CALL_GROUPS.clone().into_iter() {
-        *cg.show.write().await = !no_users.contains(&cg.call_id);
+
+    let call_groups = manager
+        .groups
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect::<Vec<_>>();
+    for call_group in call_groups {
+        *call_group.show.write().await = !no_users.contains(&call_group.call_id);
     }
 
-    let size_post = CALL_GROUPS.len();
-    if size_pre - size_post != 0 {
+    let size_post = manager.groups.len();
+    if size_pre != size_post {
         log!(
             0,
             PrintType::Call,
             "Cleaned {} calls, {} remaining",
-            size_pre - size_post,
+            size_pre.saturating_sub(size_post),
             size_post
         );
     }

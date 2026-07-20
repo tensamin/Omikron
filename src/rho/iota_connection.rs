@@ -1,12 +1,12 @@
+use crate::app_state::AppState;
 use crate::calls::call_group::CallGroup;
-use crate::calls::call_manager;
 use crate::log_cv_in;
 use crate::log_cv_out;
 use crate::log_err;
 use crate::log_in;
 use crate::log_out;
-use crate::omega::omega_connection::get_omega_connection;
 use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
+use crate::util::data_type_id;
 use crate::util::logger::PrintType;
 use dashmap::DashMap;
 use mtp::codec::CommunicationType;
@@ -17,18 +17,15 @@ use mtp::codec::DataValue;
 use mtp::codec::TypeMap;
 use mtp::crypto::KemPublicKey;
 use std::collections::BTreeMap;
-use std::{collections::HashMap, sync::Arc, sync::LazyLock, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
-use super::{rho_connection::RhoConnection, rho_manager};
-use crate::omega::omega_connection::OmegaConnection;
-
-static PENDING_CHAT_SECRETS: LazyLock<DashMap<u64, Vec<CommunicationValue>>> =
-    LazyLock::new(DashMap::new);
+use super::rho_connection::RhoConnection;
 
 #[allow(dead_code)]
 pub struct IotaConnection {
+    pub state: Arc<AppState>,
     pub iota_id: u64,
     pub client_version: String,
     pub sender: Arc<MtpSender>,
@@ -39,11 +36,14 @@ pub struct IotaConnection {
     pub waiting_tasks:
         DashMap<u32, Box<dyn Fn(Arc<IotaConnection>, CommunicationValue) -> bool + Send + Sync>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
+    pending_chat_secrets: DashMap<u64, Vec<CommunicationValue>>,
+    message_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl IotaConnection {
     pub async fn from_general(general: Arc<GeneralConnection>, iota_id: u64) -> Arc<Self> {
         Arc::new(Self {
+            state: general.state.clone(),
             ping: Arc::new(RwLock::new(0)),
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: general.rho_connection.clone(),
@@ -53,6 +53,8 @@ impl IotaConnection {
             iota_id: iota_id,
             client_version: general.client_version.read().await.clone(),
             waiting_tasks: DashMap::new(),
+            pending_chat_secrets: DashMap::new(),
+            message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
         })
     }
     pub fn start(self: Arc<Self>) {
@@ -128,7 +130,7 @@ impl IotaConnection {
     }
 
     async fn flush_pending_chat_secrets(&self, user_id: u64) {
-        let Some((_, messages)) = PENDING_CHAT_SECRETS.remove(&user_id) else {
+        let Some((_, messages)) = self.pending_chat_secrets.remove(&user_id) else {
             return;
         };
 
@@ -137,13 +139,13 @@ impl IotaConnection {
         }
     }
 
-    fn store_pending_chat_secret(cv: CommunicationValue) {
+    fn store_pending_chat_secret(&self, cv: CommunicationValue) {
         let receiver_id = cv.get_receiver();
         if receiver_id == 0 || !cv.is_type(CommunicationType::SetChatSecret) {
             return;
         }
 
-        PENDING_CHAT_SECRETS
+        self.pending_chat_secrets
             .entry(receiver_id)
             .or_default()
             .push(cv);
@@ -187,6 +189,10 @@ impl IotaConnection {
 
     /// Handle incoming message from Iota
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(permit) = self.message_slots.clone().acquire_owned().await else {
+            return;
+        };
+        let _permit = permit;
         let msg_id = cv.get_id();
         if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
             if (task)(self.clone(), cv.clone()) {
@@ -219,7 +225,10 @@ impl IotaConnection {
         }
 
         if cv.is_type(CommunicationType::CompleteRegisterUser) {
-            let response_cv = get_omega_connection()
+            let response_cv = self
+                .state
+                .omega
+                .clone()
                 .await_response(
                     &cv.clone().with_sender(self.iota_id),
                     Some(Duration::from_secs(20)),
@@ -265,7 +274,10 @@ impl IotaConnection {
 
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
         let iota_for_closure = self.clone();
-        let response_cv = get_omega_connection()
+        let response_cv = self
+            .state
+            .omega
+            .clone()
             .await_response(&cv.with_sender(self.iota_id), Some(Duration::from_secs(20)))
             .await;
         if let Ok(response_cv) = response_cv {
@@ -293,10 +305,13 @@ impl IotaConnection {
             .map(|(k, v)| {
                 let mut map = BTreeMap::new();
                 if let Ok(uid) = k.parse::<i128>() {
-                    map.insert(DataType::UserId.to_id(&tm), DataValue::SignedNumber(uid));
+                    map.insert(
+                        data_type_id(DataType::UserId, &tm),
+                        DataValue::SignedNumber(uid),
+                    );
                 }
                 map.insert(
-                    DataType::LastPing.to_id(&tm),
+                    data_type_id(DataType::LastPing, &tm),
                     DataValue::SignedNumber(v.into()),
                 );
                 DataValue::container_from_map(&map)
@@ -327,11 +342,11 @@ impl IotaConnection {
         );
 
         if my_user_ids.contains(&(sender_id as u64)) {
-            if let Some(target_rho) = rho_manager::get_rho_con_for_user(receiver_id as i64).await {
+            if let Some(target_rho) = self.state.rho.get_for_user(receiver_id as i64).await {
                 target_rho.message_to_iota(cv).await;
             } else {
                 if cv.is_type(CommunicationType::SetChatSecret) {
-                    Self::store_pending_chat_secret(cv.clone());
+                    self.store_pending_chat_secret(cv.clone());
                     let success = CommunicationValue::new(CommunicationType::Success)
                         .with_id(cv.get_id())
                         .with_sender(cv.get_sender())
@@ -387,7 +402,7 @@ impl IotaConnection {
         // ============================
         // Load Calls
         // ============================
-        let calls: Vec<Arc<CallGroup>> = call_manager::get_call_groups(user_id).await;
+        let calls: Vec<Arc<CallGroup>> = self.state.call_manager.get_call_groups(user_id).await;
 
         let mut invites: HashMap<i64, Vec<DataValue>> = HashMap::new();
         let mut global_calls: Vec<DataValue> = Vec::new();
@@ -412,27 +427,31 @@ impl IotaConnection {
                 // Build base call container
                 let mut base_call_map: BTreeMap<DataTypeId, DataValue> = BTreeMap::new();
                 base_call_map.insert(
-                    DataType::CallId.to_id(&tm),
+                    data_type_id(DataType::CallId, &tm),
                     DataValue::Str(call.call_id.to_string()),
                 );
                 base_call_map.insert(
-                    DataType::CallMembers.to_id(&tm),
+                    data_type_id(DataType::CallMembers, &tm),
                     DataValue::Array(member_ids),
                 );
 
                 if timeout > 0 {
                     base_call_map.insert(
-                        DataType::Timeout.to_id(&tm),
+                        data_type_id(DataType::Timeout, &tm),
                         DataValue::SignedNumber(timeout.into()),
                     );
                 }
 
                 if admin {
-                    base_call_map.insert(DataType::HasAdmin.to_id(&tm), DataValue::Bool(true));
+                    base_call_map
+                        .insert(data_type_id(DataType::HasAdmin, &tm), DataValue::Bool(true));
                 }
 
                 if let Some(secret) = call.get_secret_for_user(user_id).await {
-                    base_call_map.insert(DataType::CallSecret.to_id(&tm), secret.to_data_value());
+                    base_call_map.insert(
+                        data_type_id(DataType::CallSecret, &tm),
+                        secret.to_data_value(),
+                    );
                 }
 
                 // Add to global calls with only this user's recipient-specific secret.
@@ -473,7 +492,7 @@ impl IotaConnection {
                             entries.iter().cloned().collect();
 
                         if let Some(DataValue::SignedNumber(id)) =
-                            user_map.get(&DataType::UserId.to_id(&tm))
+                            user_map.get(&data_type_id(DataType::UserId, &tm))
                         {
                             interested_ids.push(*id as i64);
 
@@ -481,7 +500,7 @@ impl IotaConnection {
                                 && !call_list.is_empty()
                             {
                                 user_map.insert(
-                                    DataType::Calls.to_id(&tm),
+                                    data_type_id(DataType::Calls, &tm),
                                     DataValue::Array(call_list.clone()),
                                 );
                             }
@@ -498,7 +517,10 @@ impl IotaConnection {
         // ============================
         // Notify Omega
         // ============================
-        OmegaConnection::user_states(user_id as i64, interested_ids.clone()).await;
+        self.state
+            .omega
+            .user_states(user_id as i64, interested_ids.clone())
+            .await;
 
         // ============================
         // Notify Rho

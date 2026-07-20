@@ -1,7 +1,7 @@
-use super::{client_connection::ClientConnection, iota_connection::IotaConnection, rho_manager};
+use super::{client_connection::ClientConnection, iota_connection::IotaConnection};
 
-use crate::omega::omega_connection::OmegaConnection;
 use crate::{data::user::UserStatus, rho::app_connection::AppConnection};
+use dashmap::DashMap;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,8 +11,8 @@ use uuid::Uuid;
 pub struct RhoConnection {
     iota_connection: Arc<IotaConnection>,
     user_ids: Arc<RwLock<Vec<i64>>>,
-    client_connections: Arc<RwLock<Vec<Arc<ClientConnection>>>>,
-    app_connections: Arc<RwLock<Vec<Arc<AppConnection>>>>,
+    client_connections: DashMap<(u64, u64), Arc<ClientConnection>>,
+    app_connections: DashMap<(u64, String, Uuid), Arc<AppConnection>>,
 }
 
 impl RhoConnection {
@@ -21,8 +21,8 @@ impl RhoConnection {
         let rho_connection = Self {
             iota_connection,
             user_ids: Arc::new(RwLock::new(user_ids.clone())),
-            client_connections: Arc::new(RwLock::new(Vec::new())),
-            app_connections: Arc::new(RwLock::new(Vec::new())),
+            client_connections: DashMap::new(),
+            app_connections: DashMap::new(),
         };
 
         rho_connection
@@ -58,8 +58,10 @@ impl RhoConnection {
     }
 
     pub async fn get_client_connections(&self) -> Vec<Arc<ClientConnection>> {
-        let connections = self.client_connections.read().await;
-        connections.clone()
+        self.client_connections
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     /// Get client connections for a specific user
@@ -67,14 +69,11 @@ impl RhoConnection {
         &self,
         user_id: i64,
     ) -> Vec<Arc<ClientConnection>> {
-        let connections = self.client_connections.read().await;
-        let mut collections = Vec::new();
-        for con in connections.iter() {
-            if con.get_user_id().await == user_id as u64 {
-                collections.push(con.clone());
-            }
-        }
-        collections
+        self.client_connections
+            .iter()
+            .filter(|entry| entry.key().0 == user_id as u64)
+            .map(|entry| entry.value().clone())
+            .collect()
     }
 
     #[allow(unused)]
@@ -84,10 +83,10 @@ impl RhoConnection {
         app_identifier: Option<String>,
         app_session: Option<Uuid>,
     ) -> Vec<Arc<AppConnection>> {
-        let connections = self.app_connections.read().await;
-        connections
+        self.app_connections
             .iter()
-            .filter(|conn| {
+            .filter(|entry| {
+                let conn = entry.value();
                 if let Some(uid) = userid {
                     if conn.user_id != uid as u64 {
                         return false;
@@ -105,18 +104,22 @@ impl RhoConnection {
                 }
                 true
             })
-            .cloned()
+            .map(|entry| entry.value().clone())
             .collect()
     }
 
     pub async fn add_app_connection(&self, connection: Arc<AppConnection>) {
-        let mut connections = self.app_connections.write().await;
-        connections.push(connection);
+        let key = (
+            connection.user_id,
+            connection.app_identifier.clone(),
+            connection.app_session,
+        );
+        self.app_connections.insert(key, connection);
     }
 
     pub async fn close_app_connection(&self, connection: Arc<AppConnection>) {
-        let mut connections = self.app_connections.write().await;
-        connections.retain(|c| c.app_session != connection.app_session);
+        self.app_connections
+            .retain(|_, c| c.app_session != connection.app_session);
     }
 
     /// Add a client connection
@@ -130,37 +133,25 @@ impl RhoConnection {
 
         self.iota_connection.send_message(&notification).await;
 
-        let mut should_notify_online = false;
-        {
-            let mut connections = self.client_connections.write().await;
-            let mut keep = Vec::new();
-            let mut had_user = false;
-
-            for con in connections.drain(..) {
-                if con.user_id as i64 == user_id {
-                    had_user = true;
-                    if con.session_id as i64 == session_id {
-                        continue;
-                    }
-                }
-                keep.push(con);
-            }
-
-            if !had_user {
-                should_notify_online = true;
-            }
-
-            keep.push(Arc::clone(&connection));
-            *connections = keep;
-        }
+        let should_notify_online = !self
+            .client_connections
+            .iter()
+            .any(|entry| entry.key().0 == user_id as u64);
+        self.client_connections
+            .remove(&(user_id as u64, session_id as u64));
+        self.client_connections
+            .insert((user_id as u64, session_id as u64), Arc::clone(&connection));
 
         if should_notify_online {
-            OmegaConnection::client_changed(
-                self.get_iota_id().await as i64,
-                user_id,
-                UserStatus::user_online,
-            )
-            .await;
+            self.iota_connection
+                .state
+                .omega
+                .client_changed(
+                    self.get_iota_id().await as i64,
+                    user_id,
+                    UserStatus::user_online,
+                )
+                .await;
         }
     }
 
@@ -168,32 +159,28 @@ impl RhoConnection {
     pub async fn close_client_connection(&self, connection: Arc<ClientConnection>) {
         let target_user_id = connection.user_id as i64;
         let target_session_id = connection.session_id as i64;
-        let mut remaining_for_user = false;
-
-        {
-            let mut connections = self.client_connections.write().await;
-            let mut keep = Vec::new();
-            for con in connections.drain(..) {
-                if con.user_id as i64 == target_user_id
-                    && con.session_id as i64 == target_session_id
-                {
-                    continue;
-                }
-                if con.user_id as i64 == target_user_id {
-                    remaining_for_user = true;
-                }
-                keep.push(con);
-            }
-            *connections = keep;
-        }
+        self.client_connections
+            .remove(&(target_user_id as u64, target_session_id as u64));
+        let remaining_for_user = self
+            .client_connections
+            .iter()
+            .any(|entry| entry.key().0 == target_user_id as u64);
 
         if !remaining_for_user {
-            OmegaConnection::client_changed(
-                self.get_iota_id().await as i64,
-                target_user_id,
-                UserStatus::user_offline,
-            )
-            .await;
+            self.iota_connection
+                .state
+                .rho
+                .remove_user_binding(target_user_id, self.get_iota_id().await as i64)
+                .await;
+            self.iota_connection
+                .state
+                .omega
+                .client_changed(
+                    self.get_iota_id().await as i64,
+                    target_user_id,
+                    UserStatus::user_offline,
+                )
+                .await;
         }
     }
 
@@ -206,15 +193,23 @@ impl RhoConnection {
         }
 
         // Remove from manager
-        rho_manager::remove_rho(self.get_iota_id().await as i64).await;
+        self.iota_connection
+            .state
+            .rho
+            .remove(self.get_iota_id().await as i64)
+            .await;
 
         // Notify OmegaConnection
-        OmegaConnection::close_iota(self.get_iota_id().await as i64).await;
+        self.iota_connection
+            .state
+            .omega
+            .close_iota(self.get_iota_id().await as i64)
+            .await;
     }
 
     /// Send message from Iota to specific client
     pub async fn message_to_client(&self, cv: CommunicationValue) {
-        let connections = self.client_connections.read().await;
+        let connections = self.get_client_connections().await;
         let receiver_id = cv.get_receiver();
         let session_id = cv.get_data(DataType::SessionId).as_number();
 
@@ -238,7 +233,7 @@ impl RhoConnection {
 
     /// Set interested users for a specific client
     pub async fn set_interested(&self, user_id: i64, interested_ids: Vec<i64>) {
-        let connections = self.client_connections.read().await;
+        let connections = self.get_client_connections().await;
         for connection in connections.iter() {
             let conn_user_id = connection.get_user_id().await;
             if conn_user_id == user_id as u64 {
@@ -254,7 +249,7 @@ impl RhoConnection {
     /// Check if clients are interested in a user
     #[allow(dead_code)]
     pub async fn are_they_interested(&self, user_id: i64, user_status: &str) {
-        let connections = self.client_connections.read().await;
+        let connections = self.get_client_connections().await;
         for connection in connections.iter() {
             connection
                 .clone()
@@ -265,7 +260,7 @@ impl RhoConnection {
 
     /// Get ping information for all clients
     pub async fn get_client_pings(&self) -> HashMap<String, i64> {
-        let connections = self.client_connections.read().await;
+        let connections = self.get_client_connections().await;
         let mut pings = HashMap::new();
 
         for connection in connections.iter() {
@@ -285,7 +280,6 @@ impl RhoConnection {
     /// Get count of active client connections
     #[allow(dead_code)]
     pub async fn client_count(&self) -> usize {
-        let connections = self.client_connections.read().await;
-        connections.len()
+        self.client_connections.len()
     }
 }
