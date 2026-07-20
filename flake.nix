@@ -8,13 +8,16 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    ttp = {
-      url = "git+https://git.methanium.net/tensamin/ttp.git";
-      flake = false;
-    };
   };
 
-  outputs = inputs@{ self, nixpkgs, flake-parts, rust-overlay, ttp, ... }:
+  outputs =
+    inputs@{
+      self,
+      nixpkgs,
+      flake-parts,
+      rust-overlay,
+      ...
+    }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = [
         "x86_64-linux"
@@ -23,14 +26,25 @@
         "aarch64-darwin"
       ];
 
-      perSystem = { self', pkgs, system, ... }:
+      perSystem =
+        {
+          self',
+          pkgs,
+          system,
+          ...
+        }:
         let
           rustPkgs = import nixpkgs {
             inherit system;
             overlays = [ (import rust-overlay) ];
           };
           rustToolchain = rustPkgs.rust-bin.stable.latest.default.override {
-            extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
+            extensions = [
+              "rust-src"
+              "rust-analyzer"
+              "clippy"
+              "rustfmt"
+            ];
           };
         in
         {
@@ -44,28 +58,41 @@
                 lockFile = ./Cargo.lock;
                 allowBuiltinFetchGit = true;
               };
-              nativeBuildInputs = with pkgs; [ cmake perl pkg-config ];
+              nativeBuildInputs = with pkgs; [
+                cmake
+                perl
+                pkg-config
+              ];
               buildInputs = with pkgs; [ openssl ];
               dontUseCmakeConfigure = true;
-              preConfigure = ''
-                if [ -d ../cargo-vendor-dir/ttp-core-0.1.0 ]; then
-                  cp ${ttp}/ttp-codec.json ../cargo-vendor-dir/ttp-codec.json
-                fi
-              '';
             };
           };
 
           devShells.default = pkgs.mkShell {
-            nativeBuildInputs = with pkgs; [ rustToolchain git cmake perl pkg-config ];
+            nativeBuildInputs = with pkgs; [
+              rustToolchain
+              git
+              cmake
+              perl
+              pkg-config
+            ];
             buildInputs = with pkgs; [ openssl ];
           };
         };
 
       flake = {
-        nixosModules.default = { config, pkgs, lib, ... }:
+        nixosModules.default =
+          {
+            config,
+            pkgs,
+            lib,
+            ...
+          }:
           let
             cfg = config.services.omikron;
-            defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default or (throw "omikron: no pre-built package for system ${pkgs.stdenv.hostPlatform.system}");
+            defaultPackage =
+              self.packages.${pkgs.stdenv.hostPlatform.system}.default
+                or (throw "omikron: no pre-built package for system ${pkgs.stdenv.hostPlatform.system}");
           in
           {
             options.services.omikron = {
@@ -113,12 +140,6 @@
                 description = "Port the Omikron server listens on for incoming QUIC connections.";
               };
 
-              ttpBind = lib.mkOption {
-                type = lib.types.str;
-                default = "0.0.0.0";
-                description = "IP address to bind the TTP/QUIC server to.";
-              };
-
               omegaHost = lib.mkOption {
                 type = lib.types.str;
                 default = "tensamin.net";
@@ -163,7 +184,6 @@
 
                 environment = {
                   RHO_PORT = toString cfg.rhoPort;
-                  TTP_BIND = cfg.ttpBind;
                   OMEGA_HOST = cfg.omegaHost;
                   OMEGA_PORT = toString cfg.omegaPort;
                 };
@@ -183,19 +203,27 @@
                   CapabilityBoundingSet = [ "CAP_NET_BIND_SERVICE" ];
 
                   ExecStartPre = [
-                    ("+" + pkgs.writeShellScript "omikron-setup-certs" (if cfg.acmeCertDir != null then ''
-                      mkdir -p ${cfg.dataDir}/certs
-                      cp ${cfg.acmeCertDir}/fullchain.pem ${cfg.dataDir}/certs/cert.pem
-                      ${pkgs.openssl}/bin/openssl pkcs8 -topk8 -nocrypt \
-                        -in ${cfg.acmeCertDir}/key.pem \
-                        -out ${cfg.dataDir}/certs/key.pem
-                      chown -R omikron:omikron ${cfg.dataDir}
-                    '' else ''
-                      mkdir -p ${cfg.dataDir}/certs
-                      ln -sf ${cfg.certFile} ${cfg.dataDir}/certs/cert.pem
-                      ln -sf ${cfg.keyFile} ${cfg.dataDir}/certs/key.pem
-                      chown -R omikron:omikron ${cfg.dataDir}
-                    ''))
+                    (
+                      "+"
+                      + pkgs.writeShellScript "omikron-setup-certs" (
+                        if cfg.acmeCertDir != null then
+                          ''
+                            mkdir -p ${cfg.dataDir}/certs
+                            cp ${cfg.acmeCertDir}/fullchain.pem ${cfg.dataDir}/certs/cert.pem
+                            ${pkgs.openssl}/bin/openssl pkcs8 -topk8 -nocrypt \
+                              -in ${cfg.acmeCertDir}/key.pem \
+                              -out ${cfg.dataDir}/certs/key.pem
+                            chown -R omikron:omikron ${cfg.dataDir}
+                          ''
+                        else
+                          ''
+                            mkdir -p ${cfg.dataDir}/certs
+                            ln -sf ${cfg.certFile} ${cfg.dataDir}/certs/cert.pem
+                            ln -sf ${cfg.keyFile} ${cfg.dataDir}/certs/key.pem
+                            chown -R omikron:omikron ${cfg.dataDir}
+                          ''
+                      )
+                    )
                   ];
 
                   ProtectSystem = "strict";
