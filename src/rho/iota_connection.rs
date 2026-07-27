@@ -208,6 +208,12 @@ impl IotaConnection {
 
         log_cv_in!(PrintType::Iota, cv);
 
+        let cv = if cv.is_type(CommunicationType::ClientStateSync) {
+            self.add_call_state(cv).await
+        } else {
+            cv
+        };
+
         // Handle GET_CHATS
         if cv.is_type(CommunicationType::GetChats) {
             self.handle_get_chats(cv).await;
@@ -733,6 +739,32 @@ impl IotaConnection {
             rho_conn.message_to_client(updated_cv).await;
         } else {
         }
+    }
+
+    async fn add_call_state(&self, response: CommunicationValue) -> CommunicationValue {
+        let mut output = response.clone();
+        let user_id = response.get_receiver();
+
+        for (key, value) in response.iter_typed_data() {
+            if key == Some(DataType::Contacts) {
+                if let Some(contacts) = value.as_array() {
+                    let (contacts, global_calls) = self
+                        .state
+                        .call_state_aggregator
+                        .augment_contacts(user_id, contacts.clone())
+                        .await;
+                    output =
+                        output.add_typed_default(DataType::Contacts, DataValue::Array(contacts));
+                    output =
+                        output.add_typed_default(DataType::Calls, DataValue::Array(global_calls));
+                    continue;
+                }
+            }
+            if let Some(data_type) = key {
+                output = output.add_typed_default(data_type, value.clone());
+            }
+        }
+        output
     }
 
     pub async fn handle_close(&self) {

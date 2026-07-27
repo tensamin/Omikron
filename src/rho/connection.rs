@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::{
     anonymous_clients::anonymous_client_connection::AnonymousClientConnection,
     app_state::AppState,
-    log_cv_out, log_err, log_in, log_out,
+    log_err, log_in, log_out,
     rho::{
         app_connection::AppConnection, client_connection::ClientConnection,
         iota_connection::IotaConnection, rho_connection::RhoConnection,
@@ -19,14 +19,6 @@ use mtp::webserver::{WebMTPConnection, WebMtpReceiver, WebMtpSender};
 
 pub type MtpSender = WebMtpSender;
 pub type MtpReceiver = WebMtpReceiver;
-
-fn data_i64(value: &DataValue) -> Option<i64> {
-    match value {
-        DataValue::SignedNumber(number) => i64::try_from(*number).ok(),
-        DataValue::UnsignedNumber(number) => i64::try_from(*number).ok(),
-        _ => None,
-    }
-}
 
 /*
  * How a connection identified itself during the mtp handshake driven by
@@ -85,7 +77,12 @@ impl GeneralConnection {
             connection_kind: kind,
             id: conn.client_id,
             rho_connection: Arc::new(RwLock::new(None)),
-            session_id: Arc::new(RwLock::new(conn.client_id)),
+            session_id: Arc::new(RwLock::new(match kind {
+                ConnectionKind::Client => {
+                    ((Uuid::new_v4().as_u128() as u64) & ((1_u64 << 53) - 1)).max(1)
+                }
+                _ => conn.client_id,
+            })),
             app_identifier: Arc::new(RwLock::new(None)),
             app_session: Arc::new(RwLock::new(None)),
             client_version: Arc::new(RwLock::new(conn.version.to_string())),
@@ -132,49 +129,6 @@ impl GeneralConnection {
         let id = self.id;
         let user_id = id as i64;
 
-        let Ok(handshake) = self.receiver.receive().await else {
-            return false;
-        };
-        if !handshake.is_type(CommunicationType::ClientConnected) {
-            let error = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                .with_id(handshake.get_id());
-            let _ = self.sender.send(&error).await;
-            return false;
-        }
-        let Some(session_id) = data_i64(handshake.get_data(DataType::SessionId)) else {
-            let _ = self
-                .sender
-                .send(
-                    &CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                        .with_id(handshake.get_id()),
-                )
-                .await;
-            return false;
-        };
-        if session_id <= 0 {
-            let _ = self
-                .sender
-                .send(
-                    &CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                        .with_id(handshake.get_id()),
-                )
-                .await;
-            return false;
-        }
-        let version = data_i64(handshake.get_data(DataType::VersionNumber));
-        if !matches!(version, Some(version) if version >= 0) {
-            let _ = self
-                .sender
-                .send(
-                    &CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                        .with_id(handshake.get_id()),
-                )
-                .await;
-            return false;
-        }
-        *self.session_id.write().await = session_id as u64;
-        let request_id = handshake.get_id();
-
         let client = ClientConnection::from_general(self.clone(), id).await;
         let rho = self.find_user_rho(user_id).await;
         *self.rho_connection.write().await = rho.clone();
@@ -184,24 +138,8 @@ impl GeneralConnection {
             rho_conn.add_client_connection(client.clone()).await;
             self.notify_user_connected(user_id, rho_conn.get_iota_id().await as i64)
                 .await;
-            if let Some(response) = self
-                .request_initial_client_state(&rho_conn, user_id, handshake)
-                .await
-            {
-                let response = self.add_call_state(response, user_id).await;
-                log_cv_out!(response);
-                let _ = self.sender.send(&response).await;
-            } else {
-                let error =
-                    CommunicationValue::new(CommunicationType::ErrorNoIota).with_id(request_id);
-                log_err!(
-                    user_id,
-                    PrintType::Client,
-                    "Initial state request failed for user {}",
-                    id
-                );
-                let _ = self.sender.send(&error).await;
-            }
+            self.send_initial_client_state_request(&rho_conn, user_id)
+                .await;
         } else {
             log_err!(
                 user_id,
@@ -209,7 +147,7 @@ impl GeneralConnection {
                 "No RhoConnection found for user {}, client not attached to iota",
                 id
             );
-            let error = CommunicationValue::new(CommunicationType::ErrorNoIota).with_id(request_id);
+            let error = CommunicationValue::new(CommunicationType::ErrorNoIota);
             let _ = self.sender.send(&error).await;
         }
 
@@ -271,67 +209,19 @@ impl GeneralConnection {
         Some(rho)
     }
 
-    async fn request_initial_client_state(
-        &self,
-        rho: &Arc<RhoConnection>,
-        user_id: i64,
-        handshake: CommunicationValue,
-    ) -> Option<CommunicationValue> {
+    async fn send_initial_client_state_request(&self, rho: &Arc<RhoConnection>, user_id: i64) {
         let session_id = *self.session_id.read().await as i64;
         let request = CommunicationValue::new(CommunicationType::ClientConnected)
-            .with_id(handshake.get_id())
             .with_sender(user_id as u64)
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
             .add_typed_default(
                 DataType::SessionId,
                 DataValue::SignedNumber(session_id.into()),
             )
-            .add_typed_default(
-                DataType::VersionNumber,
-                handshake.get_data(DataType::VersionNumber).clone(),
-            )
-            .add_typed_default(
-                DataType::CacheValid,
-                handshake.get_data(DataType::CacheValid).clone(),
-            )
-            .add_typed_default(
-                DataType::CacheSchemaVersion,
-                handshake.get_data(DataType::CacheSchemaVersion).clone(),
-            );
-        rho.get_iota_connection()
-            .clone()
-            .await_response(&request, Some(Duration::from_secs(20)))
-            .await
-            .ok()
-    }
-
-    async fn add_call_state(
-        &self,
-        response: CommunicationValue,
-        user_id: i64,
-    ) -> CommunicationValue {
-        let mut output = response.clone();
-
-        for (key, value) in response.iter_typed_data() {
-            if key == Some(DataType::Contacts) {
-                if let Some(contacts) = value.as_array() {
-                    let (contacts, global_calls) = self
-                        .state
-                        .call_state_aggregator
-                        .augment_contacts(user_id as u64, contacts.clone())
-                        .await;
-                    output =
-                        output.add_typed_default(DataType::Contacts, DataValue::Array(contacts));
-                    output =
-                        output.add_typed_default(DataType::Calls, DataValue::Array(global_calls));
-                    continue;
-                }
-            }
-            if let Some(data_type) = key {
-                output = output.add_typed_default(data_type, value.clone());
-            }
-        }
-        output
+            .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(0))
+            .add_typed_default(DataType::CacheValid, DataValue::Bool(false))
+            .add_typed_default(DataType::CacheSchemaVersion, DataValue::SignedNumber(0));
+        rho.get_iota_connection().send_message(&request).await;
     }
 
     async fn migrate_iota(self: &Arc<Self>) {
@@ -389,18 +279,5 @@ impl GeneralConnection {
             rho_conn.add_app_connection(app_conn.clone()).await;
         }
         app_conn.start();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::data_i64;
-    use mtp::codec::DataValue;
-
-    #[test]
-    fn data_i64_accepts_signed_and_unsigned_values() {
-        assert_eq!(data_i64(&DataValue::SignedNumber(42)), Some(42));
-        assert_eq!(data_i64(&DataValue::UnsignedNumber(42)), Some(42));
-        assert_eq!(data_i64(&DataValue::UnsignedNumber(u128::MAX)), None);
     }
 }

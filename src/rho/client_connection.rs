@@ -105,7 +105,7 @@ impl ClientConnection {
         };
         tokio::spawn(async move {
             let _permit = permit;
-            if cv.is_type(CommunicationType::Ping) {
+            if cv.is_type(CommunicationType::ClientPing) {
                 self.handle_ping(cv).await;
                 return;
             }
@@ -331,7 +331,7 @@ impl ClientConnection {
         };
 
         // Send pong response
-        let response = CommunicationValue::new(CommunicationType::Pong)
+        let response = CommunicationValue::new(CommunicationType::ClientPing)
             .with_id(cv.get_id())
             .add_typed_default(
                 DataType::PingIota,

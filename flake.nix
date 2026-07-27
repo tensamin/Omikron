@@ -8,6 +8,10 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    mtp-type-maps = {
+      url = "git+https://git.methanium.net/tensamin/mtp-type-maps";
+      flake = false;
+    };
   };
 
   outputs =
@@ -65,6 +69,7 @@
               ];
               buildInputs = with pkgs; [ openssl ];
               dontUseCmakeConfigure = true;
+              MTP_TYPE_MAPS = "${inputs.mtp-type-maps}/type-maps.yaml";
             };
           };
 

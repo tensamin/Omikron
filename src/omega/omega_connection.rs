@@ -3,7 +3,7 @@ use crate::{
     rho::rho_manager::RhoManager, util::logger::PrintType,
 };
 use dashmap::DashMap;
-use mtp::client::{Client, Receiver, Sender};
+use mtp::client::{Client, MTPConnection, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::{
     client::ClientConfig,
@@ -297,7 +297,7 @@ impl OmegaConnection {
         let host_public_key = load_public_key_bundle("./omega.mpkb")
             .map_err(|e| format!("Failed to load omega.mpkb: {}", e))?;
 
-        let mut connection = Client::auth_connect(client_config, &self.keyring, &host_public_key)
+        let connection = Client::auth_connect(client_config, &self.keyring, &host_public_key)
             .await
             .map_err(|e| format!("Connection failed: {}", e))?;
 
@@ -309,19 +309,18 @@ impl OmegaConnection {
         );
 
         // Store sender
-        let sender_arc = Arc::new(connection.sender);
+        let sender_arc = Arc::new(connection.sender.clone());
         *self.sender.write().await = Some(sender_arc.clone());
         *self.state.write().await = ConnectionState::Connected { identified: false };
 
         // Get handle for close monitoring
         let sender_handle = sender_arc.handle().clone();
+        let connection = Arc::new(connection);
 
         // Start read loop
         let read_self = self.clone();
         let read_handle = tokio::spawn(async move {
-            read_self
-                .read_loop(&mut connection.receiver, sender_handle)
-                .await;
+            read_self.read_loop(connection, sender_handle).await;
         });
 
         // Start heartbeat
@@ -411,7 +410,7 @@ impl OmegaConnection {
 
     async fn read_loop(
         self: Arc<Self>,
-        receiver: &mut Receiver,
+        connection: Arc<MTPConnection>,
         sender_handle: Arc<ConnectionHandle>,
     ) {
         // Monitor both receiver and sender handle for close
@@ -419,7 +418,7 @@ impl OmegaConnection {
 
         loop {
             tokio::select! {
-                result = receiver.receive() => {
+                result = connection.receive() => {
                     match result {
                         Ok(cv) => {
                             if !cv.is_type(CommunicationType::Pong) && !cv.is_type(CommunicationType::Ping) {
