@@ -20,6 +20,14 @@ use mtp::webserver::{WebMTPConnection, WebMtpReceiver, WebMtpSender};
 pub type MtpSender = WebMtpSender;
 pub type MtpReceiver = WebMtpReceiver;
 
+fn data_i64(value: &DataValue) -> Option<i64> {
+    match value {
+        DataValue::SignedNumber(number) => i64::try_from(*number).ok(),
+        DataValue::UnsignedNumber(number) => i64::try_from(*number).ok(),
+        _ => None,
+    }
+}
+
 /*
  * How a connection identified itself during the mtp handshake driven by
  * `server.rs` ("iota" / "client" authenticated logins, "anonymous"
@@ -105,27 +113,35 @@ impl GeneralConnection {
     async fn migrate(self: &Arc<Self>) -> bool {
         match self.connection_kind {
             ConnectionKind::Client => self.migrate_client().await,
-            ConnectionKind::Iota => self.migrate_iota().await,
-            ConnectionKind::AnonymousClient => self.migrate_anonymous_client().await,
-            ConnectionKind::Phi => self.migrate_phi().await,
+            ConnectionKind::Iota => {
+                self.migrate_iota().await;
+                true
+            }
+            ConnectionKind::AnonymousClient => {
+                self.migrate_anonymous_client().await;
+                true
+            }
+            ConnectionKind::Phi => {
+                self.migrate_phi().await;
+                true
+            }
         }
-        true
     }
 
-    async fn migrate_client(self: &Arc<Self>) {
+    async fn migrate_client(self: &Arc<Self>) -> bool {
         let id = self.id;
         let user_id = id as i64;
 
         let Ok(handshake) = self.receiver.receive().await else {
-            return;
+            return false;
         };
         if !handshake.is_type(CommunicationType::ClientConnected) {
             let error = CommunicationValue::new(CommunicationType::ErrorInvalidData)
                 .with_id(handshake.get_id());
             let _ = self.sender.send(&error).await;
-            return;
+            return false;
         }
-        let Some(session_id) = handshake.get_data(DataType::SessionId).as_signed_number() else {
+        let Some(session_id) = data_i64(handshake.get_data(DataType::SessionId)) else {
             let _ = self
                 .sender
                 .send(
@@ -133,9 +149,9 @@ impl GeneralConnection {
                         .with_id(handshake.get_id()),
                 )
                 .await;
-            return;
+            return false;
         };
-        if !(1..=i64::MAX as i128).contains(&session_id) {
+        if session_id <= 0 {
             let _ = self
                 .sender
                 .send(
@@ -143,11 +159,9 @@ impl GeneralConnection {
                         .with_id(handshake.get_id()),
                 )
                 .await;
-            return;
+            return false;
         }
-        let version = handshake
-            .get_data(DataType::VersionNumber)
-            .as_signed_number();
+        let version = data_i64(handshake.get_data(DataType::VersionNumber));
         if !matches!(version, Some(version) if version >= 0) {
             let _ = self
                 .sender
@@ -156,9 +170,10 @@ impl GeneralConnection {
                         .with_id(handshake.get_id()),
                 )
                 .await;
-            return;
+            return false;
         }
         *self.session_id.write().await = session_id as u64;
+        let request_id = handshake.get_id();
 
         let client = ClientConnection::from_general(self.clone(), id).await;
         let rho = self.find_user_rho(user_id).await;
@@ -176,6 +191,16 @@ impl GeneralConnection {
                 let response = self.add_call_state(response, user_id).await;
                 log_cv_out!(response);
                 let _ = self.sender.send(&response).await;
+            } else {
+                let error =
+                    CommunicationValue::new(CommunicationType::ErrorNoIota).with_id(request_id);
+                log_err!(
+                    user_id,
+                    PrintType::Client,
+                    "Initial state request failed for user {}",
+                    id
+                );
+                let _ = self.sender.send(&error).await;
             }
         } else {
             log_err!(
@@ -184,9 +209,12 @@ impl GeneralConnection {
                 "No RhoConnection found for user {}, client not attached to iota",
                 id
             );
+            let error = CommunicationValue::new(CommunicationType::ErrorNoIota).with_id(request_id);
+            let _ = self.sender.send(&error).await;
         }
 
         client.start();
+        true
     }
 
     async fn notify_user_connected(&self, user_id: i64, iota_id: i64) {
@@ -251,6 +279,8 @@ impl GeneralConnection {
     ) -> Option<CommunicationValue> {
         let session_id = *self.session_id.read().await as i64;
         let request = CommunicationValue::new(CommunicationType::ClientConnected)
+            .with_id(handshake.get_id())
+            .with_sender(user_id as u64)
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
             .add_typed_default(
                 DataType::SessionId,
@@ -359,5 +389,18 @@ impl GeneralConnection {
             rho_conn.add_app_connection(app_conn.clone()).await;
         }
         app_conn.start();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::data_i64;
+    use mtp::codec::DataValue;
+
+    #[test]
+    fn data_i64_accepts_signed_and_unsigned_values() {
+        assert_eq!(data_i64(&DataValue::SignedNumber(42)), Some(42));
+        assert_eq!(data_i64(&DataValue::UnsignedNumber(42)), Some(42));
+        assert_eq!(data_i64(&DataValue::UnsignedNumber(u128::MAX)), None);
     }
 }
