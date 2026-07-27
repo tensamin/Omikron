@@ -2,7 +2,7 @@ use super::{client_connection::ClientConnection, iota_connection::IotaConnection
 
 use crate::{data::user::UserStatus, rho::app_connection::AppConnection};
 use dashmap::DashMap;
-use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use mtp::codec::{CommunicationValue, DataType};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -128,39 +128,51 @@ impl RhoConnection {
         let user_id = connection.user_id as i64;
         let session_id = connection.session_id as i64;
 
-        let notification = CommunicationValue::new(CommunicationType::ClientConnected)
-            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
-
-        self.iota_connection.send_message(&notification).await;
-
-        let should_notify_online = !self
+        if let Some((_, old_connection)) = self
             .client_connections
-            .iter()
-            .any(|entry| entry.key().0 == user_id as u64);
-        self.client_connections
-            .remove(&(user_id as u64, session_id as u64));
+            .remove(&(user_id as u64, session_id as u64))
+        {
+            // A reconnect for a persistent device replaces the old transport;
+            // do this before publishing the new route.
+            old_connection.close().await;
+        }
         self.client_connections
             .insert((user_id as u64, session_id as u64), Arc::clone(&connection));
+    }
 
-        if should_notify_online {
-            self.iota_connection
-                .state
-                .omega
-                .client_changed(
-                    self.get_iota_id().await as i64,
-                    user_id,
-                    UserStatus::user_online,
-                )
-                .await;
+    pub async fn get_client_connection(
+        &self,
+        user_id: i64,
+        session_id: i64,
+    ) -> Option<Arc<ClientConnection>> {
+        if user_id < 0 || session_id <= 0 {
+            return None;
         }
+        self.client_connections
+            .get(&(user_id as u64, session_id as u64))
+            .map(|entry| entry.value().clone())
     }
 
     /// Remove a client connection
     pub async fn close_client_connection(&self, connection: Arc<ClientConnection>) {
         let target_user_id = connection.user_id as i64;
         let target_session_id = connection.session_id as i64;
-        self.client_connections
-            .remove(&(target_user_id as u64, target_session_id as u64));
+        // Do not let a stale transport tear down the replacement for the same
+        // persistent session.
+        let key = (target_user_id as u64, target_session_id as u64);
+        if self
+            .client_connections
+            .get(&key)
+            .is_some_and(|current| !Arc::ptr_eq(current.value(), &connection))
+        {
+            return;
+        }
+        self.client_connections.remove(&key);
+        self.iota_connection
+            .state
+            .omega
+            .client_disconnected(target_user_id, target_session_id)
+            .await;
         let remaining_for_user = self
             .client_connections
             .iter()
@@ -178,6 +190,7 @@ impl RhoConnection {
                 .client_changed(
                     self.get_iota_id().await as i64,
                     target_user_id,
+                    target_session_id,
                     UserStatus::user_offline,
                 )
                 .await;
@@ -232,17 +245,9 @@ impl RhoConnection {
     }
 
     /// Set interested users for a specific client
-    pub async fn set_interested(&self, user_id: i64, interested_ids: Vec<i64>) {
-        let connections = self.get_client_connections().await;
-        for connection in connections.iter() {
-            let conn_user_id = connection.get_user_id().await;
-            if conn_user_id == user_id as u64 {
-                connection
-                    .clone()
-                    .set_interested_users(interested_ids.clone())
-                    .await;
-                break;
-            }
+    pub async fn set_interested(&self, user_id: i64, session_id: i64, interested_ids: Vec<i64>) {
+        if let Some(connection) = self.get_client_connection(user_id, session_id).await {
+            connection.set_interested_users(interested_ids).await;
         }
     }
 

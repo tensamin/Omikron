@@ -272,6 +272,28 @@ impl ClientConnection {
                 }
             }
 
+            // Every Iota request is bound to the authenticated device.  A
+            // caller may omit the field for compatibility, but can never
+            // select a different device session.
+            let expected_session_id = self.session_id as i128;
+            if let Some(session_id) = cv.get_data(DataType::SessionId).as_signed_number() {
+                if session_id != expected_session_id {
+                    let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                        .with_id(cv.get_id())
+                        .add_typed_default(
+                            DataType::SessionId,
+                            DataValue::SignedNumber(expected_session_id),
+                        );
+                    self.send_message(&response).await;
+                    return;
+                }
+            } else {
+                cv = cv.add_typed_default(
+                    DataType::SessionId,
+                    DataValue::SignedNumber(expected_session_id),
+                );
+            }
+
             // Forward other messages to Iota
             self.forward_to_iota(cv).await;
         });
@@ -330,6 +352,7 @@ impl ClientConnection {
                     .client_changed(
                         rho_conn.get_iota_id().await as i64,
                         user_id as i64,
+                        self.session_id as i64,
                         user_status,
                     )
                     .await;
@@ -868,7 +891,7 @@ impl ClientConnection {
                 user_status
             };
             let notification = CommunicationValue::new(CommunicationType::ClientChanged)
-                .add_typed_default(DataType::UserId, DataValue::Str(user_id.to_string()))
+                .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
                 .add_typed_default(DataType::UserState, DataValue::Str(status.to_string()));
 
             self.send_message(&notification).await;
@@ -876,12 +899,10 @@ impl ClientConnection {
     }
 
     /// Handle connection close
-    pub async fn handle_close(&self) {
+    pub async fn handle_close(self: Arc<Self>) {
         let user_id = self.get_user_id().await;
         if let Some(rho_conn) = self.state.rho.get_for_user(user_id as i64).await {
-            rho_conn
-                .close_client_connection(Arc::new(self.clone()))
-                .await;
+            rho_conn.close_client_connection(self.clone()).await;
         }
     }
 }

@@ -173,8 +173,11 @@ pub fn format_cv(cv: &CommunicationValue) -> String {
         parts.push(format!("> {}", receiver));
     }
 
-    let comm_type = cv.get_type().to_string();
-    parts.push(format!("{}", comm_type));
+    let comm_type = cv
+        .get_comm_type_enum()
+        .map(|kind| kind.to_string())
+        .unwrap_or_else(|| cv.get_type().to_string());
+    parts.push(format!("{} (id={})", comm_type, cv.get_id()));
 
     let data = cv.data();
 

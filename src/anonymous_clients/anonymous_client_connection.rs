@@ -356,7 +356,12 @@ impl AnonymousClientConnection {
             let user_status = UserStatus::from_str(&status_str).unwrap_or(UserStatus::user_online);
             self.state
                 .omega
-                .client_changed(self.user_id as i64, self.user_id as i64, user_status)
+                .client_changed(
+                    self.user_id as i64,
+                    self.user_id as i64,
+                    self.user_id as i64,
+                    user_status,
+                )
                 .await;
         }
     }

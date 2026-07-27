@@ -1,0 +1,3 @@
+[submodule "mtp-type-maps"]
+	path = mtp-type-maps
+	url = ssh://git@git.methanium.net/tensamin/mtp-type-maps

@@ -1,5 +1,5 @@
 use crate::{
-    config::Config, data::user::UserStatus, log_cv_in, log_cv_out, log_err, log_in,
+    config::Config, data::user::UserStatus, log_cv_in, log_cv_out, log_err, log_in, log_out,
     rho::rho_manager::RhoManager, util::logger::PrintType,
 };
 use dashmap::DashMap;
@@ -24,6 +24,7 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_HEARTBEAT_FAILURES: usize = 3;
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_REQUESTS: usize = 128;
@@ -282,14 +283,14 @@ impl OmegaConnection {
                     .with_send_mode(SendMode::SingleStreamPerMessage)
                     .with_max_message_size(1_000_000_000)
                     .with_timeouts(
-                        Duration::from_millis(2_000),
-                        Duration::from_millis(2_000),
+                        Duration::from_millis(5_000),
+                        Duration::from_millis(5_000),
                         Duration::from_millis(30_000),
                     )
                     .with_keep_alive(Some(Duration::from_secs(6)))
                     .with_max_idle_timeout(Some(Duration::from_secs(30)))
                     .with_receiver_queue_capacity(1000)
-                    .with_max_concurrent_stream_tasks(10)
+                    .with_max_concurrent_stream_tasks(64)
                     .with_persistent_stream_retries(5, Duration::from_secs(5)),
             );
 
@@ -339,6 +340,21 @@ impl OmegaConnection {
         let result = read_handle.await;
 
         // Cleanup
+        let close_reason = sender_arc.close_reason();
+        if let Some(reason) = close_reason {
+            log_err!(
+                0,
+                PrintType::Omega,
+                "Omega transport ended with close reason: {:?}",
+                reason
+            );
+        } else {
+            log_in!(
+                0,
+                PrintType::Omega,
+                "Omega transport ended without a close reason"
+            );
+        }
         *self.sender.write().await = None;
         *self.state.write().await = ConnectionState::Disconnected;
 
@@ -463,6 +479,7 @@ impl OmegaConnection {
     }
 
     async fn heartbeat_loop(self: Arc<Self>) {
+        let mut consecutive_failures = 0;
         loop {
             sleep(HEARTBEAT_INTERVAL).await;
 
@@ -481,11 +498,35 @@ impl OmegaConnection {
                 break;
             }
 
-            self.send_ping().await;
+            match self.send_ping().await {
+                Ok(()) => consecutive_failures = 0,
+                Err(error) => {
+                    consecutive_failures += 1;
+                    log_err!(
+                        0,
+                        PrintType::Omega,
+                        "Heartbeat send failed ({}/{}): {}",
+                        consecutive_failures,
+                        MAX_HEARTBEAT_FAILURES,
+                        error
+                    );
+                    if consecutive_failures >= MAX_HEARTBEAT_FAILURES {
+                        log_err!(
+                            0,
+                            PrintType::Omega,
+                            "Closing unhealthy Omega connection after repeated heartbeat failures"
+                        );
+                        if let Some(sender) = self.sender.read().await.as_ref().cloned() {
+                            sender.close().await;
+                        }
+                        break;
+                    }
+                }
+            }
         }
     }
 
-    async fn send_ping(&self) {
+    async fn send_ping(&self) -> Result<(), String> {
         let ping = CommunicationValue::new(CommunicationType::Ping).add_typed_default(
             DataType::SendTime,
             DataValue::SignedNumber(
@@ -495,7 +536,7 @@ impl OmegaConnection {
                     .as_secs() as i128,
             ),
         );
-        self.send_message(&ping).await;
+        self.try_send_message(&ping).await
     }
 
     async fn handle_pong(&self, cv: &CommunicationValue) {
@@ -516,7 +557,7 @@ impl OmegaConnection {
     // Public API
     // -------------------------------------------------------------------------
 
-    pub async fn send_message(&self, cv: &CommunicationValue) {
+    async fn try_send_message(&self, cv: &CommunicationValue) -> Result<(), String> {
         if !cv.is_type(CommunicationType::Pong) && !cv.is_type(CommunicationType::Ping) {
             log_cv_out!(PrintType::Omega, &cv);
         }
@@ -531,7 +572,7 @@ impl OmegaConnection {
                 if let Some(sender) = self.sender.write().await.take() {
                     sender.close().await;
                 }
-                return;
+                return Err("connection is closed".to_string());
             }
 
             let sender_clone = Arc::clone(sender);
@@ -539,10 +580,17 @@ impl OmegaConnection {
 
             if let Err(e) = sender_clone.send(cv).await {
                 log_err!(0, PrintType::Omega, "Send failed: {}", e);
+                return Err(e.to_string());
             }
         } else {
             log_err!(0, PrintType::Omega, "Cannot send: not connected");
+            return Err("not connected".to_string());
         }
+        Ok(())
+    }
+
+    pub async fn send_message(&self, cv: &CommunicationValue) {
+        let _ = self.try_send_message(cv).await;
     }
 
     pub async fn await_connection(&self, timeout_duration: Option<Duration>) -> Result<(), String> {
@@ -608,6 +656,17 @@ impl OmegaConnection {
             msg_id,
             WaitingTask {
                 task: Box::new(move |_, response_cv| {
+                    log_in!(
+                        0,
+                        PrintType::Omega,
+                        "Matched Omega response (request_id={}, response_id={}, type={})",
+                        msg_id,
+                        response_cv.get_id(),
+                        response_cv
+                            .get_comm_type_enum()
+                            .map(|kind| kind.to_string())
+                            .unwrap_or_else(|| response_cv.get_type().to_string())
+                    );
                     let inner_tx = tx.clone();
                     tokio::spawn(async move {
                         let _ = inner_tx.send(response_cv).await;
@@ -618,7 +677,19 @@ impl OmegaConnection {
             },
         );
 
-        self.send_message(cv).await;
+        if let Err(error) = self.try_send_message(cv).await {
+            self.waiting_tasks.remove(&msg_id);
+            return Err(format!("failed to send request: {error}"));
+        }
+        log_out!(
+            0,
+            PrintType::Omega,
+            "Sent Omega request (request_id={}, type={})",
+            msg_id,
+            cv.get_comm_type_enum()
+                .map(|kind| kind.to_string())
+                .unwrap_or_else(|| cv.get_type().to_string())
+        );
 
         let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
 
@@ -648,17 +719,30 @@ impl OmegaConnection {
         self.send_message(&cv).await;
     }
 
-    pub async fn client_changed(&self, _iota_id: i64, user_id: i64, state: UserStatus) {
-        let msg_type = match state {
-            UserStatus::iota_offline => CommunicationType::UserDisconnected,
-            UserStatus::user_offline => CommunicationType::UserDisconnected,
-            UserStatus::user_invisible => CommunicationType::UserDisconnected,
-            _ => CommunicationType::UserConnected,
-        };
-
-        let cv = CommunicationValue::new(msg_type)
+    pub async fn client_changed(
+        &self,
+        _iota_id: i64,
+        user_id: i64,
+        session_id: i64,
+        state: UserStatus,
+    ) {
+        let cv = CommunicationValue::new(CommunicationType::ClientChanged)
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
+            .add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id.into()),
+            )
             .add_typed_default(DataType::UserState, DataValue::Str(state.to_string()));
+        self.send_message(&cv).await;
+    }
+
+    pub async fn client_disconnected(&self, user_id: i64, session_id: i64) {
+        let cv = CommunicationValue::new(CommunicationType::UserDisconnected)
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
+            .add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id.into()),
+            );
         self.send_message(&cv).await;
     }
 

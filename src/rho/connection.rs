@@ -1,4 +1,5 @@
 use std::{sync::Arc, time::Duration};
+use strum_macros::Display;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -27,7 +28,7 @@ pub type MtpReceiver = WebMtpReceiver;
  * `Identification`/`Register` hello frames; it is kept only so
  * `app_connection.rs` still compiles.
  */
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
 #[allow(dead_code)]
 pub enum ConnectionKind {
     Client,
@@ -85,8 +86,20 @@ impl GeneralConnection {
 
     pub async fn handle(self: Arc<Self>) {
         log_in!(0, PrintType::General, "General connection handler started");
-        self.migrate().await;
-        log_out!(0, PrintType::General, "General connection handler stopped");
+        if self.migrate().await {
+            log_out!(
+                0,
+                PrintType::General,
+                "General connection handler stopped, upgraded to {}",
+                self.connection_kind
+            );
+        } else {
+            log_out!(
+                0,
+                PrintType::General,
+                "General connection handler stopped without upgrade"
+            );
+        }
     }
 
     async fn migrate(self: &Arc<Self>) -> bool {
@@ -102,19 +115,67 @@ impl GeneralConnection {
     async fn migrate_client(self: &Arc<Self>) {
         let id = self.id;
         let user_id = id as i64;
-        self.notify_user_connected(user_id).await;
+
+        let Ok(handshake) = self.receiver.receive().await else {
+            return;
+        };
+        if !handshake.is_type(CommunicationType::ClientConnected) {
+            let error = CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                .with_id(handshake.get_id());
+            let _ = self.sender.send(&error).await;
+            return;
+        }
+        let Some(session_id) = handshake.get_data(DataType::SessionId).as_signed_number() else {
+            let _ = self
+                .sender
+                .send(
+                    &CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                        .with_id(handshake.get_id()),
+                )
+                .await;
+            return;
+        };
+        if !(1..=i64::MAX as i128).contains(&session_id) {
+            let _ = self
+                .sender
+                .send(
+                    &CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                        .with_id(handshake.get_id()),
+                )
+                .await;
+            return;
+        }
+        let version = handshake
+            .get_data(DataType::VersionNumber)
+            .as_signed_number();
+        if !matches!(version, Some(version) if version >= 0) {
+            let _ = self
+                .sender
+                .send(
+                    &CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                        .with_id(handshake.get_id()),
+                )
+                .await;
+            return;
+        }
+        *self.session_id.write().await = session_id as u64;
 
         let client = ClientConnection::from_general(self.clone(), id).await;
         let rho = self.find_user_rho(user_id).await;
         *self.rho_connection.write().await = rho.clone();
 
         if let Some(rho_conn) = rho {
-            if let Some(response) = self.request_initial_client_state(&rho_conn, user_id).await {
+            rho_conn.bind_user_id(user_id).await;
+            rho_conn.add_client_connection(client.clone()).await;
+            self.notify_user_connected(user_id, rho_conn.get_iota_id().await as i64)
+                .await;
+            if let Some(response) = self
+                .request_initial_client_state(&rho_conn, user_id, handshake)
+                .await
+            {
                 let response = self.add_call_state(response, user_id).await;
                 log_cv_out!(response);
                 let _ = self.sender.send(&response).await;
-                rho_conn.bind_user_id(user_id).await;
-                rho_conn.add_client_connection(client.clone()).await;
             }
         } else {
             log_err!(
@@ -128,9 +189,28 @@ impl GeneralConnection {
         client.start();
     }
 
-    async fn notify_user_connected(&self, user_id: i64) {
+    async fn notify_user_connected(&self, user_id: i64, iota_id: i64) {
+        let session_id = *self.session_id.read().await as i64;
         let notify = CommunicationValue::new(CommunicationType::UserConnected)
-            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
+            .add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id.into()),
+            )
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()))
+            .add_typed_default(
+                DataType::UserState,
+                DataValue::Str("user_online".to_string()),
+            )
+            .add_typed_default(
+                DataType::UpdatedAt,
+                DataValue::SignedNumber(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i128,
+                ),
+            );
         self.state.omega.clone().send_message(&notify).await;
     }
 
@@ -167,6 +247,7 @@ impl GeneralConnection {
         &self,
         rho: &Arc<RhoConnection>,
         user_id: i64,
+        handshake: CommunicationValue,
     ) -> Option<CommunicationValue> {
         let session_id = *self.session_id.read().await as i64;
         let request = CommunicationValue::new(CommunicationType::ClientConnected)
@@ -174,6 +255,18 @@ impl GeneralConnection {
             .add_typed_default(
                 DataType::SessionId,
                 DataValue::SignedNumber(session_id.into()),
+            )
+            .add_typed_default(
+                DataType::VersionNumber,
+                handshake.get_data(DataType::VersionNumber).clone(),
+            )
+            .add_typed_default(
+                DataType::CacheValid,
+                handshake.get_data(DataType::CacheValid).clone(),
+            )
+            .add_typed_default(
+                DataType::CacheSchemaVersion,
+                handshake.get_data(DataType::CacheSchemaVersion).clone(),
             );
         rho.get_iota_connection()
             .clone()
@@ -187,7 +280,7 @@ impl GeneralConnection {
         response: CommunicationValue,
         user_id: i64,
     ) -> CommunicationValue {
-        let mut output = CommunicationValue::new(CommunicationType::IdentificationResponse);
+        let mut output = response.clone();
 
         for (key, value) in response.iter_typed_data() {
             if key == Some(DataType::Contacts) {

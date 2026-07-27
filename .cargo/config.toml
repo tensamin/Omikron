@@ -1,2 +1,2 @@
 [env]
-MTP_TYPE_MAPS = { value = "type-maps.yaml", relative = true }
+MTP_TYPE_MAPS = { value = "mtp-type-maps/type-maps.yaml", relative = true }

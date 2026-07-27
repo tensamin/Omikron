@@ -225,22 +225,124 @@ impl IotaConnection {
         }
 
         if cv.is_type(CommunicationType::CompleteRegisterUser) {
-            let response_cv = self
+            // Registration carries the authenticated Iota ID separately so
+            // Omega can bind the allocation lease to this connection rather
+            // than trusting a client-supplied value.
+            let request = cv.clone().add_typed_default(
+                DataType::IotaId,
+                DataValue::SignedNumber(self.iota_id.into()),
+            );
+            log_in!(
+                self.iota_id as i64,
+                PrintType::Omega,
+                "Forwarding CompleteRegisterUser to Omega (request_id={})",
+                request.get_id()
+            );
+            let mut response_cv = self
                 .state
                 .omega
                 .clone()
-                .await_response(
-                    &cv.clone().with_sender(self.iota_id),
-                    Some(Duration::from_secs(20)),
-                )
+                .await_response(&request, Some(Duration::from_secs(8)))
                 .await;
-            if let Ok(response_cv) = response_cv {
-                if response_cv.is_type(CommunicationType::Success) {
-                    if let Some(user_id) = cv.get_data(DataType::UserId).as_number() {
-                        self.add_user_id(user_id as u64).await;
+            if let Err(error) = &response_cv {
+                log_err!(
+                    self.iota_id as i64,
+                    PrintType::Omega,
+                    "CompleteRegisterUser request_id={} failed: {}; retrying once",
+                    request.get_id(),
+                    error
+                );
+                response_cv = self
+                    .state
+                    .omega
+                    .clone()
+                    .await_response(&request, Some(Duration::from_secs(8)))
+                    .await;
+            }
+            match response_cv {
+                Ok(response_cv) => {
+                    log_in!(
+                        self.iota_id as i64,
+                        PrintType::Omega,
+                        "Omega completed registration (request_id={}, response_id={}, type={})",
+                        request.get_id(),
+                        response_cv.get_id(),
+                        response_cv
+                            .get_comm_type_enum()
+                            .map(|kind| kind.to_string())
+                            .unwrap_or_else(|| response_cv.get_type().to_string())
+                    );
+                    if response_cv.is_type(CommunicationType::Success) {
+                        if let Some(user_id) = cv.get_data(DataType::UserId).as_number() {
+                            self.add_user_id(user_id as u64).await;
+                        }
                     }
+                    self.send_message(&response_cv).await;
                 }
-                self.send_message(&response_cv).await;
+                Err(error) => {
+                    // Omega may have committed the insert even when its
+                    // Success response was lost in transit. Verify the exact
+                    // generated user ID before reporting failure; GetUserData
+                    // uses the proven request/response path and keeps this
+                    // recovery idempotent.
+                    let user_id = cv.get_data(DataType::UserId).as_number();
+                    if let Some(user_id) = user_id {
+                        let verification = CommunicationValue::new(CommunicationType::GetUserData)
+                            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id));
+                        match self
+                            .state
+                            .omega
+                            .clone()
+                            .await_response(&verification, Some(Duration::from_secs(3)))
+                            .await
+                        {
+                            Ok(verified)
+                                if verified.get_data(DataType::UserId).as_number()
+                                    == Some(user_id) =>
+                            {
+                                log_in!(
+                                    self.iota_id as i64,
+                                    PrintType::Omega,
+                                    "Registration response was lost; verified user {} remotely",
+                                    user_id
+                                );
+                                self.add_user_id(user_id as u64).await;
+                                self.send_message(
+                                    &CommunicationValue::new(CommunicationType::Success)
+                                        .with_id(cv.get_id()),
+                                )
+                                .await;
+                                return;
+                            }
+                            Ok(verified) => log_err!(
+                                self.iota_id as i64,
+                                PrintType::Omega,
+                                "Registration verification returned an unexpected user (request_id={}, response_id={})",
+                                verification.get_id(),
+                                verified.get_id()
+                            ),
+                            Err(verify_error) => log_err!(
+                                self.iota_id as i64,
+                                PrintType::Omega,
+                                "Registration verification failed after request_id={}: {}",
+                                verification.get_id(),
+                                verify_error
+                            ),
+                        }
+                    }
+                    log_err!(
+                        self.iota_id as i64,
+                        PrintType::Omega,
+                        "CompleteRegisterUser forwarding failed: {}",
+                        error
+                    );
+                    self.send_error_response(
+                        cv.get_id(),
+                        CommunicationType::ErrorInternal,
+                        Some(&format!("Omega forwarding failed: {error}")),
+                    )
+                    .await;
+                }
             }
             return;
         }
@@ -249,7 +351,6 @@ impl IotaConnection {
             || cv.is_type(CommunicationType::PushNotification)
             || cv.is_type(CommunicationType::GetUserData)
             || cv.is_type(CommunicationType::GetIotaData)
-            || cv.is_type(CommunicationType::GetRegister)
             || cv.is_type(CommunicationType::DeleteIota)
         {
             let sender = self.get_iota_id().await;
@@ -258,12 +359,27 @@ impl IotaConnection {
                 .await;
             return;
         }
+
+        // Register allocation is scoped to this authenticated Iota.  Keep the
+        // source ID in typed data so Omega can create a durable lease.
+        if cv.is_type(CommunicationType::GetRegister) {
+            self.handle_omega_forward_without_sender(cv).await;
+            return;
+        }
         self.forward_to_client(cv).await;
     }
 
     #[allow(dead_code)]
-    async fn send_error_response(&self, message_id: u32, error_type: CommunicationType) {
-        let error = CommunicationValue::new(error_type).with_id(message_id);
+    async fn send_error_response(
+        &self,
+        message_id: u32,
+        error_type: CommunicationType,
+        detail: Option<&str>,
+    ) {
+        let mut error = CommunicationValue::new(error_type).with_id(message_id);
+        if let Some(detail) = detail {
+            error = error.add_typed_default(DataType::ErrorType, DataValue::Str(detail.into()));
+        }
         self.send_message(&error).await;
     }
 
@@ -282,6 +398,52 @@ impl IotaConnection {
             .await;
         if let Ok(response_cv) = response_cv {
             iota_for_closure.send_message(&response_cv).await;
+        }
+    }
+
+    async fn handle_omega_forward_without_sender(self: Arc<Self>, cv: CommunicationValue) {
+        let iota_for_closure = self.clone();
+        let request = cv.clone().add_typed_default(
+            DataType::IotaId,
+            DataValue::SignedNumber(self.iota_id.into()),
+        );
+        let mut response_cv = self
+            .state
+            .omega
+            .clone()
+            .await_response(&request, Some(Duration::from_secs(8)))
+            .await;
+        if let Err(error) = &response_cv {
+            log_err!(
+                self.iota_id as i64,
+                PrintType::Omega,
+                "GetRegister request_id={} failed: {}; retrying once",
+                request.get_id(),
+                error
+            );
+            response_cv = self
+                .state
+                .omega
+                .clone()
+                .await_response(&request, Some(Duration::from_secs(8)))
+                .await;
+        }
+        match response_cv {
+            Ok(response_cv) => iota_for_closure.send_message(&response_cv).await,
+            Err(error) => {
+                log_err!(
+                    self.iota_id as i64,
+                    PrintType::Omega,
+                    "GetRegister forwarding failed: {}",
+                    error
+                );
+                self.send_error_response(
+                    cv.get_id(),
+                    CommunicationType::ErrorInternal,
+                    Some(&format!("Omega forwarding failed: {error}")),
+                )
+                .await;
+            }
         }
     }
     /// Handle ping message
@@ -397,7 +559,30 @@ impl IotaConnection {
         }
 
         let mut interested_ids: Vec<i64> = Vec::new();
+        let session_id = cv.get_data(DataType::SessionId).as_signed_number();
         let tm = TypeMap::latest();
+
+        // Presence interest is the complete contact set, independent of
+        // whether this account currently participates in a call.
+        if let DataValue::Array(users) = cv.get_data(DataType::UserIds) {
+            for user in users {
+                match user {
+                    DataValue::SignedNumber(id) => interested_ids.push(*id as i64),
+                    DataValue::Container(entries) => {
+                        if let Some(DataValue::SignedNumber(id)) =
+                            entries.iter().find_map(|(key, value)| {
+                                (*key == data_type_id(DataType::UserId, &tm)).then_some(value)
+                            })
+                        {
+                            interested_ids.push(*id as i64);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            interested_ids.sort_unstable();
+            interested_ids.dedup();
+        }
 
         // ============================
         // Load Calls
@@ -494,8 +679,6 @@ impl IotaConnection {
                         if let Some(DataValue::SignedNumber(id)) =
                             user_map.get(&data_type_id(DataType::UserId, &tm))
                         {
-                            interested_ids.push(*id as i64);
-
                             if let Some(call_list) = invites.get(&(*id as i64))
                                 && !call_list.is_empty()
                             {
@@ -526,9 +709,11 @@ impl IotaConnection {
         // Notify Rho
         // ============================
         if let Some(rho_conn) = self.get_rho_connection().await {
-            rho_conn
-                .set_interested(user_id as i64, interested_ids)
-                .await;
+            if let Some(session_id) = session_id.and_then(|id| i64::try_from(id).ok()) {
+                rho_conn
+                    .set_interested(user_id as i64, session_id, interested_ids)
+                    .await;
+            }
         }
 
         // ============================
