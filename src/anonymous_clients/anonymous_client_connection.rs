@@ -20,7 +20,6 @@ pub struct AnonymousClientConnection {
 
     pub sender: Arc<MtpSender>,
     pub receiver: Arc<MtpReceiver>,
-    pub ping: Arc<RwLock<i64>>,
     pub interested_users: Arc<RwLock<Vec<i64>>>,
     is_open: Arc<RwLock<bool>>,
     pub user_name: Arc<RwLock<String>>,
@@ -36,7 +35,6 @@ impl AnonymousClientConnection {
             state: general.state.clone(),
             user_id: user_id,
 
-            ping: Arc::new(RwLock::new(0)),
             interested_users: Arc::new(RwLock::new(Vec::new())),
             is_open: Arc::new(RwLock::new(true)),
             sender: general.sender.clone(),
@@ -91,9 +89,7 @@ impl AnonymousClientConnection {
             );
             return;
         }
-        if !cv.is_type(CommunicationType::Pong) {
-            log_cv_out!(PrintType::Client, &cv);
-        }
+        log_cv_out!(PrintType::Client, &cv);
         if let Err(e) = self.sender.send(&cv).await {
             log_out!(
                 self.user_id as i64,
@@ -111,10 +107,6 @@ impl AnonymousClientConnection {
         };
         tokio::spawn(async move {
             let _permit = permit;
-            if cv.is_type(CommunicationType::Ping) {
-                self.handle_ping(cv).await;
-                return;
-            }
             log_cv_in!(PrintType::Client, &cv);
 
             if cv.is_type(CommunicationType::Identification) {
@@ -230,11 +222,6 @@ impl AnonymousClientConnection {
                     .await;
             }
 
-            // Handle ping
-            if cv.is_type(CommunicationType::Ping) {
-                self.handle_ping(cv).await;
-                return;
-            }
             // Handle client status changes
             if cv.is_type(CommunicationType::ClientChanged) {
                 self.handle_client_changed(cv).await;
@@ -332,22 +319,6 @@ impl AnonymousClientConnection {
                 client_for_closure.send_message(&response_cv).await;
             }
         });
-    }
-
-    /// Handle ping message
-    async fn handle_ping(self: Arc<Self>, cv: CommunicationValue) {
-        // Update our ping if provided
-        if let DataValue::SignedNumber(last_ping) = cv.get_data(DataType::LastPing) {
-            if let Ok(ping_val) = last_ping.to_string().parse::<i64>() {
-                let mut ping_guard = self.ping.write().await;
-                *ping_guard = ping_val;
-            }
-        }
-
-        // Send pong response
-        let response = CommunicationValue::new(CommunicationType::Pong).with_id(cv.get_id());
-
-        self.send_message(&response).await;
     }
 
     /// Handle client status change
@@ -648,7 +619,6 @@ impl Clone for AnonymousClientConnection {
             sender: Arc::clone(&self.sender),
             receiver: Arc::clone(&self.receiver),
             user_id: self.user_id,
-            ping: Arc::clone(&self.ping),
             interested_users: Arc::clone(&self.interested_users),
             is_open: Arc::clone(&self.is_open),
             user_name: Arc::clone(&self.user_name),

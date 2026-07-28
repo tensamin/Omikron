@@ -6,7 +6,7 @@ use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err, log_in, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -19,7 +19,6 @@ pub struct AppConnection {
 
     pub sender: Arc<MtpSender>,
     pub receiver: Arc<MtpReceiver>,
-    pub ping: Arc<RwLock<i64>>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     is_open: Arc<RwLock<bool>>,
@@ -29,7 +28,6 @@ impl AppConnection {
     pub async fn from_general(general: Arc<GeneralConnection>, user_id: u64) -> Arc<Self> {
         Arc::new(Self {
             state: general.state.clone(),
-            ping: Arc::new(RwLock::new(0)),
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: general.rho_connection.clone(),
             is_open: Arc::new(RwLock::new(true)),
@@ -66,12 +64,6 @@ impl AppConnection {
         self.user_id
     }
 
-    /// Get current ping
-    #[allow(unused)]
-    pub async fn get_ping(&self) -> i64 {
-        *self.ping.read().await
-    }
-
     /// Get RhoConnection if available
     pub async fn get_rho_connection(&self) -> Option<Arc<RhoConnection>> {
         self.rho_connection.read().await.clone()
@@ -87,19 +79,13 @@ impl AppConnection {
             );
             return;
         }
-        if !cv.is_type(CommunicationType::Pong) && !cv.is_type(CommunicationType::Ping) {
-            log_cv_out!(PrintType::App, &cv);
-        }
+        log_cv_out!(PrintType::App, &cv);
         let _ = self.sender.send(&cv).await;
     }
 
     /// Handle incoming message from app
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
         tokio::spawn(async move {
-            if cv.is_type(CommunicationType::Ping) {
-                self.handle_ping(cv).await;
-                return;
-            }
             log_cv_in!(PrintType::App, cv);
 
             if cv.is_type(CommunicationType::GetUserData) {
@@ -166,36 +152,6 @@ impl AppConnection {
                 app_for_closure.send_message(&response_cv).await;
             }
         });
-    }
-
-    /// Handle ping message
-    async fn handle_ping(self: Arc<Self>, cv: CommunicationValue) {
-        // Update our ping if provided
-        if let DataValue::SignedNumber(last_ping) = cv.get_data(DataType::LastPing) {
-            let current = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let mut ping_guard = self.ping.write().await;
-            *ping_guard = (current as i128 - *last_ping) as i64;
-        }
-
-        // Get Iota ping from RhoConnection
-        let iota_ping = if let Some(rho_conn) = self.get_rho_connection().await {
-            rho_conn.get_iota_connection().get_ping().await
-        } else {
-            -1
-        };
-
-        // Send pong response
-        let response = CommunicationValue::new(CommunicationType::Pong)
-            .with_id(cv.get_id())
-            .add_typed_default(
-                DataType::PingIota,
-                DataValue::SignedNumber(iota_ping.into()),
-            );
-
-        self.send_message(&response).await;
     }
 
     /// Forward message to Iota
@@ -353,7 +309,6 @@ impl Clone for AppConnection {
             app_identifier: self.app_identifier.clone(),
             app_session: self.app_session,
             client_version: self.client_version.clone(),
-            ping: Arc::clone(&self.ping),
             pub_key: Arc::clone(&self.pub_key),
             rho_connection: Arc::clone(&self.rho_connection),
             is_open: Arc::clone(&self.is_open),

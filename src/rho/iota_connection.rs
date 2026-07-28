@@ -31,7 +31,6 @@ pub struct IotaConnection {
     pub sender: Arc<MtpSender>,
     pub receiver: Arc<MtpReceiver>,
     pub user_ids: Arc<RwLock<Vec<u64>>>,
-    pub ping: Arc<RwLock<i64>>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub waiting_tasks:
         DashMap<u32, Box<dyn Fn(Arc<IotaConnection>, CommunicationValue) -> bool + Send + Sync>>,
@@ -44,7 +43,6 @@ impl IotaConnection {
     pub async fn from_general(general: Arc<GeneralConnection>, iota_id: u64) -> Arc<Self> {
         Arc::new(Self {
             state: general.state.clone(),
-            ping: Arc::new(RwLock::new(0)),
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: general.rho_connection.clone(),
             user_ids: Arc::new(RwLock::new(Vec::new())),
@@ -151,11 +149,6 @@ impl IotaConnection {
             .push(cv);
     }
 
-    /// Get current ping
-    pub async fn get_ping(&self) -> i64 {
-        *self.ping.read().await
-    }
-
     /// Set the RhoConnection reference
     pub async fn set_rho_connection(&self, rho_connection: Arc<RhoConnection>) {
         let mut rho_ref = self.rho_connection.write().await;
@@ -174,9 +167,7 @@ impl IotaConnection {
 
     /// Send a CommunicationValue to the Iota
     pub async fn send_message(&self, cv: &CommunicationValue) {
-        if !cv.is_type(CommunicationType::Pong) {
-            log_cv_out!(PrintType::Iota, cv);
-        }
+        log_cv_out!(PrintType::Iota, cv);
         if let Err(e) = self.sender.send(&cv).await {
             log_err!(
                 self.iota_id as i64,
@@ -198,12 +189,6 @@ impl IotaConnection {
             if (task)(self.clone(), cv.clone()) {
                 return;
             }
-        }
-
-        // Handle ping
-        if cv.is_type(CommunicationType::Ping) || cv.is_type(CommunicationType::Pong) {
-            self.handle_ping(cv).await;
-            return;
         }
 
         log_cv_in!(PrintType::Iota, cv);
@@ -452,46 +437,6 @@ impl IotaConnection {
             }
         }
     }
-    /// Handle ping message
-    async fn handle_ping(&self, cv: CommunicationValue) {
-        if let DataValue::SignedNumber(last_ping) = cv.get_data(DataType::LastPing) {
-            if let Ok(ping_val) = last_ping.to_string().parse::<i64>() {
-                let mut ping_guard = self.ping.write().await;
-                *ping_guard = ping_val;
-            }
-        }
-
-        let client_pings = if let Some(rho_conn) = self.get_rho_connection().await {
-            rho_conn.get_client_pings().await
-        } else {
-            HashMap::new()
-        };
-
-        let tm = TypeMap::latest();
-        let pings: Vec<DataValue> = client_pings
-            .into_iter()
-            .map(|(k, v)| {
-                let mut map = BTreeMap::new();
-                if let Ok(uid) = k.parse::<i128>() {
-                    map.insert(
-                        data_type_id(DataType::UserId, &tm),
-                        DataValue::SignedNumber(uid),
-                    );
-                }
-                map.insert(
-                    data_type_id(DataType::LastPing, &tm),
-                    DataValue::SignedNumber(v.into()),
-                );
-                DataValue::container_from_map(&map)
-            })
-            .collect();
-        let response = CommunicationValue::new(CommunicationType::Pong)
-            .with_id(cv.get_id())
-            .add_typed_default(DataType::PingClients, DataValue::Array(pings));
-
-        self.send_message(&response).await;
-    }
-
     /// Handle message forwarding to other Iotas
     async fn handle_forward_message(&self, cv: CommunicationValue) {
         let receiver_id = cv.get_receiver();

@@ -9,7 +9,7 @@ use crate::{log_cv_in, log_cv_out, log_err, log_in, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use trust_dns_resolver::TokioAsyncResolver;
 use uuid::Uuid;
@@ -22,7 +22,6 @@ pub struct ClientConnection {
 
     pub sender: Arc<MtpSender>,
     pub receiver: Arc<MtpReceiver>,
-    pub ping: Arc<RwLock<i64>>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     pub interested_users: Arc<RwLock<Vec<i64>>>,
@@ -34,7 +33,6 @@ impl ClientConnection {
     pub async fn from_general(general: Arc<GeneralConnection>, user_id: u64) -> Arc<Self> {
         Arc::new(Self {
             state: general.state.clone(),
-            ping: Arc::new(RwLock::new(0)),
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: general.rho_connection.clone(),
             interested_users: Arc::new(RwLock::new(Vec::new())),
@@ -72,11 +70,6 @@ impl ClientConnection {
         self.user_id
     }
 
-    /// Get current ping
-    pub async fn get_ping(&self) -> i64 {
-        *self.ping.read().await
-    }
-
     /// Get RhoConnection if available
     pub async fn get_rho_connection(&self) -> Option<Arc<RhoConnection>> {
         self.rho_connection.read().await.clone()
@@ -92,9 +85,7 @@ impl ClientConnection {
             );
             return;
         }
-        if !cv.is_type(CommunicationType::Pong) && !cv.is_type(CommunicationType::Ping) {
-            log_cv_out!(PrintType::Client, &cv);
-        }
+        log_cv_out!(PrintType::Client, &cv);
         let _ = self.sender.send(&cv).await;
     }
 
@@ -105,10 +96,6 @@ impl ClientConnection {
         };
         tokio::spawn(async move {
             let _permit = permit;
-            if cv.is_type(CommunicationType::ClientPing) {
-                self.handle_ping(cv).await;
-                return;
-            }
             log_cv_in!(PrintType::Client, cv);
 
             let mut cv = cv;
@@ -309,36 +296,6 @@ impl ClientConnection {
         if let Ok(response_cv) = response_cv {
             client_for_closure.send_message(&response_cv).await;
         }
-    }
-
-    /// Handle ping message
-    async fn handle_ping(self: Arc<Self>, cv: CommunicationValue) {
-        // Update our ping if provided
-        if let DataValue::SignedNumber(last_ping) = cv.get_data(DataType::LastPing) {
-            let current = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let mut ping_guard = self.ping.write().await;
-            *ping_guard = (current as i128 - *last_ping) as i64;
-        }
-
-        // Get Iota ping from RhoConnection
-        let iota_ping = if let Some(rho_conn) = self.get_rho_connection().await {
-            rho_conn.get_iota_connection().get_ping().await
-        } else {
-            -1
-        };
-
-        // Send pong response
-        let response = CommunicationValue::new(CommunicationType::ClientPing)
-            .with_id(cv.get_id())
-            .add_typed_default(
-                DataType::PingIota,
-                DataValue::SignedNumber(iota_ping.into()),
-            );
-
-        self.send_message(&response).await;
     }
 
     /// Handle client status change
@@ -917,7 +874,6 @@ impl Clone for ClientConnection {
             user_id: self.user_id,
             session_id: self.session_id,
             client_version: self.client_version.clone(),
-            ping: Arc::clone(&self.ping),
             pub_key: Arc::clone(&self.pub_key),
             rho_connection: Arc::clone(&self.rho_connection),
             interested_users: Arc::clone(&self.interested_users),

@@ -11,7 +11,7 @@ use mtp::{
     host::{Policy, SendMode},
 };
 use mtp_transport::ConnectionHandle;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, RwLock, mpsc, watch},
     task::JoinHandle,
@@ -23,8 +23,8 @@ use uuid::Uuid;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const MAX_HEARTBEAT_FAILURES: usize = 3;
+const PING_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_MISSED_PINGS: usize = 3;
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_REQUESTS: usize = 128;
@@ -118,9 +118,6 @@ pub struct OmegaConnection {
     host: String,
     port: u16,
     omikron_id: u64,
-    last_ping: Arc<Mutex<i64>>,
-    heartbeat_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
-    message_send_times: Arc<Mutex<HashMap<Uuid, Instant>>>,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     // Track if we should reconnect on close
@@ -147,9 +144,6 @@ impl OmegaConnection {
             host: config.omega_host.clone(),
             port: config.omega_port,
             omikron_id: config.omikron_id,
-            last_ping: Arc::new(Mutex::new(-1)),
-            heartbeat_handle: Arc::new(Mutex::new(None)),
-            message_send_times: Arc::new(Mutex::new(HashMap::new())),
             connection_id: Uuid::new_v4(),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             reconnect_on_close: Arc::new(RwLock::new(true)),
@@ -201,10 +195,6 @@ impl OmegaConnection {
         }
 
         if let Some(handle) = self.connection_loop_handle.lock().await.take() {
-            handle.abort();
-        }
-
-        if let Some(handle) = self.heartbeat_handle.lock().await.take() {
             handle.abort();
         }
 
@@ -292,7 +282,9 @@ impl OmegaConnection {
                     .with_receiver_queue_capacity(1000)
                     .with_max_concurrent_stream_tasks(64)
                     .with_persistent_stream_retries(5, Duration::from_secs(5)),
-            );
+            )
+            .with_ping_interval(PING_INTERVAL)
+            .with_max_missed_pings(MAX_MISSED_PINGS);
 
         let host_public_key = load_public_key_bundle("./omega.mpkb")
             .map_err(|e| format!("Failed to load omega.mpkb: {}", e))?;
@@ -323,13 +315,6 @@ impl OmegaConnection {
             read_self.read_loop(connection, sender_handle).await;
         });
 
-        // Start heartbeat
-        let heartbeat_self = self.clone();
-        let heartbeat_handle = tokio::spawn(async move {
-            heartbeat_self.heartbeat_loop().await;
-        });
-        *self.heartbeat_handle.lock().await = Some(heartbeat_handle);
-
         // Tell omega our current state now that we're actually connected -
         // doing this after teardown (as before) sent into a sender that had
         // already been cleared, silently dropping the sync every time.
@@ -356,10 +341,6 @@ impl OmegaConnection {
         }
         *self.sender.write().await = None;
         *self.state.write().await = ConnectionState::Disconnected;
-
-        if let Some(handle) = self.heartbeat_handle.lock().await.take() {
-            handle.abort();
-        }
 
         match result {
             Ok(()) => {
@@ -405,7 +386,7 @@ impl OmegaConnection {
     }
 
     // -------------------------------------------------------------------------
-    // Read Loop & Heartbeat
+    // Read Loop
     // -------------------------------------------------------------------------
 
     async fn read_loop(
@@ -421,14 +402,7 @@ impl OmegaConnection {
                 result = connection.receive() => {
                     match result {
                         Ok(cv) => {
-                            if !cv.is_type(CommunicationType::Pong) && !cv.is_type(CommunicationType::Ping) {
-                                log_cv_in!(PrintType::Omega, &cv);
-                            }
-
-                            if cv.is_type(CommunicationType::Pong) || cv.is_type(CommunicationType::Ping) {
-                                self.handle_pong(&cv).await;
-                                continue;
-                            }
+                            log_cv_in!(PrintType::Omega, &cv);
 
                             let msg_id = cv.get_id();
                             if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
@@ -477,89 +451,12 @@ impl OmegaConnection {
         }
     }
 
-    async fn heartbeat_loop(self: Arc<Self>) {
-        let mut consecutive_failures = 0;
-        loop {
-            sleep(HEARTBEAT_INTERVAL).await;
-
-            // Check if still connected
-            if !self.state.read().await.is_connected() {
-                break;
-            }
-
-            // Check if sender is closed
-            if let Some(sender) = self.sender.read().await.as_ref() {
-                if sender.is_closed() {
-                    log_err!(0, PrintType::Omega, "Sender closed, stopping heartbeat");
-                    break;
-                }
-            } else {
-                break;
-            }
-
-            match self.send_ping().await {
-                Ok(()) => consecutive_failures = 0,
-                Err(error) => {
-                    consecutive_failures += 1;
-                    log_err!(
-                        0,
-                        PrintType::Omega,
-                        "Heartbeat send failed ({}/{}): {}",
-                        consecutive_failures,
-                        MAX_HEARTBEAT_FAILURES,
-                        error
-                    );
-                    if consecutive_failures >= MAX_HEARTBEAT_FAILURES {
-                        log_err!(
-                            0,
-                            PrintType::Omega,
-                            "Closing unhealthy Omega connection after repeated heartbeat failures"
-                        );
-                        if let Some(sender) = self.sender.read().await.as_ref().cloned() {
-                            sender.close().await;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    async fn send_ping(&self) -> Result<(), String> {
-        let ping = CommunicationValue::new(CommunicationType::Ping).add_typed_default(
-            DataType::SendTime,
-            DataValue::SignedNumber(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i128,
-            ),
-        );
-        self.try_send_message(&ping).await
-    }
-
-    async fn handle_pong(&self, cv: &CommunicationValue) {
-        let timestamp = cv
-            .get_data(DataType::SendTime)
-            .as_number()
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i128
-            });
-
-        *self.last_ping.lock().await = timestamp.try_into().unwrap();
-    }
-
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
 
     async fn try_send_message(&self, cv: &CommunicationValue) -> Result<(), String> {
-        if !cv.is_type(CommunicationType::Pong) && !cv.is_type(CommunicationType::Ping) {
-            log_cv_out!(PrintType::Omega, &cv);
-        }
+        log_cv_out!(PrintType::Omega, &cv);
 
         let sender_guard = self.sender.read().await;
         if let Some(sender) = sender_guard.as_ref() {

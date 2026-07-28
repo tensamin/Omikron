@@ -3,7 +3,6 @@ use super::{client_connection::ClientConnection, iota_connection::IotaConnection
 use crate::{data::user::UserStatus, rho::app_connection::AppConnection};
 use dashmap::DashMap;
 use mtp::codec::{CommunicationValue, DataType};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -261,19 +260,6 @@ impl RhoConnection {
                 .are_you_interested(user_id, user_status)
                 .await;
         }
-    }
-
-    /// Get ping information for all clients
-    pub async fn get_client_pings(&self) -> HashMap<String, i64> {
-        let connections = self.get_client_connections().await;
-        let mut pings = HashMap::new();
-
-        for connection in connections.iter() {
-            let user_id = connection.get_user_id().await;
-            pings.insert(user_id.to_string(), connection.get_ping().await);
-        }
-
-        pings
     }
 
     /// Check if this RhoConnection contains a specific user ID
