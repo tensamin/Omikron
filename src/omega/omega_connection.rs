@@ -24,7 +24,6 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(5);
-const MAX_MISSED_PINGS: usize = 3;
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_REQUESTS: usize = 128;
@@ -284,7 +283,7 @@ impl OmegaConnection {
                     .with_persistent_stream_retries(5, Duration::from_secs(5)),
             )
             .with_ping_interval(PING_INTERVAL)
-            .with_max_missed_pings(MAX_MISSED_PINGS);
+            .with_max_missed_pings(0);
 
         let host_public_key = load_public_key_bundle("./omega.mpkb")
             .map_err(|e| format!("Failed to load omega.mpkb: {}", e))?;

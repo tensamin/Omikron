@@ -66,7 +66,14 @@ impl IotaConnection {
                             iota_for_closure.handle_message(cv).await;
                         });
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        log_err!(
+                            self_clone.iota_id as i64,
+                            PrintType::Iota,
+                            "Iota receive loop ended: {}; transport close reason: {:?}",
+                            error,
+                            self_clone.receiver.close_reason()
+                        );
                         break;
                     }
                 }

@@ -124,7 +124,7 @@ pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
                 Duration::from_millis(30_000),
             )
             .with_keep_alive(Some(Duration::from_secs(6)))
-            .with_max_idle_timeout(Some(Duration::from_secs(30)))
+            .with_max_idle_timeout(None)
             .with_receiver_queue_capacity(1000)
             .with_max_concurrent_stream_tasks(10)
             .with_persistent_stream_retries(5, Duration::from_secs(5)),

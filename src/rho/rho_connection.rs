@@ -63,6 +63,17 @@ impl RhoConnection {
             .collect()
     }
 
+    pub fn drain_client_connections(&self) -> Vec<Arc<ClientConnection>> {
+        let keys: Vec<_> = self
+            .client_connections
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.client_connections.remove(&key).map(|(_, value)| value))
+            .collect()
+    }
+
     /// Get client connections for a specific user
     pub async fn get_client_connections_for_user(
         &self,
@@ -198,25 +209,26 @@ impl RhoConnection {
 
     /// Close the Iota connection and all associated client connections
     pub async fn close_iota_connection(&self) {
+        let iota_id = self.get_iota_id().await as i64;
+        if self
+            .iota_connection
+            .state
+            .rho
+            .remove_if_current(iota_id, self)
+            .await
+            .is_none()
+        {
+            return;
+        }
+
         // Close all client connections
         let connections = self.get_client_connections().await;
         for connection in connections {
             connection.close().await;
         }
 
-        // Remove from manager
-        self.iota_connection
-            .state
-            .rho
-            .remove(self.get_iota_id().await as i64)
-            .await;
-
         // Notify OmegaConnection
-        self.iota_connection
-            .state
-            .omega
-            .close_iota(self.get_iota_id().await as i64)
-            .await;
+        self.iota_connection.state.omega.close_iota(iota_id).await;
     }
 
     /// Send message from Iota to specific client

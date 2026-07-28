@@ -75,6 +75,10 @@ impl ClientConnection {
         self.rho_connection.read().await.clone()
     }
 
+    pub async fn set_rho_connection(&self, rho_connection: Arc<RhoConnection>) {
+        *self.rho_connection.write().await = Some(rho_connection);
+    }
+
     /// Send a CommunicationValue to the client
     pub async fn send_message(self: Arc<Self>, cv: &CommunicationValue) {
         if !*self.is_open.read().await {

@@ -89,8 +89,17 @@ impl RhoManager {
         }
     }
 
-    pub async fn remove(&self, iota_id: i64) -> Option<Arc<RhoConnection>> {
-        let rho = self.connections.remove(&iota_id).map(|(_, rho)| rho);
+    pub async fn remove_if_current(
+        &self,
+        iota_id: i64,
+        expected: &RhoConnection,
+    ) -> Option<Arc<RhoConnection>> {
+        let rho = self
+            .connections
+            .remove_if(&iota_id, |_, current| {
+                std::ptr::eq(current.as_ref(), expected)
+            })
+            .map(|(_, rho)| rho);
         if let Some(rho) = rho.as_ref() {
             self.users.retain(|_, mapped| !Arc::ptr_eq(mapped, rho));
         }

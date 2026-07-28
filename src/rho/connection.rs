@@ -234,6 +234,12 @@ impl GeneralConnection {
         let iota = IotaConnection::from_general(self.clone(), id).await;
         let rho = Arc::new(RhoConnection::new(iota.clone(), Vec::new()).await);
         iota.set_rho_connection(rho.clone()).await;
+        if let Some(previous) = self.state.rho.get_by_iota(id as i64).await {
+            for client in previous.drain_client_connections() {
+                client.set_rho_connection(rho.clone()).await;
+                rho.add_client_connection(client).await;
+            }
+        }
         self.state.rho.add(rho).await;
         self.load_iota_users(&iota, id).await;
         iota.start();
