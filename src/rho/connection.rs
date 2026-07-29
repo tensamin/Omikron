@@ -232,20 +232,25 @@ impl GeneralConnection {
         self.state.omega.clone().send_message(&notify).await;
 
         let iota = IotaConnection::from_general(self.clone(), id).await;
-        let rho = Arc::new(RhoConnection::new(iota.clone(), Vec::new()).await);
+        let previous = self.state.rho.get_by_iota(id as i64).await;
+        let user_ids = match previous.as_ref() {
+            Some(previous) => previous.get_user_ids().await,
+            None => Vec::new(),
+        };
+        let rho = Arc::new(RhoConnection::new(iota.clone(), user_ids).await);
         iota.set_rho_connection(rho.clone()).await;
-        if let Some(previous) = self.state.rho.get_by_iota(id as i64).await {
+        if let Some(previous) = previous {
             for client in previous.drain_client_connections() {
                 client.set_rho_connection(rho.clone()).await;
                 rho.add_client_connection(client).await;
             }
         }
         self.state.rho.add(rho).await;
-        self.load_iota_users(&iota, id).await;
+        self.load_iota_users(id).await;
         iota.start();
     }
 
-    async fn load_iota_users(&self, iota: &Arc<IotaConnection>, iota_id: u64) {
+    async fn load_iota_users(&self, iota_id: u64) {
         let request = CommunicationValue::new(CommunicationType::GetIotaData)
             .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()));
         let Ok(response) = self
@@ -263,11 +268,14 @@ impl GeneralConnection {
         let user_ids = users
             .iter()
             .filter_map(|value| match value {
-                DataValue::SignedNumber(id) => Some(*id as u64),
+                DataValue::SignedNumber(id) => Some(*id as i64),
                 _ => None,
             })
             .collect();
-        iota.set_user_ids(user_ids).await;
+        self.state
+            .rho
+            .replace_users_for_iota(iota_id as i64, user_ids)
+            .await;
     }
 
     async fn migrate_anonymous_client(self: &Arc<Self>) {
