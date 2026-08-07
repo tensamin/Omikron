@@ -1,6 +1,6 @@
 use super::{client_connection::ClientConnection, iota_connection::IotaConnection};
 
-use crate::{data::user::UserStatus, rho::app_connection::AppConnection};
+use crate::{log_err, rho::app_connection::AppConnection};
 use dashmap::DashMap;
 use mtp::codec::{CommunicationValue, DataType};
 use std::sync::Arc;
@@ -178,11 +178,21 @@ impl RhoConnection {
             return;
         }
         self.client_connections.remove(&key);
-        self.iota_connection
+        if let Err(error) = self
+            .iota_connection
             .state
             .omega
             .client_disconnected(target_user_id, target_session_id)
-            .await;
+            .await
+        {
+            log_err!(
+                target_user_id,
+                crate::util::logger::PrintType::Client,
+                "UserDisconnected acknowledgement failed for session {}: {}",
+                target_session_id,
+                error
+            );
+        }
         let remaining_for_user = self
             .client_connections
             .iter()
@@ -193,16 +203,6 @@ impl RhoConnection {
                 .state
                 .rho
                 .remove_user_binding(target_user_id, self.get_iota_id().await as i64)
-                .await;
-            self.iota_connection
-                .state
-                .omega
-                .client_changed(
-                    self.get_iota_id().await as i64,
-                    target_user_id,
-                    target_session_id,
-                    UserStatus::user_offline,
-                )
                 .await;
         }
     }
@@ -228,7 +228,14 @@ impl RhoConnection {
         }
 
         // Notify OmegaConnection
-        self.iota_connection.state.omega.close_iota(iota_id).await;
+        if let Err(error) = self.iota_connection.state.omega.close_iota(iota_id).await {
+            log_err!(
+                iota_id,
+                crate::util::logger::PrintType::Iota,
+                "IotaDisconnected acknowledgement failed: {}",
+                error
+            );
+        }
     }
 
     /// Send message from Iota to specific client
@@ -253,25 +260,6 @@ impl RhoConnection {
     /// Send message to Iota
     pub async fn message_to_iota(&self, cv: CommunicationValue) {
         self.iota_connection.send_message(&cv).await;
-    }
-
-    /// Set interested users for a specific client
-    pub async fn set_interested(&self, user_id: i64, session_id: i64, interested_ids: Vec<i64>) {
-        if let Some(connection) = self.get_client_connection(user_id, session_id).await {
-            connection.set_interested_users(interested_ids).await;
-        }
-    }
-
-    /// Check if clients are interested in a user
-    #[allow(dead_code)]
-    pub async fn are_they_interested(&self, user_id: i64, user_status: &str) {
-        let connections = self.get_client_connections().await;
-        for connection in connections.iter() {
-            connection
-                .clone()
-                .are_you_interested(user_id, user_status)
-                .await;
-        }
     }
 
     /// Check if this RhoConnection contains a specific user ID

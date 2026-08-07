@@ -23,6 +23,47 @@ use tokio::sync::mpsc;
 
 use super::rho_connection::RhoConnection;
 
+fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, Vec<i64>)> {
+    if !value.is_type(CommunicationType::ClientStateSync)
+        && !value.is_type(CommunicationType::AddConversation)
+    {
+        return None;
+    }
+
+    let user_id = i64::try_from(value.get_receiver())
+        .ok()
+        .filter(|id| *id > 0)?;
+    let session_id = value
+        .get_data(DataType::SessionId)
+        .as_signed_number()
+        .and_then(|id| i64::try_from(id).ok())
+        .filter(|id| *id > 0)?;
+    let DataValue::Array(values) = value.get_data(DataType::UserIds) else {
+        return None;
+    };
+
+    let user_id_type = data_type_id(DataType::UserId, &TypeMap::latest());
+    let mut contact_ids = Vec::with_capacity(values.len());
+    for value in values {
+        let contact_id = match value {
+            DataValue::SignedNumber(id) => i64::try_from(*id).ok(),
+            DataValue::Container(entries) => entries.iter().find_map(|(key, value)| {
+                (*key == user_id_type)
+                    .then(|| value.as_signed_number())
+                    .flatten()
+                    .and_then(|id| i64::try_from(id).ok())
+            }),
+            _ => None,
+        }
+        .filter(|id| *id > 0)?;
+        contact_ids.push(contact_id);
+    }
+    contact_ids.sort_unstable();
+    contact_ids.dedup();
+
+    Some((user_id, session_id, contact_ids))
+}
+
 #[allow(dead_code)]
 pub struct IotaConnection {
     pub state: Arc<AppState>,
@@ -172,6 +213,29 @@ impl IotaConnection {
         }
     }
 
+    async fn replace_state_subscription(
+        &self,
+        user_id: i64,
+        session_id: i64,
+        contact_ids: Vec<i64>,
+    ) -> Result<(), String> {
+        let Some(rho_connection) = self.get_rho_connection().await else {
+            return Err("Rho connection is unavailable".to_string());
+        };
+        if rho_connection
+            .get_client_connection(user_id, session_id)
+            .await
+            .is_none()
+        {
+            return Err("target client session is no longer connected".to_string());
+        }
+
+        self.state
+            .omega
+            .replace_state_subscription(user_id, session_id, contact_ids)
+            .await
+    }
+
     /// Send a CommunicationValue to the Iota
     pub async fn send_message(&self, cv: &CommunicationValue) {
         log_cv_out!(PrintType::Iota, cv);
@@ -205,6 +269,34 @@ impl IotaConnection {
         } else {
             cv
         };
+
+        // Iota's UserIds field is an authoritative replacement snapshot for
+        // the requesting client session, including contact mutations.
+        if let Some((user_id, session_id, contact_ids)) = contact_snapshot(&cv) {
+            if let Err(error) = self
+                .replace_state_subscription(user_id, session_id, contact_ids)
+                .await
+            {
+                log_err!(
+                    self.iota_id as i64,
+                    PrintType::Omega,
+                    "Failed to replace presence subscription for user {} session {}: {}",
+                    user_id,
+                    session_id,
+                    error
+                );
+            }
+        }
+
+        if cv.is_type(CommunicationType::StateSubscribe) {
+            self.send_error_response(
+                cv.get_id(),
+                CommunicationType::ErrorInvalidData,
+                Some("StateSubscribe must come from an authoritative contact snapshot"),
+            )
+            .await;
+            return;
+        }
 
         // Handle GET_CHATS
         if cv.is_type(CommunicationType::GetChats) {
@@ -517,7 +609,20 @@ impl IotaConnection {
         }
 
         let mut interested_ids: Vec<i64> = Vec::new();
-        let session_id = cv.get_data(DataType::SessionId).as_signed_number();
+        let Some(session_id) = cv
+            .get_data(DataType::SessionId)
+            .as_signed_number()
+            .and_then(|id| i64::try_from(id).ok())
+            .filter(|id| *id > 0)
+        else {
+            self.forward_to_client(
+                CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                    .with_id(cv.get_id())
+                    .with_receiver(user_id),
+            )
+            .await;
+            return;
+        };
         let tm = TypeMap::latest();
 
         // Presence interest is the complete contact set, independent of
@@ -658,20 +763,18 @@ impl IotaConnection {
         // ============================
         // Notify Omega
         // ============================
-        self.state
-            .omega
-            .user_states(user_id as i64, interested_ids.clone())
-            .await;
-
-        // ============================
-        // Notify Rho
-        // ============================
-        if let Some(rho_conn) = self.get_rho_connection().await {
-            if let Some(session_id) = session_id.and_then(|id| i64::try_from(id).ok()) {
-                rho_conn
-                    .set_interested(user_id as i64, session_id, interested_ids)
-                    .await;
-            }
+        if let Err(error) = self
+            .replace_state_subscription(user_id as i64, session_id, interested_ids.clone())
+            .await
+        {
+            log_err!(
+                self.iota_id as i64,
+                PrintType::Omega,
+                "Failed to replace presence subscription for user {} session {}: {}",
+                user_id,
+                session_id,
+                error
+            );
         }
 
         // ============================
@@ -777,5 +880,50 @@ impl std::fmt::Debug for IotaConnection {
             .field("identified", &"[async]")
             .field("ping", &"[async]")
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contact_snapshot;
+    use crate::util::data_type_id;
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
+
+    fn snapshot(user_ids: DataValue) -> CommunicationValue {
+        CommunicationValue::new(CommunicationType::ClientStateSync)
+            .with_receiver(7)
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(11))
+            .add_typed_default(DataType::UserIds, user_ids)
+    }
+
+    #[test]
+    fn contact_snapshot_deduplicates_flat_and_typed_ids() {
+        let user_id_type = data_type_id(DataType::UserId, &TypeMap::latest());
+        let parsed = contact_snapshot(&snapshot(DataValue::Array(vec![
+            DataValue::SignedNumber(20),
+            DataValue::Container(vec![(user_id_type, DataValue::SignedNumber(21))]),
+            DataValue::SignedNumber(20),
+        ])))
+        .unwrap();
+
+        assert_eq!(parsed, (7, 11, vec![20, 21]));
+    }
+
+    #[test]
+    fn contact_snapshot_accepts_empty_contact_sets() {
+        assert_eq!(
+            contact_snapshot(&snapshot(DataValue::Array(Vec::new()))),
+            Some((7, 11, Vec::new()))
+        );
+    }
+
+    #[test]
+    fn contact_snapshot_rejects_malformed_contact_sets() {
+        assert_eq!(
+            contact_snapshot(&snapshot(DataValue::Array(vec![DataValue::Str(
+                "bad".into(),
+            )]))),
+            None
+        );
     }
 }

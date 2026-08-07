@@ -136,10 +136,23 @@ impl GeneralConnection {
         if let Some(rho_conn) = rho {
             rho_conn.bind_user_id(user_id).await;
             rho_conn.add_client_connection(client.clone()).await;
-            self.notify_user_connected(user_id, rho_conn.get_iota_id().await as i64)
-                .await;
-            self.send_initial_client_state_request(&rho_conn, user_id)
-                .await;
+            match self
+                .notify_user_connected(user_id, rho_conn.get_iota_id().await as i64)
+                .await
+            {
+                Ok(()) => {
+                    self.send_initial_client_state_request(&rho_conn, user_id)
+                        .await;
+                }
+                Err(error) => {
+                    log_err!(
+                        user_id,
+                        PrintType::Client,
+                        "UserConnected acknowledgement failed: {}",
+                        error
+                    );
+                }
+            }
         } else {
             log_err!(
                 user_id,
@@ -155,29 +168,13 @@ impl GeneralConnection {
         true
     }
 
-    async fn notify_user_connected(&self, user_id: i64, iota_id: i64) {
+    async fn notify_user_connected(&self, user_id: i64, iota_id: i64) -> Result<(), String> {
         let session_id = *self.session_id.read().await as i64;
-        let notify = CommunicationValue::new(CommunicationType::UserConnected)
-            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id.into()),
-            )
-            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()))
-            .add_typed_default(
-                DataType::UserState,
-                DataValue::Str("user_online".to_string()),
-            )
-            .add_typed_default(
-                DataType::UpdatedAt,
-                DataValue::SignedNumber(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as i128,
-                ),
-            );
-        self.state.omega.clone().send_message(&notify).await;
+        self.state
+            .omega
+            .clone()
+            .user_connected(user_id, session_id, iota_id)
+            .await
     }
 
     async fn find_user_rho(&self, user_id: i64) -> Option<Arc<RhoConnection>> {
@@ -227,9 +224,6 @@ impl GeneralConnection {
     async fn migrate_iota(self: &Arc<Self>) {
         let id = self.id;
         log_in!(id as i64, PrintType::Iota, "Iota {} connected", id);
-        let notify = CommunicationValue::new(CommunicationType::IotaConnected)
-            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(id.into()));
-        self.state.omega.clone().send_message(&notify).await;
 
         let iota = IotaConnection::from_general(self.clone(), id).await;
         let previous = self.state.rho.get_by_iota(id as i64).await;
@@ -246,6 +240,14 @@ impl GeneralConnection {
             }
         }
         self.state.rho.add(rho).await;
+        if let Err(error) = self.state.omega.clone().iota_connected(id as i64).await {
+            log_err!(
+                id as i64,
+                PrintType::Iota,
+                "IotaConnected acknowledgement failed: {}",
+                error
+            );
+        }
         self.load_iota_users(id).await;
         iota.start();
     }

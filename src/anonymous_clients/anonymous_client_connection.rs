@@ -8,7 +8,6 @@ use uuid::Uuid;
 use crate::anonymous_clients::anonymous_manager::{self, generate_username};
 use crate::app_state::AppState;
 use crate::calls::call_group::call_invite_secret_from_cv;
-use crate::data::user::UserStatus;
 use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
 use crate::util::data_type_id;
 use crate::util::logger::PrintType;
@@ -222,9 +221,13 @@ impl AnonymousClientConnection {
                     .await;
             }
 
-            // Handle client status changes
-            if cv.is_type(CommunicationType::ClientChanged) {
-                self.handle_client_changed(cv).await;
+            // Presence is account-scoped and anonymous sessions have no
+            // persisted account preference to change.
+            if cv.is_type(CommunicationType::SetUserState)
+                || cv.is_type(CommunicationType::ClientChanged)
+            {
+                self.send_error_response(&cv.get_id(), CommunicationType::ErrorNoUserId)
+                    .await;
                 return;
             }
 
@@ -319,22 +322,6 @@ impl AnonymousClientConnection {
                 client_for_closure.send_message(&response_cv).await;
             }
         });
-    }
-
-    /// Handle client status change
-    async fn handle_client_changed(self: Arc<Self>, cv: CommunicationValue) {
-        if let DataValue::Str(status_str) = cv.get_data(DataType::UserState) {
-            let user_status = UserStatus::from_str(&status_str).unwrap_or(UserStatus::user_online);
-            self.state
-                .omega
-                .client_changed(
-                    self.user_id as i64,
-                    self.user_id as i64,
-                    self.user_id as i64,
-                    user_status,
-                )
-                .await;
-        }
     }
 
     /// Handle call invite

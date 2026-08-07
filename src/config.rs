@@ -1,10 +1,12 @@
-use std::env;
+use std::{env, time::Duration};
 
 use thiserror::Error;
 
 const DEFAULT_RHO_PORT: u16 = 443;
 const DEFAULT_OMEGA_HOST: &str = "tensamin.net";
 const DEFAULT_OMEGA_PORT: u16 = 9187;
+const DEFAULT_OMEGA_SYNC_TIMEOUT_SECONDS: u64 = 20;
+const DEFAULT_OMEGA_SYNC_RETRIES: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveKitConfig {
@@ -19,6 +21,11 @@ pub struct Config {
     pub omega_host: String,
     pub omega_port: u16,
     pub omikron_id: u64,
+    /// Maximum duration of one route or subscription synchronization request.
+    pub omega_sync_timeout: Duration,
+    /// Number of synchronization requests before the transport is closed and
+    /// the normal reconnect loop starts.
+    pub omega_sync_retries: u32,
     pub livekit: Option<LiveKitConfig>,
 }
 
@@ -38,6 +45,15 @@ impl Config {
         let rho_port = parse_or_default("RHO_PORT", DEFAULT_RHO_PORT)?;
         let omega_port = parse_or_default("OMEGA_PORT", DEFAULT_OMEGA_PORT)?;
         let omikron_id = parse_or_default("ID", 0_u64)?;
+        // Each synchronization request is bounded by this timeout. After
+        // omega_sync_retries attempts, Omikron closes the authenticated
+        // transport so the normal reconnect loop can establish a clean state.
+        let omega_sync_timeout = Duration::from_secs(parse_or_default(
+            "OMEGA_SYNC_TIMEOUT_SECONDS",
+            DEFAULT_OMEGA_SYNC_TIMEOUT_SECONDS,
+        )?);
+        let omega_sync_retries =
+            parse_or_default("OMEGA_SYNC_RETRIES", DEFAULT_OMEGA_SYNC_RETRIES)?.max(1);
         let omega_host = env::var("OMEGA_HOST")
             .unwrap_or_else(|_| DEFAULT_OMEGA_HOST.to_string())
             .trim()
@@ -55,6 +71,8 @@ impl Config {
             omega_host,
             omega_port,
             omikron_id,
+            omega_sync_timeout,
+            omega_sync_retries,
             livekit: livekit_from_environment()?,
         })
     }

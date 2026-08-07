@@ -135,4 +135,17 @@ impl RhoManager {
             .map(|entry| entry.value().clone())
             .collect()
     }
+
+    pub async fn get_client_connection(
+        &self,
+        user_id: i64,
+        session_id: i64,
+    ) -> Option<Arc<super::client_connection::ClientConnection>> {
+        for rho in self.connections().await {
+            if let Some(client) = rho.get_client_connection(user_id, session_id).await {
+                return Some(client);
+            }
+        }
+        None
+    }
 }

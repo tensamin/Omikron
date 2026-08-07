@@ -1,6 +1,9 @@
+use super::capabilities::PeerCapabilities;
 use crate::{
-    config::Config, data::user::UserStatus, log_cv_in, log_cv_out, log_err, log_in, log_out,
-    rho::rho_manager::RhoManager, util::logger::PrintType,
+    config::Config,
+    log_cv_in, log_cv_out, log_err, log_in, log_out,
+    rho::rho_manager::RhoManager,
+    util::{data_type_id, logger::PrintType},
 };
 use dashmap::DashMap;
 use mtp::client::{Client, MTPConnection, Sender};
@@ -13,7 +16,7 @@ use mtp::{
 use mtp_transport::ConnectionHandle;
 use std::{sync::Arc, time::Duration};
 use tokio::{
-    sync::{Mutex, RwLock, mpsc, watch},
+    sync::{Mutex, RwLock, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{Instant, sleep},
 };
@@ -23,12 +26,44 @@ use uuid::Uuid;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const CAPABILITY_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_REQUESTS: usize = 128;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+
+fn client_changed_target(value: &CommunicationValue) -> Option<(i64, i64)> {
+    if !value.is_type(CommunicationType::ClientChanged) {
+        return None;
+    }
+    let receiver = i64::try_from(value.get_receiver())
+        .ok()
+        .filter(|id| *id > 0)?;
+    let session_id = value
+        .get_data(DataType::SessionId)
+        .as_signed_number()
+        .and_then(|id| i64::try_from(id).ok())
+        .filter(|id| *id > 0)?;
+    value
+        .get_data(DataType::UserId)
+        .as_signed_number()
+        .and_then(|id| i64::try_from(id).ok())
+        .filter(|id| *id > 0)?;
+    value.get_data(DataType::UserState).as_str()?;
+    Some((receiver, session_id))
+}
+
+fn parse_omega_capability_response(value: &CommunicationValue) -> Result<PeerCapabilities, String> {
+    if !value.is_type(CommunicationType::IdentificationResponse) {
+        return Err("not an identification response".to_string());
+    }
+    PeerCapabilities::from_omega_identification_description(
+        value.get_data(DataType::Description).as_str(),
+    )
+    .map_err(|_| "Omega advertised an invalid capability set".to_string())
+}
 
 // ============================================================================
 // Waiting Task System
@@ -85,24 +120,33 @@ pub fn start_task_cleanup_loop(omega: Arc<OmegaConnection>) {
 pub enum ConnectionState {
     Disconnected,
     Connecting,
-    Connected { identified: bool },
+    Identifying,
+    SynchronizingRoutes,
+    SynchronizingSubscriptions,
+    Ready,
 }
 
 #[allow(unused_variables)]
 impl ConnectionState {
     pub fn is_connected(&self) -> bool {
-        match self {
-            ConnectionState::Connected { identified } => true,
-            _ => false,
-        }
+        !matches!(
+            self,
+            ConnectionState::Disconnected | ConnectionState::Connecting
+        )
     }
 
     #[allow(dead_code)]
     pub fn is_identified(&self) -> bool {
-        match self {
-            ConnectionState::Connected { identified: true } => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            ConnectionState::SynchronizingRoutes
+                | ConnectionState::SynchronizingSubscriptions
+                | ConnectionState::Ready
+        )
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self, ConnectionState::Ready)
     }
 }
 
@@ -117,6 +161,8 @@ pub struct OmegaConnection {
     host: String,
     port: u16,
     omikron_id: u64,
+    sync_timeout: Duration,
+    sync_retries: u32,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     // Track if we should reconnect on close
@@ -126,6 +172,14 @@ pub struct OmegaConnection {
     keyring: mtp::crypto::Keyring,
     rho: Arc<RhoManager>,
     waiting_tasks: DashMap<u32, WaitingTask>,
+    session_presence: DashMap<(i64, i64), SessionPresenceState>,
+    peer_capabilities: Arc<RwLock<PeerCapabilities>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionPresenceState {
+    pub subscribed_user_ids: Vec<i64>,
+    pub pending: bool,
 }
 
 impl OmegaConnection {
@@ -143,6 +197,8 @@ impl OmegaConnection {
             host: config.omega_host.clone(),
             port: config.omega_port,
             omikron_id: config.omikron_id,
+            sync_timeout: config.omega_sync_timeout,
+            sync_retries: config.omega_sync_retries,
             connection_id: Uuid::new_v4(),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             reconnect_on_close: Arc::new(RwLock::new(true)),
@@ -154,6 +210,8 @@ impl OmegaConnection {
             keyring,
             rho,
             waiting_tasks: DashMap::new(),
+            session_presence: DashMap::new(),
+            peer_capabilities: Arc::new(RwLock::new(PeerCapabilities::default())),
         }
     }
 
@@ -267,6 +325,7 @@ impl OmegaConnection {
 
         let client_config = ClientConfig::new(format!("https://{}:{}", self.host, self.port))
             .with_client_id(self.omikron_id)
+            .with_description(PeerCapabilities::current().identification_description())
             .with_policy(
                 Policy::default()
                     .with_send_mode(SendMode::SingleStreamPerMessage)
@@ -302,17 +361,42 @@ impl OmegaConnection {
         // Store sender
         let sender_arc = Arc::new(connection.sender.clone());
         *self.sender.write().await = Some(sender_arc.clone());
-        *self.state.write().await = ConnectionState::Connected { identified: false };
+        // A new authenticated transport gets a fresh request circuit. A
+        // previous transport can have failed while synchronizing and must not
+        // prevent this connection from making its initial requests.
+        self.circuit_breaker.lock().await.record_success();
+        *self.state.write().await = ConnectionState::Identifying;
 
         // Get handle for close monitoring
         let sender_handle = sender_arc.handle().clone();
         let connection = Arc::new(connection);
+        let (capability_tx, capability_rx) = oneshot::channel();
 
         // Start read loop
         let read_self = self.clone();
         let read_handle = tokio::spawn(async move {
-            read_self.read_loop(connection, sender_handle).await;
+            read_self
+                .read_loop(connection, sender_handle, Some(capability_tx))
+                .await;
         });
+
+        let negotiated_capabilities =
+            match tokio::time::timeout(CAPABILITY_NEGOTIATION_TIMEOUT, capability_rx).await {
+                Ok(Ok(Ok(capabilities))) => capabilities,
+                Ok(Ok(Err(error))) => {
+                    self.fail_synchronization("capability negotiation", error)
+                        .await;
+                    let _ = read_handle.await;
+                    return Err("Omega capability negotiation failed".to_string());
+                }
+                Ok(Err(_)) | Err(_) => {
+                    // An Omega from before capability negotiation sends no second
+                    // identification response. Fall back to its documented
+                    // legacy contracts rather than guessing modern support.
+                    PeerCapabilities::default()
+                }
+            };
+        *self.peer_capabilities.write().await = negotiated_capabilities;
 
         // Tell omega our current state now that we're actually connected -
         // doing this after teardown (as before) sent into a sender that had
@@ -354,8 +438,10 @@ impl OmegaConnection {
         }
     }
 
-    async fn sync_client_iota_status(self: Arc<Self>) {
+    async fn sync_client_iota_status(&self) {
+        *self.state.write().await = ConnectionState::SynchronizingRoutes;
         let mut connected_iota_ids: Vec<DataValue> = Vec::new();
+        let mut connected_sessions: Vec<DataValue> = Vec::new();
         let mut connected_user_ids: Vec<DataValue> = Vec::new();
 
         let iota_ids = self.rho.iota_ids().await;
@@ -367,21 +453,120 @@ impl OmegaConnection {
 
         for rho in rho_connections {
             for client_conn in rho.get_client_connections().await {
-                connected_user_ids.push(DataValue::SignedNumber(
-                    client_conn.get_user_id().await.into(),
-                ));
+                let type_map = mtp::codec::TypeMap::latest();
+                let user_id = DataValue::SignedNumber(client_conn.get_user_id().await.into());
+                let session_id = DataValue::SignedNumber((client_conn.session_id as i128).into());
+                let iota_id = DataValue::SignedNumber((rho.get_iota_id().await as i128).into());
+                let peer_capabilities = self.peer_capabilities.read().await.clone();
+                if peer_capabilities.session_snapshot_v1 {
+                    connected_sessions.push(DataValue::Container(vec![
+                        (data_type_id(DataType::UserId, &type_map), user_id),
+                        (data_type_id(DataType::SessionId, &type_map), session_id),
+                        (data_type_id(DataType::IotaId, &type_map), iota_id),
+                    ]));
+                } else {
+                    connected_user_ids.push(user_id);
+                }
             }
         }
 
-        let sync_msg = CommunicationValue::new(CommunicationType::SyncClientIotaStatus)
-            .add_typed_default(DataType::IotaIds, DataValue::Array(connected_iota_ids))
-            .add_typed_default(DataType::UserIds, DataValue::Array(connected_user_ids))
-            .add_typed_default(
-                DataType::RhoConnections,
-                DataValue::SignedNumber(self.rho.connection_count().await as i128),
-            );
+        let peer_capabilities = self.peer_capabilities.read().await.clone();
+        let sync_msg = if peer_capabilities.session_snapshot_v1 {
+            CommunicationValue::new(CommunicationType::SyncClientIotaStatus)
+                .add_typed_default(DataType::IotaIds, DataValue::Array(connected_iota_ids))
+                .add_typed_default(DataType::UserStates, DataValue::Array(connected_sessions))
+                .add_typed_default(
+                    DataType::RhoConnections,
+                    DataValue::SignedNumber(self.rho.connection_count().await as i128),
+                )
+        } else {
+            // Legacy Omega has no request/response contract for this message.
+            // Its exact snapshot is IotaIds + UserIds + RhoConnections.
+            CommunicationValue::new(CommunicationType::SyncClientIotaStatus)
+                .add_typed_default(DataType::IotaIds, DataValue::Array(connected_iota_ids))
+                .add_typed_default(DataType::UserIds, DataValue::Array(connected_user_ids))
+                .add_typed_default(
+                    DataType::RhoConnections,
+                    DataValue::SignedNumber(self.rho.connection_count().await as i128),
+                )
+        };
 
-        self.send_message(&sync_msg).await;
+        if !peer_capabilities.session_snapshot_v1 {
+            if let Err(error) = self.send_message_result(&sync_msg).await {
+                self.fail_synchronization("legacy route synchronization", error)
+                    .await;
+                return;
+            }
+            *self.state.write().await = ConnectionState::SynchronizingSubscriptions;
+            if let Err(error) = self.restore_presence_subscriptions().await {
+                self.fail_synchronization("subscription restoration", error)
+                    .await;
+                return;
+            }
+            *self.state.write().await = ConnectionState::Ready;
+            return;
+        }
+
+        let mut response = Err("route synchronization did not start".to_string());
+        for attempt in 0..self.sync_retries {
+            response = self
+                .await_response(&sync_msg, Some(self.sync_timeout))
+                .await;
+            match &response {
+                Ok(value) if value.is_type(CommunicationType::Success) => break,
+                Ok(value) if value.is_type(CommunicationType::ErrorInvalidData) => break,
+                _ if attempt + 1 < self.sync_retries => {
+                    sleep(Duration::from_millis(250 * 2u64.pow(attempt))).await
+                }
+                _ => break,
+            }
+        }
+        match response {
+            Ok(response) if response.is_type(CommunicationType::Success) => {
+                *self.state.write().await = ConnectionState::SynchronizingSubscriptions;
+                if let Err(error) = self.restore_presence_subscriptions().await {
+                    log_err!(
+                        0,
+                        PrintType::Omega,
+                        "Presence subscription restoration failed: {}",
+                        error
+                    );
+                    self.fail_synchronization("subscription restoration", error)
+                        .await;
+                    return;
+                }
+                *self.state.write().await = ConnectionState::Ready;
+            }
+            Ok(response) => {
+                let error = format!(
+                    "Omega rejected presence snapshot with {}",
+                    response.get_type()
+                );
+                self.fail_synchronization("route synchronization", error)
+                    .await;
+                return;
+            }
+            Err(error) => {
+                self.fail_synchronization("route synchronization", error)
+                    .await;
+                return;
+            }
+        }
+    }
+
+    async fn fail_synchronization(&self, phase: &str, error: String) {
+        log_err!(
+            0,
+            PrintType::Omega,
+            "Omega {} failed after {} attempts: {}; closing transport for reconnect",
+            phase,
+            self.sync_retries,
+            error
+        );
+        *self.state.write().await = ConnectionState::Disconnected;
+        if let Some(sender) = self.sender.read().await.as_ref() {
+            sender.close().await;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -392,6 +577,7 @@ impl OmegaConnection {
         self: Arc<Self>,
         connection: Arc<MTPConnection>,
         sender_handle: Arc<ConnectionHandle>,
+        mut capability_tx: Option<oneshot::Sender<Result<PeerCapabilities, String>>>,
     ) {
         // Monitor both receiver and sender handle for close
         let mut close_rx = sender_handle.subscribe_close();
@@ -402,6 +588,14 @@ impl OmegaConnection {
                     match result {
                         Ok(cv) => {
                             log_cv_in!(PrintType::Omega, &cv);
+
+                            if cv.is_type(CommunicationType::IdentificationResponse) {
+                                if let Some(tx) = capability_tx.take() {
+                                    let result = parse_omega_capability_response(&cv);
+                                    let _ = tx.send(result);
+                                }
+                                continue;
+                            }
 
                             let msg_id = cv.get_id();
                             if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
@@ -429,6 +623,20 @@ impl OmegaConnection {
                                         }
                                     }
                                 }
+                            }
+                            if cv.is_type(CommunicationType::ClientChanged) {
+                                let Some((receiver, session_id)) = client_changed_target(&cv)
+                                else {
+                                    continue;
+                                };
+                                if let Some(client) = self
+                                    .rho
+                                    .get_client_connection(receiver, session_id)
+                                    .await
+                                {
+                                    client.send_message(&cv).await;
+                                }
+                                continue;
                             }
                         }
                         Err(e) => {
@@ -486,6 +694,14 @@ impl OmegaConnection {
 
     pub async fn send_message(&self, cv: &CommunicationValue) {
         let _ = self.try_send_message(cv).await;
+    }
+
+    pub async fn send_message_result(&self, cv: &CommunicationValue) -> Result<(), String> {
+        self.try_send_message(cv).await
+    }
+
+    pub async fn supports_set_user_state(&self) -> bool {
+        self.peer_capabilities.read().await.set_user_state_v1
     }
 
     pub async fn await_connection(&self, timeout_duration: Option<Duration>) -> Result<(), String> {
@@ -607,72 +823,371 @@ impl OmegaConnection {
         self.state.read().await.is_identified()
     }
 
+    pub async fn is_ready(&self) -> bool {
+        self.state.read().await.is_ready()
+    }
+
     #[allow(dead_code)]
-    pub async fn close_iota(&self, iota_id: i64) {
+    pub async fn close_iota(&self, iota_id: i64) -> Result<(), String> {
         let cv = CommunicationValue::new(CommunicationType::IotaDisconnected)
             .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()));
-        self.send_message(&cv).await;
+        let request_id = cv.get_id();
+        let result = self.lifecycle_request(&cv).await;
+        if let Err(error) = &result {
+            self.log_lifecycle_failure("IotaDisconnected", iota_id, None, request_id, error);
+            self.sync_client_iota_status().await;
+        }
+        result
     }
 
-    pub async fn client_changed(
-        &self,
-        _iota_id: i64,
-        user_id: i64,
-        session_id: i64,
-        state: UserStatus,
-    ) {
-        let cv = CommunicationValue::new(CommunicationType::ClientChanged)
-            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id.into()),
-            )
-            .add_typed_default(DataType::UserState, DataValue::Str(state.to_string()));
-        self.send_message(&cv).await;
-    }
-
-    pub async fn client_disconnected(&self, user_id: i64, session_id: i64) {
+    pub async fn client_disconnected(&self, user_id: i64, session_id: i64) -> Result<(), String> {
+        self.session_presence.remove(&(user_id, session_id));
         let cv = CommunicationValue::new(CommunicationType::UserDisconnected)
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
             .add_typed_default(
                 DataType::SessionId,
                 DataValue::SignedNumber(session_id.into()),
             );
-        self.send_message(&cv).await;
+        let request_id = cv.get_id();
+        let result = self.lifecycle_request(&cv).await;
+        if let Err(error) = &result {
+            self.log_lifecycle_failure(
+                "UserDisconnected",
+                user_id,
+                Some(session_id),
+                request_id,
+                error,
+            );
+            self.sync_client_iota_status().await;
+        }
+        result
     }
 
-    pub async fn user_states(&self, user_id: i64, user_ids: Vec<i64>) {
-        let user_ids = user_ids
-            .iter()
-            .map(|v| DataValue::SignedNumber((*v).into()))
-            .collect();
-
-        let cv = CommunicationValue::new(CommunicationType::GetStates)
-            .add_typed_default(DataType::UserIds, DataValue::Array(user_ids));
-        let msg_id = cv.get_id();
-
-        let rho_manager = self.rho.clone();
-        self.waiting_tasks.insert(
-            msg_id,
-            WaitingTask {
-                task: Box::new(
-                    move |_: Arc<OmegaConnection>, response: CommunicationValue| {
-                        let rho_manager = rho_manager.clone();
-                        tokio::spawn(async move {
-                            let rho = rho_manager.get_for_user(user_id).await;
-                            if let Some(rho) = rho {
-                                for client in rho.get_client_connections_for_user(user_id).await {
-                                    client.send_message(&response).await;
-                                }
-                            }
-                        });
-                        true
-                    },
+    pub async fn user_connected(
+        &self,
+        user_id: i64,
+        session_id: i64,
+        iota_id: i64,
+    ) -> Result<(), String> {
+        let request = CommunicationValue::new(CommunicationType::UserConnected)
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
+            .add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id.into()),
+            )
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()))
+            .add_typed_default(
+                DataType::UserState,
+                DataValue::Str("user_online".to_string()),
+            )
+            .add_typed_default(
+                DataType::UpdatedAt,
+                DataValue::SignedNumber(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i128,
                 ),
-                inserted_at: Instant::now(),
+            );
+        let request_id = request.get_id();
+        let result = self.lifecycle_request(&request).await;
+        if let Err(error) = &result {
+            self.log_lifecycle_failure(
+                "UserConnected",
+                user_id,
+                Some(session_id),
+                request_id,
+                error,
+            );
+            self.sync_client_iota_status().await;
+        }
+        result
+    }
+
+    pub async fn iota_connected(&self, iota_id: i64) -> Result<(), String> {
+        let request = CommunicationValue::new(CommunicationType::IotaConnected)
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()));
+        let request_id = request.get_id();
+        let result = self.lifecycle_request(&request).await;
+        if let Err(error) = &result {
+            self.log_lifecycle_failure("IotaConnected", iota_id, None, request_id, error);
+            self.sync_client_iota_status().await;
+        }
+        result
+    }
+
+    pub async fn reconcile_routes(&self) {
+        self.sync_client_iota_status().await;
+    }
+
+    async fn lifecycle_request(&self, request: &CommunicationValue) -> Result<(), String> {
+        if !self.is_ready().await {
+            return Err("Omega is not synchronized".to_string());
+        }
+        if !self.peer_capabilities.read().await.session_snapshot_v1 {
+            // Legacy Omega handles lifecycle messages as notifications and
+            // never returns Success. A transport-level send result is the
+            // only acknowledgement available under that contract.
+            return self.send_message_result(request).await;
+        }
+        let response = self
+            .await_response(request, Some(Duration::from_secs(20)))
+            .await?;
+        if response.is_type(CommunicationType::Success) {
+            Ok(())
+        } else {
+            Err(format!("Omega rejected {}", response.get_type()))
+        }
+    }
+
+    fn log_lifecycle_failure(
+        &self,
+        operation: &str,
+        entity_id: i64,
+        session_id: Option<i64>,
+        request_id: u32,
+        error: &str,
+    ) {
+        log_err!(
+            0,
+            PrintType::Omega,
+            "Lifecycle operation={} entity_id={} session_id={:?} request_id={} failed: {}",
+            operation,
+            entity_id,
+            session_id,
+            request_id,
+            error
+        );
+    }
+
+    pub async fn replace_state_subscription(
+        &self,
+        user_id: i64,
+        session_id: i64,
+        mut user_ids: Vec<i64>,
+    ) -> Result<(), String> {
+        if user_id <= 0 || session_id <= 0 {
+            return Err("invalid user or session id".to_string());
+        }
+
+        user_ids.sort_unstable();
+        user_ids.dedup();
+
+        let key = (user_id, session_id);
+        // Store the latest authoritative snapshot before checking readiness.
+        // A client can synchronize while the transport is reconnecting.
+        self.session_presence.insert(
+            key,
+            SessionPresenceState {
+                subscribed_user_ids: user_ids.clone(),
+                pending: true,
             },
         );
 
-        self.send_message(&cv).await;
+        if !self.is_ready().await {
+            return Err("Omega is not synchronized".to_string());
+        }
+
+        self.deliver_state_subscription(key, user_ids).await
+    }
+
+    async fn deliver_state_subscription(
+        &self,
+        key: (i64, i64),
+        user_ids: Vec<i64>,
+    ) -> Result<(), String> {
+        let (user_id, session_id) = key;
+
+        if !self.peer_capabilities.read().await.state_subscribe_v1 {
+            let delivered_ids = user_ids.clone();
+            let result = self
+                .request_user_states(user_id, session_id, user_ids)
+                .await;
+            if result.is_ok() {
+                self.mark_presence_delivered(key, &delivered_ids).await;
+            }
+            return result;
+        }
+
+        let subscription = CommunicationValue::new(CommunicationType::StateSubscribe)
+            .with_sender(user_id as u64)
+            .add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id.into()),
+            )
+            .add_typed_default(
+                DataType::UserIds,
+                DataValue::Array(
+                    user_ids
+                        .iter()
+                        .map(|user_id| DataValue::SignedNumber((*user_id).into()))
+                        .collect(),
+                ),
+            );
+        let response = self
+            .await_response(&subscription, Some(Duration::from_secs(20)))
+            .await?;
+        if !response.is_type(CommunicationType::Success) {
+            return Err(format!(
+                "StateSubscribe rejected with {}",
+                response.get_type()
+            ));
+        }
+
+        let delivered_ids = user_ids.clone();
+        self.request_user_states(user_id, session_id, user_ids)
+            .await?;
+        self.mark_presence_delivered(key, &delivered_ids).await;
+        Ok(())
+    }
+
+    async fn restore_presence_subscriptions(&self) -> Result<(), String> {
+        let mut active = Vec::new();
+        for rho in self.rho.connections().await {
+            active.extend(rho.get_client_connections().await);
+        }
+        let active_keys: std::collections::HashSet<_> = active
+            .iter()
+            .map(|client| (client.user_id as i64, client.session_id as i64))
+            .collect();
+
+        // Do not replay subscriptions for sessions that disappeared while the
+        // transport was down.
+        self.session_presence
+            .retain(|key, _| active_keys.contains(key));
+
+        for key in active_keys {
+            let Some(snapshot) = self.session_presence.get(&key).map(|entry| entry.clone()) else {
+                continue;
+            };
+            if !snapshot.pending {
+                continue;
+            }
+            self.deliver_state_subscription(key, snapshot.subscribed_user_ids)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn mark_presence_delivered(&self, key: (i64, i64), delivered_ids: &[i64]) {
+        if let Some(mut entry) = self.session_presence.get_mut(&key)
+            && entry.subscribed_user_ids == delivered_ids
+        {
+            entry.pending = false;
+        }
+    }
+
+    async fn request_user_states(
+        &self,
+        user_id: i64,
+        session_id: i64,
+        user_ids: Vec<i64>,
+    ) -> Result<(), String> {
+        let request = CommunicationValue::new(CommunicationType::GetStates)
+            .add_typed_default(
+                DataType::SessionId,
+                DataValue::SignedNumber(session_id.into()),
+            )
+            .add_typed_default(
+                DataType::UserIds,
+                DataValue::Array(
+                    user_ids
+                        .iter()
+                        .map(|user_id| DataValue::SignedNumber((*user_id).into()))
+                        .collect(),
+                ),
+            );
+        let response = self
+            .await_response(&request, Some(Duration::from_secs(20)))
+            .await?;
+        let legacy_peer = !self.peer_capabilities.read().await.client_state_push_v1;
+        let response =
+            if legacy_peer && response.get_data(DataType::SessionId).as_number().is_none() {
+                response.add_typed_default(
+                    DataType::SessionId,
+                    DataValue::SignedNumber(session_id.into()),
+                )
+            } else {
+                response
+            };
+        if !legacy_peer
+            && response.get_data(DataType::SessionId).as_number() != Some(session_id as i128)
+        {
+            return Err("GetStates response had the wrong session".to_string());
+        }
+
+        if let Some(client) = self.rho.get_client_connection(user_id, session_id).await {
+            client.send_message(&response).await;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PeerCapabilities, client_changed_target, parse_omega_capability_response};
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+
+    fn notification() -> CommunicationValue {
+        CommunicationValue::new(CommunicationType::ClientChanged)
+            .with_receiver(7)
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(11))
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(20))
+            .add_typed_default(DataType::UserState, DataValue::Str("user_online".into()))
+    }
+
+    #[test]
+    fn client_changed_target_requires_all_routing_fields() {
+        assert_eq!(client_changed_target(&notification()), Some((7, 11)));
+
+        let mut missing_session = notification();
+        missing_session.remove_data(DataType::SessionId);
+        assert_eq!(client_changed_target(&missing_session), None);
+
+        let mut missing_state = notification();
+        missing_state.remove_data(DataType::UserState);
+        assert_eq!(client_changed_target(&missing_state), None);
+    }
+
+    #[test]
+    fn client_changed_target_rejects_non_positive_ids() {
+        let invalid = CommunicationValue::new(CommunicationType::ClientChanged)
+            .with_receiver(0)
+            .add_typed_default(DataType::SessionId, DataValue::SignedNumber(11))
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(20))
+            .add_typed_default(DataType::UserState, DataValue::Str("user_online".into()));
+        assert_eq!(client_changed_target(&invalid), None);
+    }
+
+    #[test]
+    fn capability_response_negotiates_new_omega() {
+        let response = CommunicationValue::new(CommunicationType::IdentificationResponse)
+            .add_typed_default(
+                DataType::Description,
+                DataValue::Str(
+                    "omega;caps=set_user_state_v1,state_subscribe_v1,session_snapshot_v1,client_state_push_v1"
+                        .into(),
+                ),
+            );
+        let capabilities = parse_omega_capability_response(&response).unwrap();
+        assert!(capabilities.state_subscribe_v1);
+        assert!(capabilities.client_state_push_v1);
+    }
+
+    #[test]
+    fn missing_capability_response_is_legacy() {
+        let response = CommunicationValue::new(CommunicationType::IdentificationResponse);
+        let capabilities = parse_omega_capability_response(&response).unwrap();
+        assert_eq!(capabilities, PeerCapabilities::default());
+    }
+
+    #[test]
+    fn unsupported_capability_response_is_rejected() {
+        let response = CommunicationValue::new(CommunicationType::IdentificationResponse)
+            .add_typed_default(
+                DataType::Description,
+                DataValue::Str("omega;caps=unsupported_v9".into()),
+            );
+        assert!(parse_omega_capability_response(&response).is_err());
     }
 }

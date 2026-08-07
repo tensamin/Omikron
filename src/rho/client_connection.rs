@@ -24,7 +24,6 @@ pub struct ClientConnection {
     pub receiver: Arc<MtpReceiver>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
-    pub interested_users: Arc<RwLock<Vec<i64>>>,
     is_open: Arc<RwLock<bool>>,
     message_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -35,7 +34,6 @@ impl ClientConnection {
             state: general.state.clone(),
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: general.rho_connection.clone(),
-            interested_users: Arc::new(RwLock::new(Vec::new())),
             is_open: Arc::new(RwLock::new(true)),
             sender: general.sender.clone(),
             receiver: general.receiver.clone(),
@@ -104,9 +102,26 @@ impl ClientConnection {
 
             let mut cv = cv;
 
-            // Handle client status changes
-            if cv.is_type(CommunicationType::ClientChanged) {
-                self.handle_client_changed(cv).await;
+            if cv.is_type(CommunicationType::SetUserState) {
+                self.handle_set_user_state(cv).await;
+                return;
+            }
+
+            // Compatibility for clients predating SetUserState.  The target
+            // user fields, if present, are deliberately ignored: an
+            // authenticated connection may only change its own state.
+            if cv.is_type(CommunicationType::ClientChanged)
+                && cv.get_data_opt(DataType::UserState).is_some()
+            {
+                self.handle_set_user_state(
+                    CommunicationValue::new(CommunicationType::SetUserState)
+                        .with_id(cv.get_id())
+                        .add_typed_default(
+                            DataType::UserState,
+                            cv.get_data(DataType::UserState).clone(),
+                        ),
+                )
+                .await;
                 return;
             }
 
@@ -191,6 +206,46 @@ impl ClientConnection {
                 || cv.is_type(CommunicationType::GetIotaData)
                 || cv.is_type(CommunicationType::DeleteUser)
             {
+                if cv.is_type(CommunicationType::ChangeUserData)
+                    && cv.get_data_opt(DataType::OnlineStatus).is_some()
+                {
+                    let mut profile_request = cv.clone();
+                    let preference = profile_request.remove_data(DataType::OnlineStatus);
+                    let state_request = CommunicationValue::new(CommunicationType::SetUserState)
+                        .with_id(cv.get_id())
+                        .add_typed_default(DataType::UserState, preference.unwrap());
+                    let state_response = match self.request_set_user_state(state_request).await {
+                        Ok(response) => response,
+                        Err(error_type) => {
+                            self.send_error_response(cv.get_id(), error_type).await;
+                            return;
+                        }
+                    };
+                    if !state_response.is_type(CommunicationType::Success) {
+                        self.send_message(&state_response).await;
+                        return;
+                    }
+
+                    if profile_request.data_len() == 0 {
+                        self.send_message(&state_response).await;
+                        return;
+                    }
+
+                    match self
+                        .await_omega_response(profile_request.with_sender(self.user_id))
+                        .await
+                    {
+                        Ok(response) if response.is_type(CommunicationType::Success) => {
+                            self.send_message(&response).await;
+                        }
+                        Ok(response) => self.send_message(&response).await,
+                        Err(_) => {
+                            self.send_error_response(cv.get_id(), CommunicationType::ErrorInternal)
+                                .await;
+                        }
+                    }
+                    return;
+                }
                 let sender = self.get_user_id().await;
                 self.handle_omega_forward(cv.with_sender(sender as u64))
                     .await;
@@ -290,34 +345,91 @@ impl ClientConnection {
         });
     }
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
-        let client_for_closure = self.clone();
-        let response_cv = self
-            .state
-            .omega
-            .clone()
-            .await_response(&cv.with_sender(self.user_id), Some(Duration::from_secs(20)))
-            .await;
-        if let Ok(response_cv) = response_cv {
-            client_for_closure.send_message(&response_cv).await;
+        let request_id = cv.get_id();
+        match self.await_omega_response(cv).await {
+            Ok(response_cv) => self.send_message(&response_cv).await,
+            Err(_) => {
+                self.send_error_response(request_id, CommunicationType::ErrorInternal)
+                    .await;
+            }
         }
     }
 
-    /// Handle client status change
-    async fn handle_client_changed(self: Arc<Self>, cv: CommunicationValue) {
-        let user_id = self.get_user_id().await;
-        if let DataValue::Str(status_str) = cv.get_data(DataType::UserState) {
-            let user_status = UserStatus::from_str(&status_str).unwrap_or(UserStatus::user_online);
-            if let Some(rho_conn) = self.get_rho_connection().await {
-                self.state
-                    .omega
-                    .client_changed(
-                        rho_conn.get_iota_id().await as i64,
-                        user_id as i64,
-                        self.session_id as i64,
-                        user_status,
-                    )
-                    .await;
-            }
+    async fn await_omega_response(&self, cv: CommunicationValue) -> Result<CommunicationValue, ()> {
+        self.state
+            .omega
+            .clone()
+            .await_response(&cv.with_sender(self.user_id), Some(Duration::from_secs(20)))
+            .await
+            .map_err(|_| ())
+    }
+
+    async fn request_set_user_state(
+        &self,
+        cv: CommunicationValue,
+    ) -> Result<CommunicationValue, CommunicationType> {
+        if !self.state.omega.is_ready().await {
+            return Err(CommunicationType::ErrorInternal);
+        }
+        let Some(state) = cv
+            .get_data(DataType::UserState)
+            .as_str()
+            .and_then(UserStatus::from_client_preference)
+        else {
+            return Err(CommunicationType::ErrorInvalidData);
+        };
+        let Some(rho) = self.get_rho_connection().await else {
+            return Err(CommunicationType::ErrorNoIota);
+        };
+        let request = if self.state.omega.supports_set_user_state().await {
+            CommunicationValue::new(CommunicationType::SetUserState)
+                .with_id(cv.get_id())
+                .with_sender(self.user_id)
+                .add_typed_default(
+                    DataType::UserId,
+                    DataValue::SignedNumber(self.user_id as i128),
+                )
+                .add_typed_default(
+                    DataType::SessionId,
+                    DataValue::SignedNumber(self.session_id as i128),
+                )
+                .add_typed_default(
+                    DataType::IotaId,
+                    DataValue::SignedNumber(rho.get_iota_id().await as i128),
+                )
+                .add_typed_default(DataType::UserState, DataValue::Str(state.to_string()))
+        } else {
+            // Legacy Omega accepts the original ClientChanged request. It is
+            // intentionally limited to the authenticated user's ID and a
+            // writable preference, with no derived connectivity state.
+            CommunicationValue::new(CommunicationType::ClientChanged)
+                .with_id(cv.get_id())
+                .with_sender(self.user_id)
+                .add_typed_default(
+                    DataType::UserId,
+                    DataValue::SignedNumber(self.user_id as i128),
+                )
+                .add_typed_default(DataType::UserState, DataValue::Str(state.to_string()))
+        };
+        if !self.state.omega.supports_set_user_state().await {
+            self.state
+                .omega
+                .send_message_result(&request)
+                .await
+                .map_err(|_| CommunicationType::ErrorInternal)?;
+            return Ok(CommunicationValue::new(CommunicationType::Success)
+                .with_id(cv.get_id())
+                .add_typed_default(DataType::UserState, DataValue::Str(state.to_string())));
+        }
+        self.await_omega_response(request)
+            .await
+            .map_err(|_| CommunicationType::ErrorInternal)
+    }
+
+    async fn handle_set_user_state(self: Arc<Self>, cv: CommunicationValue) {
+        match self.request_set_user_state(cv.clone()).await {
+            Ok(response) => self.send_message(&response).await,
+            Err(error_type) => self.send_error_response(cv.get_id(), error_type).await,
         }
     }
 
@@ -830,35 +942,6 @@ impl ClientConnection {
         let _ = self.sender.close();
     }
 
-    /// Set interested users list
-    pub async fn set_interested_users(self: Arc<Self>, interested_ids: Vec<i64>) {
-        let mut interested_guard = self.interested_users.write().await;
-        *interested_guard = interested_ids;
-    }
-    #[allow(dead_code)]
-    pub async fn get_interested_users(self: Arc<Self>) -> Vec<i64> {
-        let interested_guard = self.interested_users.read().await;
-        interested_guard.clone()
-    }
-
-    /// Check if interested in a user and send notification
-    #[allow(dead_code)]
-    pub async fn are_you_interested(self: Arc<Self>, user_id: i64, user_status: &str) {
-        let interested_guard = self.clone().get_interested_users().await;
-        if interested_guard.contains(&user_id) {
-            let status = if user_status == "user_invisible" {
-                "user_offline"
-            } else {
-                user_status
-            };
-            let notification = CommunicationValue::new(CommunicationType::ClientChanged)
-                .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
-                .add_typed_default(DataType::UserState, DataValue::Str(status.to_string()));
-
-            self.send_message(&notification).await;
-        }
-    }
-
     /// Handle connection close
     pub async fn handle_close(self: Arc<Self>) {
         let user_id = self.get_user_id().await;
@@ -880,7 +963,6 @@ impl Clone for ClientConnection {
             client_version: self.client_version.clone(),
             pub_key: Arc::clone(&self.pub_key),
             rho_connection: Arc::clone(&self.rho_connection),
-            interested_users: Arc::clone(&self.interested_users),
             is_open: Arc::clone(&self.is_open),
             message_slots: Arc::clone(&self.message_slots),
         }
