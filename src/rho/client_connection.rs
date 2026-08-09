@@ -77,6 +77,12 @@ impl ClientConnection {
         *self.rho_connection.write().await = Some(rho_connection);
     }
 
+    /// A membership snapshot can remove an account from an Iota while keeping
+    /// its authenticated Omega connection alive.
+    pub async fn clear_rho_connection(&self) {
+        *self.rho_connection.write().await = None;
+    }
+
     /// Send a CommunicationValue to the client
     pub async fn send_message(self: Arc<Self>, cv: &CommunicationValue) {
         if !*self.is_open.read().await {

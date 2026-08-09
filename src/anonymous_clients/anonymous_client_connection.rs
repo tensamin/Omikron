@@ -302,7 +302,6 @@ impl AnonymousClientConnection {
 
             if cv.is_type(CommunicationType::GetUserData)
                 || cv.is_type(CommunicationType::GetIotaData)
-                || cv.is_type(CommunicationType::DeleteUser)
             {
                 self.handle_omega_forward(cv).await;
                 return;

@@ -442,6 +442,12 @@ impl IotaConnection {
             || cv.is_type(CommunicationType::GetUserData)
             || cv.is_type(CommunicationType::GetIotaData)
             || cv.is_type(CommunicationType::DeleteIota)
+            || cv.is_type(CommunicationType::AttachUserBegin)
+            || cv.is_type(CommunicationType::AttachUserComplete)
+            || cv.is_type(CommunicationType::ReleaseUserFromIota)
+            || cv.is_type(CommunicationType::DeleteUserCredentialBegin)
+            || cv.is_type(CommunicationType::DeleteUserCredentialComplete)
+            || cv.is_type(CommunicationType::EraseHostedUserDataAck)
         {
             let sender = self.get_iota_id().await;
 

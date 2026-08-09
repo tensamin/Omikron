@@ -86,6 +86,14 @@ impl RhoConnection {
             .collect()
     }
 
+    pub async fn detach_user_clients(&self, user_id: i64) {
+        let clients = self.get_client_connections_for_user(user_id).await;
+        for client in clients {
+            client.clear_rho_connection().await;
+        }
+        self.client_connections.retain(|(id, _), _| *id != user_id as u64);
+    }
+
     #[allow(unused)]
     pub async fn get_app_connections(
         &self,
