@@ -622,7 +622,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
+<<<<<<< HEAD
  "windows-sys 0.61.2",
+=======
+ "windows-sys 0.52.0",
+>>>>>>> e0dd9a085fd88168e714af0d6af88769af3aa644
 ]
 
 [[package]]
@@ -1464,9 +1468,15 @@ dependencies = [
 
 [[package]]
 name = "livekit-protocol"
+<<<<<<< HEAD
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4d26880e94e2f9bab298445e7d86a3794453d211a12ddbd051bd9991a343f9ff"
+=======
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "526f22bddf409e5f15449d55cf341647d7c16a1f43df9db9b05be106e4208e1c"
+>>>>>>> e0dd9a085fd88168e714af0d6af88769af3aa644
 dependencies = [
  "pbjson",
  "pbjson-types",
@@ -2329,7 +2339,11 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
+<<<<<<< HEAD
  "windows-sys 0.61.2",
+=======
+ "windows-sys 0.52.0",
+>>>>>>> e0dd9a085fd88168e714af0d6af88769af3aa644
 ]
 
 [[package]]
@@ -2583,7 +2597,11 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
+<<<<<<< HEAD
  "windows-sys 0.61.2",
+=======
+ "windows-sys 0.52.0",
+>>>>>>> e0dd9a085fd88168e714af0d6af88769af3aa644
 ]
 
 [[package]]
@@ -2642,7 +2660,11 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
+<<<<<<< HEAD
  "windows-sys 0.61.2",
+=======
+ "windows-sys 0.52.0",
+>>>>>>> e0dd9a085fd88168e714af0d6af88769af3aa644
 ]
 
 [[package]]
@@ -3027,7 +3049,11 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
+<<<<<<< HEAD
  "windows-sys 0.61.2",
+=======
+ "windows-sys 0.52.0",
+>>>>>>> e0dd9a085fd88168e714af0d6af88769af3aa644
 ]
 
 [[package]]
@@ -3588,7 +3614,11 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
+<<<<<<< HEAD
  "windows-sys 0.61.2",
+=======
+ "windows-sys 0.52.0",
+>>>>>>> e0dd9a085fd88168e714af0d6af88769af3aa644
 ]
 
 [[package]]
