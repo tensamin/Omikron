@@ -66,7 +66,10 @@ impl RhoManager {
             )
             .await;
 
-        let replacement = user_ids.iter().copied().collect::<std::collections::HashSet<_>>();
+        let replacement = user_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
         for user_id in previous_users {
             if !replacement.contains(&user_id) {
                 rho.detach_user_clients(user_id).await;

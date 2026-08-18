@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-mtp = { git = "https://git.methanium.net/Methanium/mtp.git", features = [
+mtp = { git = "https://git.methanium.net/Methanium/mtp.git",  features = [
     "web-server",
     "client",
     "crypto",
     "files",
+    "raw",
 ] }
 mtp-transport = { git = "https://git.methanium.net/Methanium/mtp.git" }
 

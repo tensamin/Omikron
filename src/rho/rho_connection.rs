@@ -1,8 +1,15 @@
 use super::{client_connection::ClientConnection, iota_connection::IotaConnection};
 
-use crate::{log_err, rho::app_connection::AppConnection};
+use super::relay_router::RouteTarget;
+use crate::{
+    log_err,
+    rho::{
+        app_connection::AppConnection,
+        connection::{MtpValueCompat, OptionalDataValueCompat},
+    },
+};
 use dashmap::DashMap;
-use mtp::codec::{CommunicationValue, DataType};
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -91,7 +98,8 @@ impl RhoConnection {
         for client in clients {
             client.clear_rho_connection().await;
         }
-        self.client_connections.retain(|(id, _), _| *id != user_id as u64);
+        self.client_connections
+            .retain(|(id, _), _| *id != user_id as u64);
     }
 
     #[allow(unused)]
@@ -265,9 +273,60 @@ impl RhoConnection {
         }
     }
 
-    /// Send message to Iota
     pub async fn message_to_iota(&self, cv: CommunicationValue) {
         self.iota_connection.send_message(&cv).await;
+    }
+
+    pub async fn has_local_client(&self, user_id: u64) -> bool {
+        self.client_connections
+            .iter()
+            .any(|entry| entry.key().0 == user_id)
+    }
+
+    pub async fn send_relay_to_client(&self, cv: &CommunicationValue) -> Result<(), String> {
+        let receiver_id = cv
+            .receiver()
+            .and_then(RouteTarget::from_wire_id)
+            .and_then(|target| match target {
+                RouteTarget::User(user_id) => Some(user_id),
+                RouteTarget::Iota(_) => None,
+            })
+            .ok_or_else(|| "client offline".to_string())?;
+        let connections = self
+            .get_client_connections_for_user(receiver_id as i64)
+            .await;
+        if connections.is_empty() {
+            return Err("client offline".to_string());
+        }
+
+        let mut send_error = None;
+        for connection in connections {
+            if let Err(error) = connection.send_relay(cv).await {
+                send_error = Some(error);
+            }
+        }
+        send_error.map_or(Ok(()), Err)
+    }
+
+    pub async fn send_relay_to_iota(&self, cv: &CommunicationValue) -> Result<(), String> {
+        self.iota_connection.send_relay(cv).await
+    }
+
+    pub async fn await_relay_to_iota(
+        &self,
+        cv: &CommunicationValue,
+    ) -> Result<CommunicationValue, String> {
+        self.iota_connection
+            .clone()
+            .await_response(cv, Some(std::time::Duration::from_secs(20)))
+            .await
+    }
+
+    pub async fn forward_relay_ack(&self, user_id: u64, frame_id: u32) {
+        let acknowledgement = CommunicationValue::new(CommunicationType::Success)
+            .with_id(frame_id)
+            .add_typed_default(DataType::UserId, DataValue::UnsignedNumber(user_id.into()));
+        self.iota_connection.send_message(&acknowledgement).await;
     }
 
     /// Check if this RhoConnection contains a specific user ID

@@ -2,6 +2,8 @@ use super::capabilities::PeerCapabilities;
 use crate::{
     config::Config,
     log_cv_in, log_cv_out, log_err, log_in, log_out,
+    rho::connection::{MtpValueCompat, OptionalDataValueCompat},
+    rho::relay_router,
     rho::rho_manager::RhoManager,
     util::{data_type_id, logger::PrintType},
 };
@@ -597,6 +599,37 @@ impl OmegaConnection {
                                 continue;
                             }
 
+                            if cv.is_type(CommunicationType::Relay) {
+                                let destination_iota = cv.receiver().unwrap_or_default();
+                                let request_id = cv.get_id();
+                                let response = match relay_router::route_from_omega(&self.rho, cv).await {
+                                    Ok(()) => CommunicationValue::new(CommunicationType::Success)
+                                        .with_id(request_id),
+                                    Err(error) => {
+                                        log_err!(
+                                            self.omikron_id as i64,
+                                            PrintType::Omega,
+                                            "Relay routing failed for destination Iota {}: {}",
+                                            destination_iota,
+                                            error
+                                        );
+                                        CommunicationValue::new(
+                                            relay_router::error_response_type(&error),
+                                        )
+                                        .with_id(request_id)
+                                    }
+                                };
+                                if let Err(send_error) = self.send_message_result(&response).await {
+                                    log_err!(
+                                        self.omikron_id as i64,
+                                        PrintType::Omega,
+                                        "Relay routing response failed: {}",
+                                        send_error
+                                    );
+                                }
+                                continue;
+                            }
+
                             let msg_id = cv.get_id();
                             if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
                                 if (task.task)(self.clone(), cv.clone()) {
@@ -605,7 +638,7 @@ impl OmegaConnection {
                             }
 
                             if cv.is_type(CommunicationType::IotaUserData) {
-                                if let DataValue::Array(users) = cv.get_data(DataType::UserIds) {
+                                if let Some(DataValue::Array(users)) = cv.get_data(DataType::UserIds) {
                                     let mut user_ids = Vec::new();
                                     for value in users {
                                         if let DataValue::SignedNumber(user_id) = value {

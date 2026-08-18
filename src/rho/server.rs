@@ -9,7 +9,7 @@ use crate::{
     app_state::AppState,
     log, log_err,
     omega::omega_connection::OmegaConnection,
-    rho::connection::GeneralConnection,
+    rho::connection::{GeneralConnection, OptionalDataValueCompat},
     util::{file_util::load_file_vec, logger::PrintType},
 };
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
@@ -98,7 +98,7 @@ pub async fn complete_register(
     };
 
     match response.get_data(DataType::IotaId) {
-        DataValue::SignedNumber(id) => *id as u64,
+        Some(DataValue::SignedNumber(id)) => *id as u64,
         _ => 0,
     }
 }

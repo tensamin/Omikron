@@ -8,7 +8,9 @@ use uuid::Uuid;
 use crate::anonymous_clients::anonymous_manager::{self, generate_username};
 use crate::app_state::AppState;
 use crate::calls::call_group::call_invite_secret_from_cv;
-use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
+use crate::rho::connection::{
+    GeneralConnection, MtpReceiver, MtpSender, MtpValueCompat, OptionalDataValueCompat,
+};
 use crate::util::data_type_id;
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_out};
@@ -108,6 +110,12 @@ impl AnonymousClientConnection {
             let _permit = permit;
             log_cv_in!(PrintType::Client, &cv);
 
+            if cv.is_type(CommunicationType::Relay) {
+                self.send_error_response(&cv.get_id(), CommunicationType::ErrorNotAuthenticated)
+                    .await;
+                return;
+            }
+
             if cv.is_type(CommunicationType::Identification) {
                 let call_id = Uuid::parse_str(cv.get_data(DataType::CallId).as_str().unwrap_or(""))
                     .unwrap_or(Uuid::new_v4());
@@ -153,19 +161,31 @@ impl AnonymousClientConnection {
                     let mut json_invitee = Vec::new();
                     let _ = json_invitee.push((
                         DataType::UserId,
-                        call_invitee_cv.get_data(DataType::UserId).clone(),
+                        call_invitee_cv
+                            .get_data(DataType::UserId)
+                            .cloned()
+                            .unwrap_or(DataValue::Null),
                     ));
                     let _ = json_invitee.push((
                         DataType::Username,
-                        call_invitee_cv.get_data(DataType::Username).clone(),
+                        call_invitee_cv
+                            .get_data(DataType::Username)
+                            .cloned()
+                            .unwrap_or(DataValue::Null),
                     ));
                     let _ = json_invitee.push((
                         DataType::Display,
-                        call_invitee_cv.get_data(DataType::Display).clone(),
+                        call_invitee_cv
+                            .get_data(DataType::Display)
+                            .cloned()
+                            .unwrap_or(DataValue::Null),
                     ));
                     let _ = json_invitee.push((
                         DataType::Avatar,
-                        call_invitee_cv.get_data(DataType::Avatar).clone(),
+                        call_invitee_cv
+                            .get_data(DataType::Avatar)
+                            .cloned()
+                            .unwrap_or(DataValue::Null),
                     ));
 
                     let _ = invited.push(DataValue::Container(
@@ -223,9 +243,7 @@ impl AnonymousClientConnection {
 
             // Presence is account-scoped and anonymous sessions have no
             // persisted account preference to change.
-            if cv.is_type(CommunicationType::SetUserState)
-                || cv.is_type(CommunicationType::ClientChanged)
-            {
+            if cv.is_type(CommunicationType::ClientChanged) {
                 self.send_error_response(&cv.get_id(), CommunicationType::ErrorNoUserId)
                     .await;
                 return;
@@ -333,7 +351,7 @@ impl AnonymousClientConnection {
         }
 
         let call_id = match cv.get_data(DataType::CallId) {
-            DataValue::Str(id_str) => match Uuid::parse_str(&id_str.to_string()) {
+            Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(_) => {
                     self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidCallId)
@@ -443,7 +461,7 @@ impl AnonymousClientConnection {
         let user_id = self.get_user_id();
 
         let call_id = match cv.get_data(DataType::CallId) {
-            DataValue::Str(id_str) => match Uuid::parse_str(&id_str.to_string()) {
+            Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(_) => {
                     self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidCallId)

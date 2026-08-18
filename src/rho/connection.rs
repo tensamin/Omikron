@@ -21,6 +21,66 @@ pub type MtpSender = WebMtpSender;
 pub type MtpReceiver = WebMtpReceiver;
 
 /*
+ * MTP 0.3 exposes absent frame fields and data entries as Options. These
+ * adapters keep legacy control handlers explicit while Relay code uses the
+ * native optional accessors directly.
+ */
+pub(crate) trait MtpValueCompat {
+    fn get_id(&self) -> u32;
+    fn get_sender(&self) -> u64;
+    fn get_receiver(&self) -> u64;
+    fn get_data_opt(&self, data_type: DataType) -> Option<&DataValue>;
+}
+
+impl MtpValueCompat for CommunicationValue {
+    fn get_id(&self) -> u32 {
+        self.id().unwrap_or_default()
+    }
+
+    fn get_sender(&self) -> u64 {
+        self.sender().unwrap_or_default()
+    }
+
+    fn get_receiver(&self) -> u64 {
+        self.receiver().unwrap_or_default()
+    }
+
+    fn get_data_opt(&self, data_type: DataType) -> Option<&DataValue> {
+        self.get_data(data_type)
+    }
+}
+
+pub(crate) trait OptionalDataValueCompat {
+    fn as_bool(&self) -> Option<bool>;
+    fn as_number(&self) -> Option<i128>;
+    fn as_signed_number(&self) -> Option<i128>;
+    fn as_str(&self) -> Option<&str>;
+    fn as_bytes(&self) -> Option<Vec<u8>>;
+}
+
+impl OptionalDataValueCompat for Option<&DataValue> {
+    fn as_bool(&self) -> Option<bool> {
+        self.and_then(|value| value.as_bool())
+    }
+
+    fn as_number(&self) -> Option<i128> {
+        self.and_then(|value| value.as_number())
+    }
+
+    fn as_signed_number(&self) -> Option<i128> {
+        self.and_then(|value| value.as_signed_number())
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        self.and_then(|value| value.as_str())
+    }
+
+    fn as_bytes(&self) -> Option<Vec<u8>> {
+        self.and_then(|value| value.as_bytes())
+    }
+}
+
+/*
  * How a connection identified itself during the mtp handshake driven by
  * `server.rs` ("iota" / "client" authenticated logins, "anonymous"
  * unauthenticated). `Phi` (third-party apps) predates that handshake and is
@@ -194,7 +254,7 @@ impl GeneralConnection {
             return None;
         };
 
-        let DataValue::SignedNumber(iota_id) = user_data_cv.get_data(DataType::IotaId) else {
+        let Some(DataValue::SignedNumber(iota_id)) = user_data_cv.get_data(DataType::IotaId) else {
             return None;
         };
         let rho = self
@@ -264,7 +324,7 @@ impl GeneralConnection {
         else {
             return;
         };
-        let DataValue::Array(users) = response.get_data(DataType::UserIds) else {
+        let Some(DataValue::Array(users)) = response.get_data(DataType::UserIds) else {
             return;
         };
         let user_ids = users

@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::{
     calls::{call_util::LiveKitService, caller::Caller, error::CallError},
     omega::omega_connection::OmegaConnection,
+    rho::connection::OptionalDataValueCompat,
     util::data_type_id,
 };
 
@@ -95,7 +96,7 @@ impl CallSecretEnvelope {
 }
 
 pub fn call_invite_secret_from_cv(cv: &CommunicationValue) -> Option<CallSecretEnvelope> {
-    CallSecretEnvelope::from_data_value(cv.get_data(DataType::CallSecret))
+    CallSecretEnvelope::from_data_value(cv.get_data(DataType::CallSecret)?)
 }
 
 impl CallGroup {
@@ -348,8 +349,11 @@ mod tests {
             receiver_secret.clone().to_data_value(),
         );
 
+        let Some(call_secret) = cv.get_data(DataType::CallSecret) else {
+            panic!("call invite did not contain a call secret");
+        };
         assert_eq!(
-            CallSecretEnvelope::from_data_value(cv.get_data(DataType::CallSecret)),
+            CallSecretEnvelope::from_data_value(call_secret),
             Some(receiver_secret)
         );
     }

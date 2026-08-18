@@ -5,7 +5,10 @@ use crate::log_cv_out;
 use crate::log_err;
 use crate::log_in;
 use crate::log_out;
-use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
+use crate::rho::connection::{
+    GeneralConnection, MtpReceiver, MtpSender, MtpValueCompat, OptionalDataValueCompat,
+};
+use crate::rho::relay_router::{self, RelaySource};
 use crate::util::data_type_id;
 use crate::util::logger::PrintType;
 use dashmap::DashMap;
@@ -38,7 +41,7 @@ fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, Vec<i64>)> 
         .as_signed_number()
         .and_then(|id| i64::try_from(id).ok())
         .filter(|id| *id > 0)?;
-    let DataValue::Array(values) = value.get_data(DataType::UserIds) else {
+    let Some(DataValue::Array(values)) = value.get_data(DataType::UserIds) else {
         return None;
     };
 
@@ -76,7 +79,6 @@ pub struct IotaConnection {
     pub waiting_tasks:
         DashMap<u32, Box<dyn Fn(Arc<IotaConnection>, CommunicationValue) -> bool + Send + Sync>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
-    pending_chat_secrets: DashMap<u64, Vec<CommunicationValue>>,
     message_slots: Arc<tokio::sync::Semaphore>,
 }
 
@@ -92,7 +94,6 @@ impl IotaConnection {
             iota_id: iota_id,
             client_version: general.client_version.read().await.clone(),
             waiting_tasks: DashMap::new(),
-            pending_chat_secrets: DashMap::new(),
             message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
         })
     }
@@ -150,10 +151,6 @@ impl IotaConnection {
             let user_ids_i64: Vec<i64> = user_ids.into_iter().map(|u| u as i64).collect();
             rho_conn.set_user_ids(user_ids_i64).await;
         }
-
-        for user_id in self.get_user_ids().await {
-            self.flush_pending_chat_secrets(user_id).await;
-        }
     }
 
     pub async fn add_user_id(&self, user_id: u64) {
@@ -170,31 +167,7 @@ impl IotaConnection {
             if let Some(rho_conn) = self.get_rho_connection().await {
                 rho_conn.add_user_id(user_id as i64).await;
             }
-
-            self.flush_pending_chat_secrets(user_id).await;
         }
-    }
-
-    async fn flush_pending_chat_secrets(&self, user_id: u64) {
-        let Some((_, messages)) = self.pending_chat_secrets.remove(&user_id) else {
-            return;
-        };
-
-        for message in messages {
-            self.send_message(&message).await;
-        }
-    }
-
-    fn store_pending_chat_secret(&self, cv: CommunicationValue) {
-        let receiver_id = cv.get_receiver();
-        if receiver_id == 0 || !cv.is_type(CommunicationType::SetChatSecret) {
-            return;
-        }
-
-        self.pending_chat_secrets
-            .entry(receiver_id)
-            .or_default()
-            .push(cv);
     }
 
     /// Set the RhoConnection reference
@@ -249,12 +222,58 @@ impl IotaConnection {
         }
     }
 
+    pub async fn send_relay(&self, cv: &CommunicationValue) -> Result<(), String> {
+        self.sender
+            .send(cv)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     /// Handle incoming message from Iota
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
         let Ok(permit) = self.message_slots.clone().acquire_owned().await else {
             return;
         };
         let _permit = permit;
+        if cv.is_type(CommunicationType::Relay) {
+            let cv = relay_router::ensure_relay_frame_id(cv);
+            let request_id = cv.get_id();
+            let next_hop = cv.receiver().unwrap_or_default();
+            let response = match relay_router::route_relay(
+                &self.state,
+                RelaySource::Iota {
+                    iota_id: self.iota_id,
+                },
+                cv,
+            )
+            .await
+            {
+                Ok(()) => CommunicationValue::new(CommunicationType::Success).with_id(request_id),
+                Err(error) => {
+                    log_err!(
+                        self.iota_id as i64,
+                        PrintType::Iota,
+                        "Relay routing failed for destination {}: {}",
+                        next_hop,
+                        error
+                    );
+                    CommunicationValue::new(relay_router::error_response_type(&error))
+                        .with_id(request_id)
+                }
+            };
+            self.send_message(&response).await;
+            return;
+        }
+
+        if matches!(
+            crate::rho::relay_router::message_security_class(&cv),
+            crate::rho::relay_router::MessageSecurityClass::RelayOnly
+        ) {
+            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData, None)
+                .await;
+            return;
+        }
+
         let msg_id = cv.get_id();
         if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
             if (task)(self.clone(), cv.clone()) {
@@ -301,16 +320,6 @@ impl IotaConnection {
         // Handle GET_CHATS
         if cv.is_type(CommunicationType::GetChats) {
             self.handle_get_chats(cv).await;
-            return;
-        }
-
-        // Handle forwarding to other Iotas or clients
-        let receiver_id = cv.get_receiver();
-        if (receiver_id != 0 && !self.get_user_ids().await.contains(&(receiver_id as u64)))
-            || cv.is_type(CommunicationType::MessageOtherIota)
-            || cv.is_type(CommunicationType::SendChat)
-        {
-            self.handle_forward_message(cv).await;
             return;
         }
 
@@ -462,7 +471,14 @@ impl IotaConnection {
             self.handle_omega_forward_without_sender(cv).await;
             return;
         }
-        self.forward_to_client(cv).await;
+        log_err!(
+            self.iota_id as i64,
+            PrintType::Iota,
+            "Rejected unsupported communication type {}",
+            cv.get_type()
+        );
+        self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData, None)
+            .await;
     }
 
     #[allow(dead_code)]
@@ -542,63 +558,6 @@ impl IotaConnection {
             }
         }
     }
-    /// Handle message forwarding to other Iotas
-    async fn handle_forward_message(&self, cv: CommunicationValue) {
-        let receiver_id = cv.get_receiver();
-        let sender_id = cv.get_sender();
-        let my_user_ids = self.get_user_ids().await;
-
-        log_in!(
-            self.iota_id as i64,
-            PrintType::Iota,
-            "Authority check: sender_id={} receiver_id={} iota_user_ids={:?} msg_type={:?} msg_id={}",
-            sender_id,
-            receiver_id,
-            my_user_ids,
-            cv.get_type(),
-            cv.get_id()
-        );
-
-        if my_user_ids.contains(&(sender_id as u64)) {
-            if let Some(target_rho) = self.state.rho.get_for_user(receiver_id as i64).await {
-                target_rho.message_to_iota(cv).await;
-            } else {
-                if cv.is_type(CommunicationType::SetChatSecret) {
-                    self.store_pending_chat_secret(cv.clone());
-                    let success = CommunicationValue::new(CommunicationType::Success)
-                        .with_id(cv.get_id())
-                        .with_sender(cv.get_sender())
-                        .with_receiver(cv.get_sender());
-                    self.send_message(&success).await;
-                    return;
-                }
-
-                let error = CommunicationValue::new(CommunicationType::ErrorNoIota)
-                    .with_id(cv.get_id())
-                    .with_sender(cv.get_sender());
-                self.send_message(&error).await;
-            }
-        } else {
-            log_err!(
-                self.iota_id as i64,
-                PrintType::Iota,
-                "Rejected client->iota forward: sender_id={} is not authorized for this iota. Known users={:?}",
-                sender_id,
-                my_user_ids
-            );
-
-            self.send_message(
-                &CommunicationValue::new(CommunicationType::ErrorInvalidUserId).add_typed_default(
-                    DataType::ErrorType,
-                    DataValue::Str(
-                        "You are sending to another User without authority.".to_string(),
-                    ),
-                ),
-            )
-            .await;
-        }
-    }
-
     /// Handle GET_CHATS message
     async fn handle_get_chats(&self, cv: CommunicationValue) {
         let user_id = cv.get_sender();
@@ -633,7 +592,7 @@ impl IotaConnection {
 
         // Presence interest is the complete contact set, independent of
         // whether this account currently participates in a call.
-        if let DataValue::Array(users) = cv.get_data(DataType::UserIds) {
+        if let Some(DataValue::Array(users)) = cv.get_data(DataType::UserIds) {
             for user in users {
                 match user {
                     DataValue::SignedNumber(id) => interested_ids.push(*id as i64),
@@ -733,13 +692,13 @@ impl IotaConnection {
         // ============================
         let enriched_contacts = if empty {
             match cv.get_data(DataType::UserIds) {
-                DataValue::Array(arr) => DataValue::Array(arr.clone()),
+                Some(DataValue::Array(arr)) => DataValue::Array(arr.clone()),
                 _ => DataValue::Array(vec![]),
             }
         } else {
             let mut enriched: Vec<DataValue> = Vec::new();
 
-            if let DataValue::Array(users) = cv.get_data(DataType::UserIds) {
+            if let Some(DataValue::Array(users)) = cv.get_data(DataType::UserIds) {
                 for user_val in users {
                     if let DataValue::Container(entries) = user_val {
                         let mut user_map: BTreeMap<DataTypeId, DataValue> =
@@ -806,7 +765,8 @@ impl IotaConnection {
         let mut output = response.clone();
         let user_id = response.get_receiver();
 
-        for (key, value) in response.iter_typed_data() {
+        let typed_data: Vec<_> = response.iter_typed_data().collect();
+        for (key, value) in typed_data {
             if key == Some(DataType::Contacts) {
                 if let Some(contacts) = value.as_array() {
                     let (contacts, global_calls) = self

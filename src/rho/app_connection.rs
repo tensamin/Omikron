@@ -1,9 +1,12 @@
 use crate::anonymous_clients::anonymous_manager;
 use crate::app_state::AppState;
-use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
+use crate::rho::connection::{
+    GeneralConnection, MtpReceiver, MtpSender, MtpValueCompat, OptionalDataValueCompat,
+};
+use crate::rho::relay_router::{self, RelaySource};
 use crate::rho::rho_connection::RhoConnection;
 use crate::util::logger::PrintType;
-use crate::{log_cv_in, log_cv_out, log_err, log_in, log_out};
+use crate::{log_cv_in, log_cv_out, log_err, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,6 +91,59 @@ impl AppConnection {
         tokio::spawn(async move {
             log_cv_in!(PrintType::App, cv);
 
+            if cv.is_type(CommunicationType::Relay) {
+                let cv = relay_router::ensure_relay_frame_id(cv);
+                let request_id = cv.get_id();
+                let next_hop = cv.receiver().unwrap_or_default();
+                let result = match self.get_rho_connection().await {
+                    Some(rho) => {
+                        relay_router::route_relay(
+                            &self.state,
+                            RelaySource::Client {
+                                iota_id: rho.get_iota_id().await,
+                            },
+                            cv,
+                        )
+                        .await
+                    }
+                    None => Err(relay_router::RelayRouteError::DestinationIotaNotLocal),
+                };
+                let response = match result {
+                    Ok(()) => {
+                        CommunicationValue::new(CommunicationType::Success).with_id(request_id)
+                    }
+                    Err(error) => {
+                        log_err!(
+                            self.user_id as i64,
+                            PrintType::App,
+                            "Relay routing failed for destination Iota {}: {}",
+                            next_hop,
+                            error
+                        );
+                        CommunicationValue::new(relay_router::error_response_type(&error))
+                            .with_id(request_id)
+                    }
+                };
+                self.send_message(&response).await;
+                return;
+            }
+
+            if cv.is_type(CommunicationType::Success) {
+                if let Some(rho) = self.get_rho_connection().await {
+                    rho.forward_relay_ack(self.user_id, cv.get_id()).await;
+                }
+                return;
+            }
+
+            if matches!(
+                relay_router::message_security_class(&cv),
+                relay_router::MessageSecurityClass::RelayOnly
+            ) {
+                self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData)
+                    .await;
+                return;
+            }
+
             if cv.is_type(CommunicationType::GetUserData) {
                 if let Some(anonymous) = {
                     if let Some(user_id) = cv.get_data(DataType::UserId).as_number() {
@@ -135,8 +191,14 @@ impl AppConnection {
                     .await;
                 return;
             }
-            // Forward other messages to Iota
-            self.forward_to_iota(cv).await;
+            log_err!(
+                self.user_id as i64,
+                PrintType::App,
+                "Rejected unsupported communication type {}",
+                cv.get_type()
+            );
+            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData)
+                .await;
         });
     }
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
@@ -152,123 +214,6 @@ impl AppConnection {
                 app_for_closure.send_message(&response_cv).await;
             }
         });
-    }
-
-    /// Forward message to Iota
-    async fn forward_to_iota(self: Arc<Self>, cv: CommunicationValue) {
-        let sender_user_id = self.get_user_id().await;
-        let msg_id = cv.get_id();
-        let msg_type = cv.get_type();
-
-        log_in!(
-            sender_user_id as i64,
-            PrintType::App,
-            "Forwarding app->iota: sender={} type={:?} id={} receiver={}",
-            sender_user_id,
-            msg_type,
-            msg_id,
-            cv.get_receiver()
-        );
-
-        if cv.is_type(CommunicationType::AddConversation)
-            && cv.get_data(DataType::ChatPartnerId).as_number().is_none()
-        {
-            let chat_partner_name = cv
-                .get_data(DataType::ChatPartnerName)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-
-            if anonymous_manager::get_anonymous_user_by_name(chat_partner_name.to_string())
-                .await
-                .is_some()
-            {
-                self.send_error_response(cv.get_id(), CommunicationType::ErrorAnonymous)
-                    .await;
-                return;
-            }
-
-            let load_uuid_response = self
-                .state
-                .omega
-                .clone()
-                .await_response(
-                    &CommunicationValue::new(CommunicationType::GetUserData)
-                        .with_id(cv.clone().get_id())
-                        .add_typed_default(
-                            DataType::Username,
-                            DataValue::Str(chat_partner_name.clone()),
-                        ),
-                    Some(Duration::from_secs(20)),
-                )
-                .await;
-            let chat_partner_id = {
-                if let Ok(load_uuid_response) = load_uuid_response {
-                    load_uuid_response.get_data(DataType::UserId).clone()
-                } else {
-                    DataValue::Null
-                }
-            };
-
-            if let Some(rho_conn) = self.get_rho_connection().await {
-                let iota_id = rho_conn.get_iota_id().await;
-                log_in!(
-                    sender_user_id as i64,
-                    PrintType::App,
-                    "Resolved rho for add_conversation: sender={} -> iota_id={} id={}",
-                    sender_user_id,
-                    iota_id,
-                    msg_id
-                );
-
-                let updated_cv = cv
-                    .with_sender(sender_user_id as u64)
-                    .add_typed_default(DataType::ChatPartnerId, chat_partner_id);
-                rho_conn.message_to_iota(updated_cv).await;
-            } else {
-                log_err!(
-                    sender_user_id as i64,
-                    PrintType::App,
-                    "No rho/iota mapping found for add_conversation sender={} type={:?} id={}",
-                    sender_user_id,
-                    msg_type,
-                    msg_id
-                );
-            }
-            return;
-        }
-
-        if let Some(rho_conn) = self.get_rho_connection().await {
-            let iota_id = rho_conn.get_iota_id().await;
-            log_in!(
-                sender_user_id as i64,
-                PrintType::App,
-                "Resolved rho for forward: sender={} -> iota_id={} type={:?} id={}",
-                sender_user_id,
-                iota_id,
-                msg_type,
-                msg_id
-            );
-
-            let updated_cv = cv.with_sender(sender_user_id as u64);
-            rho_conn.message_to_iota(updated_cv).await;
-        } else {
-            log_err!(
-                sender_user_id as i64,
-                PrintType::App,
-                "No rho/iota mapping found for sender={} type={:?} id={}",
-                sender_user_id,
-                msg_type,
-                msg_id
-            );
-            let error_cv = CommunicationValue::new(CommunicationType::ErrorNoIota)
-                .with_id(msg_id)
-                .add_typed_default(
-                    DataType::UserId,
-                    DataValue::SignedNumber(sender_user_id.into()),
-                );
-            self.send_message(&error_cv).await;
-        }
     }
 
     /// Send error response

@@ -7,7 +7,9 @@ use std::{
 };
 
 use ansi_term::Color;
-use mtp::codec::{CommunicationValue, DataTypeId, DataValue, Version};
+use mtp::codec::{CommunicationType, CommunicationValue, DataTypeId, DataValue, Version};
+
+use crate::rho::connection::MtpValueCompat;
 
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 
@@ -179,11 +181,16 @@ pub fn format_cv(cv: &CommunicationValue) -> String {
         .unwrap_or_else(|| cv.get_type().to_string());
     parts.push(format!("{} (id={})", comm_type, cv.get_id()));
 
-    let data = cv.data();
+    if cv.is_type(CommunicationType::Relay) {
+        parts.push("<opaque relay payload>".to_string());
+        return parts.join(": ");
+    }
+
+    let data = cv.data().unwrap_or(&[]);
 
     let formated_data = format_data_container(
         data.iter().map(|(k, v)| (*k, v.clone())).collect(),
-        Version(1, 0),
+        Version(3, 0),
     );
 
     parts.push(format!("{}", formated_data));

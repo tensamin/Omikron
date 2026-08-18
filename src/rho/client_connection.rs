@@ -2,10 +2,13 @@ use crate::anonymous_clients::anonymous_manager;
 use crate::app_state::AppState;
 use crate::calls::call_group::call_invite_secret_from_cv;
 use crate::data::user::UserStatus;
-use crate::rho::connection::{GeneralConnection, MtpReceiver, MtpSender};
+use crate::rho::connection::{
+    GeneralConnection, MtpReceiver, MtpSender, MtpValueCompat, OptionalDataValueCompat,
+};
+use crate::rho::relay_router::{self, RelaySource};
 use crate::rho::rho_connection::RhoConnection;
 use crate::util::logger::PrintType;
-use crate::{log_cv_in, log_cv_out, log_err, log_in, log_out};
+use crate::{log_cv_in, log_cv_out, log_err, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -97,6 +100,16 @@ impl ClientConnection {
         let _ = self.sender.send(&cv).await;
     }
 
+    pub async fn send_relay(&self, cv: &CommunicationValue) -> Result<(), String> {
+        if !*self.is_open.read().await {
+            return Err("client connection is closed".to_string());
+        }
+        self.sender
+            .send(cv)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     /// Handle incoming message from client
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
         let Ok(permit) = self.message_slots.clone().acquire_owned().await else {
@@ -108,8 +121,56 @@ impl ClientConnection {
 
             let mut cv = cv;
 
-            if cv.is_type(CommunicationType::SetUserState) {
-                self.handle_set_user_state(cv).await;
+            if cv.is_type(CommunicationType::Relay) {
+                cv = relay_router::ensure_relay_frame_id(cv);
+                let request_id = cv.get_id();
+                let next_hop = cv.receiver().unwrap_or_default();
+                let result = match self.get_rho_connection().await {
+                    Some(rho) => {
+                        relay_router::route_relay(
+                            &self.state,
+                            RelaySource::Client {
+                                iota_id: rho.get_iota_id().await,
+                            },
+                            cv,
+                        )
+                        .await
+                    }
+                    None => Err(relay_router::RelayRouteError::DestinationIotaNotLocal),
+                };
+                let response = match result {
+                    Ok(()) => {
+                        CommunicationValue::new(CommunicationType::Success).with_id(request_id)
+                    }
+                    Err(error) => {
+                        log_err!(
+                            self.user_id as i64,
+                            PrintType::Client,
+                            "Relay routing failed for destination Iota {}: {}",
+                            next_hop,
+                            error
+                        );
+                        CommunicationValue::new(relay_router::error_response_type(&error))
+                            .with_id(request_id)
+                    }
+                };
+                self.send_message(&response).await;
+                return;
+            }
+
+            if cv.is_type(CommunicationType::Success) {
+                if let Some(rho) = self.get_rho_connection().await {
+                    rho.forward_relay_ack(self.user_id, cv.get_id()).await;
+                }
+                return;
+            }
+
+            if matches!(
+                relay_router::message_security_class(&cv),
+                relay_router::MessageSecurityClass::RelayOnly
+            ) {
+                self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData)
+                    .await;
                 return;
             }
 
@@ -120,11 +181,13 @@ impl ClientConnection {
                 && cv.get_data_opt(DataType::UserState).is_some()
             {
                 self.handle_set_user_state(
-                    CommunicationValue::new(CommunicationType::SetUserState)
+                    CommunicationValue::new(CommunicationType::ClientChanged)
                         .with_id(cv.get_id())
                         .add_typed_default(
                             DataType::UserState,
-                            cv.get_data(DataType::UserState).clone(),
+                            cv.get_data(DataType::UserState)
+                                .cloned()
+                                .unwrap_or(DataValue::Null),
                         ),
                 )
                 .await;
@@ -216,10 +279,12 @@ impl ClientConnection {
                     && cv.get_data_opt(DataType::OnlineStatus).is_some()
                 {
                     let mut profile_request = cv.clone();
-                    let preference = profile_request.remove_data(DataType::OnlineStatus);
-                    let state_request = CommunicationValue::new(CommunicationType::SetUserState)
+                    let preference = profile_request
+                        .remove_data(DataType::OnlineStatus)
+                        .unwrap_or(DataValue::Null);
+                    let state_request = CommunicationValue::new(CommunicationType::ClientChanged)
                         .with_id(cv.get_id())
-                        .add_typed_default(DataType::UserState, preference.unwrap());
+                        .add_typed_default(DataType::UserState, preference);
                     let state_response = match self.request_set_user_state(state_request).await {
                         Ok(response) => response,
                         Err(error_type) => {
@@ -346,8 +411,14 @@ impl ClientConnection {
                 );
             }
 
-            // Forward other messages to Iota
-            self.forward_to_iota(cv).await;
+            log_err!(
+                self.user_id as i64,
+                PrintType::Client,
+                "Rejected unsupported communication type {}",
+                cv.get_type()
+            );
+            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData)
+                .await;
         });
     }
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
@@ -384,52 +455,25 @@ impl ClientConnection {
         else {
             return Err(CommunicationType::ErrorInvalidData);
         };
-        let Some(rho) = self.get_rho_connection().await else {
+        let Some(_rho) = self.get_rho_connection().await else {
             return Err(CommunicationType::ErrorNoIota);
         };
-        let request = if self.state.omega.supports_set_user_state().await {
-            CommunicationValue::new(CommunicationType::SetUserState)
-                .with_id(cv.get_id())
-                .with_sender(self.user_id)
-                .add_typed_default(
-                    DataType::UserId,
-                    DataValue::SignedNumber(self.user_id as i128),
-                )
-                .add_typed_default(
-                    DataType::SessionId,
-                    DataValue::SignedNumber(self.session_id as i128),
-                )
-                .add_typed_default(
-                    DataType::IotaId,
-                    DataValue::SignedNumber(rho.get_iota_id().await as i128),
-                )
-                .add_typed_default(DataType::UserState, DataValue::Str(state.to_string()))
-        } else {
-            // Legacy Omega accepts the original ClientChanged request. It is
-            // intentionally limited to the authenticated user's ID and a
-            // writable preference, with no derived connectivity state.
-            CommunicationValue::new(CommunicationType::ClientChanged)
-                .with_id(cv.get_id())
-                .with_sender(self.user_id)
-                .add_typed_default(
-                    DataType::UserId,
-                    DataValue::SignedNumber(self.user_id as i128),
-                )
-                .add_typed_default(DataType::UserState, DataValue::Str(state.to_string()))
-        };
-        if !self.state.omega.supports_set_user_state().await {
-            self.state
-                .omega
-                .send_message_result(&request)
-                .await
-                .map_err(|_| CommunicationType::ErrorInternal)?;
-            return Ok(CommunicationValue::new(CommunicationType::Success)
-                .with_id(cv.get_id())
-                .add_typed_default(DataType::UserState, DataValue::Str(state.to_string())));
-        }
-        self.await_omega_response(request)
+        let request = CommunicationValue::new(CommunicationType::ClientChanged)
+            .with_id(cv.get_id())
+            .with_sender(self.user_id)
+            .add_typed_default(
+                DataType::UserId,
+                DataValue::SignedNumber(self.user_id as i128),
+            )
+            .add_typed_default(DataType::UserState, DataValue::Str(state.to_string()));
+        self.state
+            .omega
+            .send_message_result(&request)
             .await
-            .map_err(|_| CommunicationType::ErrorInternal)
+            .map_err(|_| CommunicationType::ErrorInternal)?;
+        return Ok(CommunicationValue::new(CommunicationType::Success)
+            .with_id(cv.get_id())
+            .add_typed_default(DataType::UserState, DataValue::Str(state.to_string())));
     }
 
     async fn handle_set_user_state(self: Arc<Self>, cv: CommunicationValue) {
@@ -449,7 +493,7 @@ impl ClientConnection {
         }
 
         let call_id = match cv.get_data(DataType::CallId) {
-            DataValue::Str(id_str) => match Uuid::parse_str(id_str.as_str()) {
+            Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(_) => {
                     self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidCallId)
@@ -559,7 +603,7 @@ impl ClientConnection {
         let user_id = self.get_user_id().await;
 
         let call_id = match cv.get_data(DataType::CallId) {
-            DataValue::Str(id_str) => match Uuid::parse_str(id_str.as_str()) {
+            Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(_) => {
                     self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidCallId)
@@ -600,7 +644,7 @@ impl ClientConnection {
         let user_id = self.get_user_id().await;
 
         let call_id = match cv.get_data(DataType::CallId) {
-            DataValue::Str(id_str) => match Uuid::parse_str(id_str.as_str()) {
+            Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(_) => {
                     self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidCallId)
@@ -750,7 +794,10 @@ impl ClientConnection {
             let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
                 Ok(r) => r,
                 Err(_) => {
-                    let path_data = cv.get_data(DataType::Path).clone();
+                    let path_data = cv
+                        .get_data(DataType::Path)
+                        .cloned()
+                        .unwrap_or(DataValue::Null);
                     let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
                         .with_id(cv.get_id())
                         .add_typed_default(DataType::Path, path_data);
@@ -786,14 +833,20 @@ impl ClientConnection {
                         return;
                     }
 
-                    let path_data = cv.get_data(DataType::Path).clone();
+                    let path_data = cv
+                        .get_data(DataType::Path)
+                        .cloned()
+                        .unwrap_or(DataValue::Null);
                     let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
                         .with_id(cv.get_id())
                         .add_typed_default(DataType::Path, path_data);
                     self.send_message(&error_cv).await;
                 }
                 Err(_) => {
-                    let path_data = cv.get_data(DataType::Path).clone();
+                    let path_data = cv
+                        .get_data(DataType::Path)
+                        .cloned()
+                        .unwrap_or(DataValue::Null);
                     let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
                         .with_id(cv.get_id())
                         .add_typed_default(DataType::Path, path_data);
@@ -804,131 +857,14 @@ impl ClientConnection {
             return;
         }
 
-        let path_data = cv.get_data(DataType::Path).clone();
+        let path_data = cv
+            .get_data(DataType::Path)
+            .cloned()
+            .unwrap_or(DataValue::Null);
         let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
             .with_id(cv.get_id())
             .add_typed_default(DataType::Path, path_data);
         self.send_message(&error_cv).await;
-    }
-
-    /// Forward message to Iota
-    async fn forward_to_iota(self: Arc<Self>, cv: CommunicationValue) {
-        let sender_user_id = self.get_user_id().await;
-        let msg_id = cv.get_id();
-        let msg_type = cv.get_type();
-
-        log_in!(
-            sender_user_id as i64,
-            PrintType::Client,
-            "Forwarding client->iota: sender={} type={:?} id={} receiver={}",
-            sender_user_id,
-            msg_type,
-            msg_id,
-            cv.get_receiver()
-        );
-
-        if cv.is_type(CommunicationType::AddConversation)
-            && cv
-                .get_data(DataType::ChatPartnerId)
-                .as_signed_number()
-                .is_none()
-        {
-            let chat_partner_name = cv
-                .get_data(DataType::ChatPartnerName)
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-
-            if anonymous_manager::get_anonymous_user_by_name(chat_partner_name.to_string())
-                .await
-                .is_some()
-            {
-                self.send_error_response(cv.get_id(), CommunicationType::ErrorAnonymous)
-                    .await;
-                return;
-            }
-
-            let load_uuid_response = self
-                .state
-                .omega
-                .clone()
-                .await_response(
-                    &CommunicationValue::new(CommunicationType::GetUserData)
-                        .with_id(cv.clone().get_id())
-                        .add_typed_default(
-                            DataType::Username,
-                            DataValue::Str(chat_partner_name.clone()),
-                        ),
-                    Some(Duration::from_secs(20)),
-                )
-                .await;
-            let chat_partner_id = {
-                if let Ok(load_uuid_response) = load_uuid_response {
-                    load_uuid_response.get_data(DataType::UserId).clone()
-                } else {
-                    DataValue::Null
-                }
-            };
-
-            if let Some(rho_conn) = self.get_rho_connection().await {
-                let iota_id = rho_conn.get_iota_id().await;
-                log_in!(
-                    sender_user_id as i64,
-                    PrintType::Client,
-                    "Resolved rho for add_conversation: sender={} -> iota_id={} id={}",
-                    sender_user_id,
-                    iota_id,
-                    msg_id
-                );
-
-                let updated_cv = cv
-                    .with_sender(sender_user_id as u64)
-                    .add_typed_default(DataType::ChatPartnerId, chat_partner_id);
-                rho_conn.message_to_iota(updated_cv).await;
-            } else {
-                log_err!(
-                    sender_user_id as i64,
-                    PrintType::Client,
-                    "No rho/iota mapping found for add_conversation sender={} type={:?} id={}",
-                    sender_user_id,
-                    msg_type,
-                    msg_id
-                );
-            }
-            return;
-        }
-
-        if let Some(rho_conn) = self.get_rho_connection().await {
-            let iota_id = rho_conn.get_iota_id().await;
-            log_in!(
-                sender_user_id as i64,
-                PrintType::Client,
-                "Resolved rho for forward: sender={} -> iota_id={} type={:?} id={}",
-                sender_user_id,
-                iota_id,
-                msg_type,
-                msg_id
-            );
-
-            let updated_cv = cv.with_sender(sender_user_id as u64);
-            rho_conn.message_to_iota(updated_cv).await;
-        } else {
-            log_err!(
-                sender_user_id as i64,
-                PrintType::Client,
-                "No rho/iota mapping found for sender={} type={:?} id={}",
-                sender_user_id,
-                msg_type,
-                msg_id
-            );
-            let error_cv = CommunicationValue::new(CommunicationType::ErrorNoIota)
-                .with_id(msg_id)
-                .add_typed_default(
-                    DataType::UserId,
-                    DataValue::SignedNumber(sender_user_id.into()),
-                );
-            self.send_message(&error_cv).await;
-        }
     }
 
     /// Send error response
