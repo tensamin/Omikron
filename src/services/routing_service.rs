@@ -4,10 +4,12 @@ use mtp::codec::CommunicationValue;
 
 use crate::{app_state::AppState, rho::rho_connection::RhoConnection};
 
+#[allow(dead_code)]
 pub struct RoutingService {
     state: Arc<AppState>,
 }
 
+#[allow(dead_code)]
 impl RoutingService {
     pub fn new(state: Arc<AppState>) -> Self {
         Self { state }

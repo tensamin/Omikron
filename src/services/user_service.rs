@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use crate::{app_state::AppState, rho::rho_connection::RhoConnection};
 
+#[allow(dead_code)]
 pub struct UserService {
     state: Arc<AppState>,
 }
 
+#[allow(dead_code)]
 impl UserService {
     pub fn new(state: Arc<AppState>) -> Self {
         Self { state }

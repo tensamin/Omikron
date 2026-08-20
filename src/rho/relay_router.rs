@@ -26,6 +26,7 @@ pub enum RouteTarget {
 }
 
 impl RouteTarget {
+    #[allow(dead_code)]
     pub fn wire_id(self) -> Option<u64> {
         let (kind, id) = match self {
             Self::User(id) => (USER_TARGET_KIND, id),
@@ -251,7 +252,7 @@ fn route_response(response: CommunicationValue) -> Result<(), RelayRouteError> {
 }
 
 pub fn ensure_relay_frame_id(frame: CommunicationValue) -> CommunicationValue {
-    if frame.id().is_some_and(|id| id != 0) {
+    if frame.id().is_some() {
         return frame;
     }
     let id = NEXT_RELAY_FRAME_ID.fetch_add(1, Ordering::Relaxed).max(1);

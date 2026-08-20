@@ -15,6 +15,7 @@ use crate::{
 pub struct CallGroup {
     pub call_id: Uuid,
     pub members: RwLock<Vec<Arc<Caller>>>,
+    #[allow(dead_code)]
     pub show: RwLock<bool>,
     pub anonymous_joining: RwLock<bool>,
     pub short_link: RwLock<Option<String>>,
@@ -100,6 +101,7 @@ pub fn call_invite_secret_from_cv(cv: &CommunicationValue) -> Option<CallSecretE
 }
 
 impl CallGroup {
+    #[allow(dead_code)]
     pub fn new(call_id: Uuid, user: Arc<Caller>) -> Self {
         Self::new_with_service(call_id, user, Arc::new(LiveKitService::new(None)))
     }

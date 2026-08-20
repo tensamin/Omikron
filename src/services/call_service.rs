@@ -7,10 +7,12 @@ use crate::{
     calls::{call_group::CallGroup, error::CallError},
 };
 
+#[allow(dead_code)]
 pub struct CallService {
     state: Arc<AppState>,
 }
 
+#[allow(dead_code)]
 impl CallService {
     pub fn new(state: Arc<AppState>) -> Self {
         Self { state }

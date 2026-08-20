@@ -7,6 +7,9 @@ const DEFAULT_OMEGA_HOST: &str = "tensamin.net";
 const DEFAULT_OMEGA_PORT: u16 = 9187;
 const DEFAULT_OMEGA_SYNC_TIMEOUT_SECONDS: u64 = 20;
 const DEFAULT_OMEGA_SYNC_RETRIES: u32 = 3;
+const DEFAULT_RHO_MAX_CONNECTIONS: usize = 256;
+const DEFAULT_RHO_MAX_ANONYMOUS_CONNECTIONS: usize = 128;
+const DEFAULT_RHO_MAX_ANONYMOUS_CONNECTIONS_PER_IP: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveKitConfig {
@@ -26,6 +29,12 @@ pub struct Config {
     /// Number of synchronization requests before the transport is closed and
     /// the normal reconnect loop starts.
     pub omega_sync_retries: u32,
+    /// Maximum number of application sessions accepted by the Rho listener.
+    pub rho_max_connections: usize,
+    /// Maximum number of anonymous application sessions.
+    pub rho_max_anonymous_connections: usize,
+    /// Maximum number of anonymous sessions from one peer IP address.
+    pub rho_max_anonymous_connections_per_ip: usize,
     pub livekit: Option<LiveKitConfig>,
 }
 
@@ -54,6 +63,16 @@ impl Config {
         )?);
         let omega_sync_retries =
             parse_or_default("OMEGA_SYNC_RETRIES", DEFAULT_OMEGA_SYNC_RETRIES)?.max(1);
+        let rho_max_connections =
+            parse_positive_or_default("RHO_MAX_CONNECTIONS", DEFAULT_RHO_MAX_CONNECTIONS)?;
+        let rho_max_anonymous_connections = parse_positive_or_default(
+            "RHO_MAX_ANONYMOUS_CONNECTIONS",
+            DEFAULT_RHO_MAX_ANONYMOUS_CONNECTIONS,
+        )?;
+        let rho_max_anonymous_connections_per_ip = parse_positive_or_default(
+            "RHO_MAX_ANONYMOUS_CONNECTIONS_PER_IP",
+            DEFAULT_RHO_MAX_ANONYMOUS_CONNECTIONS_PER_IP,
+        )?;
         let omega_host = env::var("OMEGA_HOST")
             .unwrap_or_else(|_| DEFAULT_OMEGA_HOST.to_string())
             .trim()
@@ -73,9 +92,23 @@ impl Config {
             omikron_id,
             omega_sync_timeout,
             omega_sync_retries,
+            rho_max_connections,
+            rho_max_anonymous_connections,
+            rho_max_anonymous_connections_per_ip,
             livekit: livekit_from_environment()?,
         })
     }
+}
+
+fn parse_positive_or_default(name: &'static str, default: usize) -> Result<usize, ConfigError> {
+    let value = parse_or_default(name, default)?;
+    if value == 0 {
+        return Err(ConfigError::InvalidValue {
+            name,
+            kind: "positive number",
+        });
+    }
+    Ok(value)
 }
 
 fn parse_or_default<T>(name: &'static str, default: T) -> Result<T, ConfigError>

@@ -39,6 +39,7 @@ impl Caller {
     pub async fn set_timeout(&self, timeout: i64) {
         *self.timeout.write().await = timeout;
     }
+    #[allow(dead_code)]
     pub fn create_token(&self, livekit: &LiveKitService) -> Result<String, CallError> {
         livekit.create_token(self.user_id, self.call_id, self.has_admin())
     }

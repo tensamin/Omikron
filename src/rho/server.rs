@@ -9,13 +9,34 @@ use crate::{
     app_state::AppState,
     log, log_err,
     omega::omega_connection::OmegaConnection,
-    rho::connection::{GeneralConnection, OptionalDataValueCompat},
+    rho::connection::{ConnectionKind, GeneralConnection, OptionalDataValueCompat},
     util::{file_util::load_file_vec, logger::PrintType},
 };
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::PublicKeyBundle;
 use mtp::host::{AuthenticationPolicy, HostConfig, Policy, SendMode};
 use mtp::webserver::{MTPWebServer, WebServerConfig};
+
+fn web_config(max_connections: usize) -> Result<WebServerConfig, mtp::webserver::RouterError> {
+    WebServerConfig::new()
+        .max_connections(max_connections)
+        .route("/", |_request, response| async move { response.body("OK") })
+}
+
+fn rho_policy() -> Policy {
+    Policy::default()
+        .with_send_mode(SendMode::SingleStreamPerMessage)
+        .with_timeouts(
+            Duration::from_millis(2_000),
+            Duration::from_millis(2_000),
+            Duration::from_millis(30_000),
+        )
+        .with_keep_alive(Some(Duration::from_secs(6)))
+        .with_max_idle_timeout(Some(Duration::from_secs(30)))
+        .with_receiver_queue_capacity(1000)
+        .with_max_concurrent_stream_tasks(10)
+        .with_persistent_stream_retries(5, Duration::from_secs(5))
+}
 
 /*
  * Resolves the PublicKeyBundle mtp needs to verify a login's signed
@@ -75,10 +96,23 @@ pub async fn complete_register(
     }
     println!("Iota connection request");
 
+    let pub_key_bytes = match pub_key.try_as_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log_err!(
+                0,
+                PrintType::General,
+                "Failed to serialize Iota public key: {}",
+                error
+            );
+            return 0;
+        }
+    };
+
     let request = CommunicationValue::new(CommunicationType::CompleteRegisterIota)
         .add_typed_default(
             DataType::PublicKey,
-            DataValue::Str(BASE64_STD.encode(pub_key.as_bytes())),
+            DataValue::Str(BASE64_STD.encode(pub_key_bytes)),
         );
 
     let response = match omega
@@ -114,21 +148,7 @@ pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
         cert_pem,
         key_pem,
     )
-    .with_policy(
-        Policy::default()
-            .with_send_mode(SendMode::SingleStreamPerMessage)
-            .with_max_message_size(1_000_000_000)
-            .with_timeouts(
-                Duration::from_millis(2_000),
-                Duration::from_millis(2_000),
-                Duration::from_millis(30_000),
-            )
-            .with_keep_alive(Some(Duration::from_secs(6)))
-            .with_max_idle_timeout(None)
-            .with_receiver_queue_capacity(1000)
-            .with_max_concurrent_stream_tasks(10)
-            .with_persistent_stream_retries(5, Duration::from_secs(5)),
-    )
+    .with_policy(rho_policy())
     .with_authentication(
         state
             .keyring_for_host()
@@ -148,8 +168,7 @@ pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
     )
     .with_authentication_policy(AuthenticationPolicy::AllowAuthentication);
 
-    let web_config = WebServerConfig::new()
-        .route("/", |_request, response| async move { response.body("OK") })?;
+    let web_config = web_config(state.config.rho_max_connections)?;
     let mut host = MTPWebServer::new(host_config, web_config).await?;
     log!(
         0,
@@ -176,9 +195,21 @@ pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
             }
         };
 
+        let global_permit = match state.rho_connection_limits.all.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                log_err!(
+                    0,
+                    PrintType::General,
+                    "Rejected connection: global Rho connection limit reached"
+                );
+                continue;
+            }
+        };
+        let peer_ip = conn.remote_addr.map(|address| address.ip());
         let state = state.clone();
         tokio::spawn(async move {
-            let Some(conn) = GeneralConnection::new(conn, state) else {
+            let Some(conn) = GeneralConnection::new(conn, state.clone()) else {
                 log_err!(
                     0,
                     PrintType::General,
@@ -186,10 +217,81 @@ pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
                 );
                 return;
             };
+
+            let anonymous_permit = if conn.connection_kind() == ConnectionKind::AnonymousClient {
+                match state
+                    .rho_connection_limits
+                    .anonymous
+                    .clone()
+                    .try_acquire_owned()
+                {
+                    Ok(permit) => Some(permit),
+                    Err(_) => {
+                        log_err!(
+                            0,
+                            PrintType::General,
+                            "Rejected anonymous connection: anonymous limit reached"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let anonymous_ip_permit = if conn.connection_kind() == ConnectionKind::AnonymousClient {
+                let Some(peer_ip) = peer_ip else {
+                    log_err!(
+                        0,
+                        PrintType::General,
+                        "Rejected anonymous connection: peer address unavailable"
+                    );
+                    return;
+                };
+                match state
+                    .rho_connection_limits
+                    .try_acquire_anonymous_per_ip(peer_ip)
+                {
+                    Some(permit) => Some(permit),
+                    None => {
+                        log_err!(
+                            0,
+                            PrintType::General,
+                            "Rejected anonymous connection: per-IP limit reached"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let _global_permit = global_permit;
+            let _anonymous_permit = anonymous_permit;
+            let _anonymous_ip_permit = anonymous_ip_permit;
             conn.handle().await;
         });
     }
     log!(0, PrintType::General, "Server stopped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{rho_policy, web_config};
+    use std::time::Duration;
+
+    #[test]
+    fn rho_connection_budget_configures_mtp_admission() {
+        let config = web_config(7).expect("health route is valid");
+        assert_eq!(config.max_connections, 7);
+    }
+
+    #[test]
+    fn rho_policy_keeps_idle_peers_alive_and_detects_dead_peers() {
+        let policy = rho_policy();
+        assert_eq!(policy.keep_alive_interval, Some(Duration::from_secs(6)));
+        assert_eq!(policy.max_idle_timeout, Some(Duration::from_secs(30)));
+    }
 }

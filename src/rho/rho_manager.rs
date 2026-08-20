@@ -24,6 +24,7 @@ impl RhoManager {
         self.users.get(&user_id).map(|entry| entry.value().clone())
     }
 
+    #[allow(dead_code)]
     pub async fn contains_iota(&self, iota_id: i64) -> bool {
         self.connections.contains_key(&iota_id)
     }

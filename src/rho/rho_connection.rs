@@ -3,10 +3,7 @@ use super::{client_connection::ClientConnection, iota_connection::IotaConnection
 use super::relay_router::RouteTarget;
 use crate::{
     log_err,
-    rho::{
-        app_connection::AppConnection,
-        connection::{MtpValueCompat, OptionalDataValueCompat},
-    },
+    rho::{app_connection::AppConnection, connection::OptionalDataValueCompat},
 };
 use dashmap::DashMap;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
@@ -257,7 +254,14 @@ impl RhoConnection {
     /// Send message from Iota to specific client
     pub async fn message_to_client(&self, cv: CommunicationValue) {
         let connections = self.get_client_connections().await;
-        let receiver_id = cv.get_receiver();
+        let Some(receiver_id) = cv.receiver() else {
+            log_err!(
+                0,
+                crate::util::logger::PrintType::General,
+                "Discarded message without an MTP receiver"
+            );
+            return;
+        };
         let session_id = cv.get_data(DataType::SessionId).as_number();
 
         for connection in connections.iter() {
@@ -273,6 +277,7 @@ impl RhoConnection {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn message_to_iota(&self, cv: CommunicationValue) {
         self.iota_connection.send_message(&cv).await;
     }
@@ -308,6 +313,7 @@ impl RhoConnection {
         send_error.map_or(Ok(()), Err)
     }
 
+    #[allow(dead_code)]
     pub async fn send_relay_to_iota(&self, cv: &CommunicationValue) -> Result<(), String> {
         self.iota_connection.send_relay(cv).await
     }
