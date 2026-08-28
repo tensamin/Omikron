@@ -3,6 +3,7 @@ mod app_state;
 mod calls;
 mod config;
 mod data;
+mod identity;
 mod omega;
 mod rho;
 mod services;
@@ -18,34 +19,19 @@ pub static WORKING_DIR: Lazy<PathBuf> =
 use rustls::crypto::aws_lc_rs::default_provider;
 
 use mtp::crypto::Keyring;
-use mtp::files::{load_keyring_raw, save_keyring_raw, save_public_key_bundle};
 
 use crate::{
     app_state::AppState,
     calls::{call_manager::CallManager, call_util::LiveKitService},
     config::Config,
+    identity::{
+        KEYRING_PATH, PUBLIC_KEY_PATH, identity_secret_from_environment, load_or_create_keyring,
+    },
     omega::omega_connection::{OmegaConnection, start_task_cleanup_loop},
     rho::rho_manager::RhoManager,
     rho::server::start,
     util::logger::{PrintType, startup},
 };
-
-const KEYRING_PATH: &str = "./omikron.mk";
-const PUBLIC_KEY_PATH: &str = "./omikron.mpkb";
-
-fn load_keyring() -> Result<Keyring, String> {
-    match load_keyring_raw(KEYRING_PATH) {
-        Ok(keyring) => Ok(keyring),
-        Err(_) => {
-            let kr = Keyring::generate();
-            save_keyring_raw(&kr, KEYRING_PATH).map_err(|error| error.to_string())?;
-            save_public_key_bundle(&kr.public_key_bundle(), PUBLIC_KEY_PATH)
-                .map_err(|error| error.to_string())?;
-            eprintln!("Generated new keyring at {}", KEYRING_PATH);
-            Ok(kr)
-        }
-    }
-}
 
 #[tokio::main]
 async fn main() {
@@ -64,10 +50,10 @@ async fn main() {
         }
     };
 
-    let keyring = match load_keyring() {
-        Ok(keyring) => keyring,
+    let identity_secret = match identity_secret_from_environment() {
+        Ok(secret) => secret,
         Err(error) => {
-            eprintln!("Unable to load keyring: {error}");
+            eprintln!("Unable to load Omikron identity secret: {error}");
             return;
         }
     };

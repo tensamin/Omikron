@@ -9,8 +9,6 @@ use std::{
 use ansi_term::Color;
 use mtp::codec::{CommunicationType, CommunicationValue, DataTypeId, DataValue, Version};
 
-use crate::rho::connection::MtpValueCompat;
-
 static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
 
 #[allow(dead_code)]
@@ -153,7 +151,9 @@ pub fn log_cv_internal(
     let formatted = format_cv(cv);
 
     log_internal(
-        cv.get_sender() as i64,
+        cv.sender()
+            .and_then(|sender| i64::try_from(sender).ok())
+            .unwrap_or(0),
         print_type.unwrap_or(PrintType::General),
         prefix,
         false,
@@ -164,14 +164,14 @@ pub fn log_cv_internal(
 pub fn format_cv(cv: &CommunicationValue) -> String {
     let mut parts = Vec::new();
 
-    let sender = cv.get_sender();
-    let receiver = cv.get_receiver();
+    let sender = cv.sender();
+    let receiver = cv.receiver();
 
-    if sender > 0 && receiver > 0 {
+    if let (Some(sender), Some(receiver)) = (sender, receiver) {
         parts.push(format!("{} > {}", sender, receiver));
-    } else if sender > 0 {
+    } else if let Some(sender) = sender {
         parts.push(format!("{}", sender));
-    } else if receiver > 0 {
+    } else if let Some(receiver) = receiver {
         parts.push(format!("> {}", receiver));
     }
 
@@ -179,7 +179,7 @@ pub fn format_cv(cv: &CommunicationValue) -> String {
         .get_comm_type_enum()
         .map(|kind| kind.to_string())
         .unwrap_or_else(|| cv.get_type().to_string());
-    parts.push(format!("{} (id={})", comm_type, cv.get_id()));
+    parts.push(format!("{} (id={:?})", comm_type, cv.id()));
 
     if cv.is_type(CommunicationType::Relay) {
         parts.push("<opaque relay payload>".to_string());

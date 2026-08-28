@@ -9,7 +9,7 @@ use crate::anonymous_clients::anonymous_manager::{self, generate_username};
 use crate::app_state::AppState;
 use crate::calls::call_group::call_invite_secret_from_cv;
 use crate::rho::connection::{
-    GeneralConnection, MtpReceiver, MtpSender, MtpValueCompat, OptionalDataValueCompat,
+    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
 };
 use crate::util::data_type_id;
 use crate::util::logger::PrintType;
@@ -109,10 +109,25 @@ impl AnonymousClientConnection {
         };
         tokio::spawn(async move {
             let _permit = permit;
+            let message_id = match cv.require_id() {
+                Ok(message_id) => message_id,
+                Err(error) => {
+                    let response =
+                        CommunicationValue::new(CommunicationType::ErrorInvalidData).without_id();
+                    log_out!(
+                        self.user_id as i64,
+                        PrintType::Client,
+                        "Rejected malformed message: {}",
+                        error
+                    );
+                    self.send_message(&response).await;
+                    return;
+                }
+            };
             log_cv_in!(PrintType::Client, &cv);
 
             if cv.is_type(CommunicationType::Relay) {
-                self.send_error_response(&cv.get_id(), CommunicationType::ErrorNotAuthenticated)
+                self.send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
                     .await;
                 return;
             }
@@ -126,18 +141,15 @@ impl AnonymousClientConnection {
                         call
                     } else {
                         self.send_error_response(
-                            &cv.get_id(),
+                            message_id,
                             CommunicationType::ErrorNotAuthenticated,
                         )
                         .await;
                         return;
                     }
                 } else {
-                    self.send_error_response(
-                        &cv.get_id(),
-                        CommunicationType::ErrorNotAuthenticated,
-                    )
-                    .await;
+                    self.send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
+                        .await;
                     return;
                 };
 
@@ -210,7 +222,7 @@ impl AnonymousClientConnection {
                 self.clone()
                     .send_message(
                         &&CommunicationValue::new(CommunicationType::IdentificationResponse)
-                            .with_id(cv.get_id())
+                            .with_id(message_id)
                             .add_typed_default(
                                 DataType::UserId,
                                 DataValue::SignedNumber(self.user_id.into()),
@@ -245,7 +257,7 @@ impl AnonymousClientConnection {
             // Presence is account-scoped and anonymous sessions have no
             // persisted account preference to change.
             if cv.is_type(CommunicationType::ClientChanged) {
-                self.send_error_response(&cv.get_id(), CommunicationType::ErrorNoUserId)
+                self.send_error_response(message_id, CommunicationType::ErrorNoUserId)
                     .await;
                 return;
             }
@@ -291,7 +303,7 @@ impl AnonymousClientConnection {
                     }
                 } {
                     let response = CommunicationValue::new(CommunicationType::GetUserData)
-                        .with_id(cv.get_id())
+                        .with_id(message_id)
                         .add_typed_default(
                             DataType::Username,
                             DataValue::Str(anonymous.get_user_name().await),
@@ -344,9 +356,12 @@ impl AnonymousClientConnection {
 
     /// Handle call invite
     async fn handle_call_invite(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let receiver_id: i64 = cv.get_data(DataType::ReceiverId).as_number().unwrap_or(0) as i64;
         if receiver_id == 0 {
-            self.send_error_response(&cv.get_id(), CommunicationType::ErrorNoUserId)
+            self.send_error_response(message_id, CommunicationType::ErrorNoUserId)
                 .await;
             return;
         }
@@ -355,13 +370,13 @@ impl AnonymousClientConnection {
             Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(_) => {
-                    self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidCallId)
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                         .await;
                     return;
                 }
             },
             _ => {
-                self.send_error_response(&cv.get_id(), CommunicationType::ErrorNoCallId)
+                self.send_error_response(message_id, CommunicationType::ErrorNoCallId)
                     .await;
                 return;
             }
@@ -370,7 +385,7 @@ impl AnonymousClientConnection {
         let secret = match call_invite_secret_from_cv(&cv) {
             Some(secret) => secret,
             None => {
-                self.send_error_response(&cv.get_id(), CommunicationType::BadRequest)
+                self.send_error_response(message_id, CommunicationType::BadRequest)
                     .await;
                 return;
             }
@@ -381,7 +396,7 @@ impl AnonymousClientConnection {
             .add_invite(call_id, self.user_id, receiver_id as u64, secret.clone())
             .await;
         if !invited {
-            self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidCallId)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                 .await;
             return;
         }
@@ -391,7 +406,7 @@ impl AnonymousClientConnection {
             .call_manager
             .should_forward_invite(self.user_id, receiver_id as u64)
         {
-            let response = CommunicationValue::new(CommunicationType::Success).with_id(cv.get_id());
+            let response = CommunicationValue::new(CommunicationType::Success).with_id(message_id);
             self.send_message(&response).await;
             return;
         }
@@ -423,7 +438,7 @@ impl AnonymousClientConnection {
                 });
 
                 let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                    .with_id(cv.get_id())
+                    .with_id(message_id)
                     .add_typed_default(
                         DataType::ReceiverId,
                         DataValue::SignedNumber(receiver_id.into()),
@@ -453,25 +468,28 @@ impl AnonymousClientConnection {
 
         target_rho.message_to_client(forward).await;
 
-        let response = CommunicationValue::new(CommunicationType::Success).with_id(cv.get_id());
+        let response = CommunicationValue::new(CommunicationType::Success).with_id(message_id);
         self.send_message(&response).await;
     }
 
     /// Handle get call request
     async fn handle_get_call(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let user_id = self.get_user_id();
 
         let call_id = match cv.get_data(DataType::CallId) {
             Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(_) => {
-                    self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidCallId)
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                         .await;
                     return;
                 }
             },
             _ => {
-                self.send_error_response(&cv.get_id(), CommunicationType::ErrorNoCallId)
+                self.send_error_response(message_id, CommunicationType::ErrorNoCallId)
                     .await;
                 return;
             }
@@ -485,7 +503,7 @@ impl AnonymousClientConnection {
         {
             Ok(token) => {
                 let response = CommunicationValue::new(CommunicationType::CallToken)
-                    .with_id(cv.get_id())
+                    .with_id(message_id)
                     .with_receiver(user_id)
                     .add_typed_default(DataType::CallToken, DataValue::Str(token));
                 self.send_message(&response).await;
@@ -497,16 +515,19 @@ impl AnonymousClientConnection {
                     error
                 );
                 let error_cv = CommunicationValue::new(CommunicationType::ErrorNoCallId)
-                    .with_id(cv.get_id())
+                    .with_id(message_id)
                     .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));
                 self.send_message(&error_cv).await;
             }
         }
     }
     async fn handle_call_timeout_user(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let Ok(call_id) = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or(""))
         else {
-            self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidCallId)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                 .await;
             return;
         };
@@ -520,12 +541,12 @@ impl AnonymousClientConnection {
             .unwrap_or(0);
 
         let Some(call) = self.state.call_manager.get_call(call_id).await else {
-            self.send_error_response(&cv.get_id(), CommunicationType::ErrorNotFound)
+            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
                 .await;
             return;
         };
         let Some(caller) = call.get_caller(self.get_user_id()).await else {
-            self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidUserId)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidUserId)
                 .await;
             return;
         };
@@ -536,9 +557,12 @@ impl AnonymousClientConnection {
         }
     }
     async fn handle_call_disconnect_user(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let Ok(call_id) = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or(""))
         else {
-            self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidCallId)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                 .await;
             return;
         };
@@ -548,12 +572,12 @@ impl AnonymousClientConnection {
             .unwrap_or(0);
 
         let Some(call) = self.state.call_manager.get_call(call_id).await else {
-            self.send_error_response(&cv.get_id(), CommunicationType::ErrorNotFound)
+            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
                 .await;
             return;
         };
         let Some(caller) = call.get_caller(self.get_user_id()).await else {
-            self.send_error_response(&cv.get_id(), CommunicationType::ErrorInvalidUserId)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidUserId)
                 .await;
             return;
         };
@@ -563,8 +587,8 @@ impl AnonymousClientConnection {
     }
 
     /// Send error response
-    async fn send_error_response(self: Arc<Self>, message_id: &u32, error_type: CommunicationType) {
-        let error = CommunicationValue::new(error_type).with_id(*message_id);
+    async fn send_error_response(self: Arc<Self>, message_id: u32, error_type: CommunicationType) {
+        let error = CommunicationValue::new(error_type).with_id(message_id);
         self.send_message(&error).await;
     }
     /// Close the connection

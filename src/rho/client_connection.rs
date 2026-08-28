@@ -3,7 +3,7 @@ use crate::app_state::AppState;
 use crate::calls::call_group::call_invite_secret_from_cv;
 use crate::data::user::UserStatus;
 use crate::rho::connection::{
-    GeneralConnection, MtpReceiver, MtpSender, MtpValueCompat, OptionalDataValueCompat,
+    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
 };
 use crate::rho::relay_router::{self, RelaySource};
 use crate::rho::rho_connection::RhoConnection;
@@ -117,14 +117,41 @@ impl ClientConnection {
         };
         tokio::spawn(async move {
             let _permit = permit;
+            let message_id = match cv.require_id() {
+                Ok(message_id) => message_id,
+                Err(error) => {
+                    log_err!(
+                        self.user_id as i64,
+                        PrintType::Client,
+                        "Rejected malformed message: {}",
+                        error
+                    );
+                    let response =
+                        CommunicationValue::new(CommunicationType::ErrorInvalidData).without_id();
+                    self.send_message(&response).await;
+                    return;
+                }
+            };
             log_cv_in!(PrintType::Client, cv);
 
             let mut cv = cv;
 
             if cv.is_type(CommunicationType::Relay) {
+                let next_hop = match cv.require_receiver() {
+                    Ok(next_hop) => next_hop,
+                    Err(error) => {
+                        log_err!(
+                            self.user_id as i64,
+                            PrintType::Client,
+                            "Rejected malformed relay: {}",
+                            error
+                        );
+                        self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                            .await;
+                        return;
+                    }
+                };
                 cv = relay_router::ensure_relay_frame_id(cv);
-                let request_id = cv.get_id();
-                let next_hop = cv.receiver().unwrap_or_default();
                 let result = match self.get_rho_connection().await {
                     Some(rho) => {
                         relay_router::route_relay(
@@ -140,7 +167,7 @@ impl ClientConnection {
                 };
                 let response = match result {
                     Ok(()) => {
-                        CommunicationValue::new(CommunicationType::Success).with_id(request_id)
+                        CommunicationValue::new(CommunicationType::Success).with_id(message_id)
                     }
                     Err(error) => {
                         log_err!(
@@ -151,7 +178,7 @@ impl ClientConnection {
                             error
                         );
                         CommunicationValue::new(relay_router::error_response_type(&error))
-                            .with_id(request_id)
+                            .with_id(message_id)
                     }
                 };
                 self.send_message(&response).await;
@@ -160,7 +187,7 @@ impl ClientConnection {
 
             if cv.is_type(CommunicationType::Success) {
                 if let Some(rho) = self.get_rho_connection().await {
-                    rho.forward_relay_ack(self.user_id, cv.get_id()).await;
+                    rho.forward_relay_ack(self.user_id, message_id).await;
                 }
                 return;
             }
@@ -169,7 +196,7 @@ impl ClientConnection {
                 relay_router::message_security_class(&cv),
                 relay_router::MessageSecurityClass::RelayOnly
             ) {
-                self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData)
+                self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
                     .await;
                 return;
             }
@@ -178,11 +205,11 @@ impl ClientConnection {
             // user fields, if present, are deliberately ignored: an
             // authenticated connection may only change its own state.
             if cv.is_type(CommunicationType::ClientChanged)
-                && cv.get_data_opt(DataType::UserState).is_some()
+                && cv.get_data(DataType::UserState).is_some()
             {
                 self.handle_set_user_state(
                     CommunicationValue::new(CommunicationType::ClientChanged)
-                        .with_id(cv.get_id())
+                        .with_id(message_id)
                         .add_typed_default(
                             DataType::UserState,
                             cv.get_data(DataType::UserState)
@@ -240,7 +267,7 @@ impl ClientConnection {
                     }
                 } {
                     let response = CommunicationValue::new(CommunicationType::GetUserData)
-                        .with_id(cv.get_id())
+                        .with_id(message_id)
                         .add_typed_default(
                             DataType::Username,
                             DataValue::Str(anonymous.get_user_name().await),
@@ -276,19 +303,19 @@ impl ClientConnection {
                 || cv.is_type(CommunicationType::DeleteUser)
             {
                 if cv.is_type(CommunicationType::ChangeUserData)
-                    && cv.get_data_opt(DataType::OnlineStatus).is_some()
+                    && cv.get_data(DataType::OnlineStatus).is_some()
                 {
                     let mut profile_request = cv.clone();
                     let preference = profile_request
                         .remove_data(DataType::OnlineStatus)
                         .unwrap_or(DataValue::Null);
                     let state_request = CommunicationValue::new(CommunicationType::ClientChanged)
-                        .with_id(cv.get_id())
+                        .with_id(message_id)
                         .add_typed_default(DataType::UserState, preference);
                     let state_response = match self.request_set_user_state(state_request).await {
                         Ok(response) => response,
                         Err(error_type) => {
-                            self.send_error_response(cv.get_id(), error_type).await;
+                            self.send_error_response(message_id, error_type).await;
                             return;
                         }
                     };
@@ -311,7 +338,7 @@ impl ClientConnection {
                         }
                         Ok(response) => self.send_message(&response).await,
                         Err(_) => {
-                            self.send_error_response(cv.get_id(), CommunicationType::ErrorInternal)
+                            self.send_error_response(message_id, CommunicationType::ErrorInternal)
                                 .await;
                         }
                     }
@@ -336,7 +363,7 @@ impl ClientConnection {
                 if is_per_device_settings {
                     let Some(session_id) = session_id else {
                         let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                            .with_id(cv.get_id())
+                            .with_id(message_id)
                             .with_receiver(self.user_id)
                             .add_typed_default(
                                 DataType::Message,
@@ -352,7 +379,7 @@ impl ClientConnection {
 
                     if session_id != expected_session_id {
                         let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                            .with_id(cv.get_id())
+                            .with_id(message_id)
                             .with_receiver(self.user_id)
                             .add_typed_default(
                                 DataType::Message,
@@ -368,7 +395,7 @@ impl ClientConnection {
                 } else if let Some(session_id) = session_id {
                     if session_id != expected_session_id {
                         let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                            .with_id(cv.get_id())
+                            .with_id(message_id)
                             .with_receiver(self.user_id)
                             .add_typed_default(
                                 DataType::Message,
@@ -396,7 +423,7 @@ impl ClientConnection {
             if let Some(session_id) = cv.get_data(DataType::SessionId).as_signed_number() {
                 if session_id != expected_session_id {
                     let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                        .with_id(cv.get_id())
+                        .with_id(message_id)
                         .add_typed_default(
                             DataType::SessionId,
                             DataValue::SignedNumber(expected_session_id),
@@ -417,12 +444,14 @@ impl ClientConnection {
                 "Rejected unsupported communication type {}",
                 cv.get_type()
             );
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
                 .await;
         });
     }
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
-        let request_id = cv.get_id();
+        let Ok(request_id) = cv.require_id() else {
+            return;
+        };
         match self.await_omega_response(cv).await {
             Ok(response_cv) => self.send_message(&response_cv).await,
             Err(_) => {
@@ -445,6 +474,9 @@ impl ClientConnection {
         &self,
         cv: CommunicationValue,
     ) -> Result<CommunicationValue, CommunicationType> {
+        let message_id = cv
+            .require_id()
+            .map_err(|_| CommunicationType::ErrorInvalidData)?;
         if !self.state.omega.is_ready().await {
             return Err(CommunicationType::ErrorInternal);
         }
@@ -459,7 +491,7 @@ impl ClientConnection {
             return Err(CommunicationType::ErrorNoIota);
         };
         let request = CommunicationValue::new(CommunicationType::ClientChanged)
-            .with_id(cv.get_id())
+            .with_id(message_id)
             .with_sender(self.user_id)
             .add_typed_default(
                 DataType::UserId,
@@ -472,22 +504,28 @@ impl ClientConnection {
             .await
             .map_err(|_| CommunicationType::ErrorInternal)?;
         return Ok(CommunicationValue::new(CommunicationType::Success)
-            .with_id(cv.get_id())
+            .with_id(message_id)
             .add_typed_default(DataType::UserState, DataValue::Str(state.to_string())));
     }
 
     async fn handle_set_user_state(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         match self.request_set_user_state(cv.clone()).await {
             Ok(response) => self.send_message(&response).await,
-            Err(error_type) => self.send_error_response(cv.get_id(), error_type).await,
+            Err(error_type) => self.send_error_response(message_id, error_type).await,
         }
     }
 
     /// Handle call invite
     async fn handle_call_invite(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let receiver_id: i128 = cv.get_data(DataType::ReceiverId).as_number().unwrap_or(0);
         if receiver_id == 0 {
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorNoUserId)
+            self.send_error_response(message_id, CommunicationType::ErrorNoUserId)
                 .await;
             return;
         }
@@ -496,13 +534,13 @@ impl ClientConnection {
             Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(_) => {
-                    self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidCallId)
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                         .await;
                     return;
                 }
             },
             _ => {
-                self.send_error_response(cv.get_id(), CommunicationType::ErrorNoCallId)
+                self.send_error_response(message_id, CommunicationType::ErrorNoCallId)
                     .await;
                 return;
             }
@@ -511,7 +549,7 @@ impl ClientConnection {
         let secret = match call_invite_secret_from_cv(&cv) {
             Some(secret) => secret,
             None => {
-                self.send_error_response(cv.get_id(), CommunicationType::BadRequest)
+                self.send_error_response(message_id, CommunicationType::BadRequest)
                     .await;
                 return;
             }
@@ -522,7 +560,7 @@ impl ClientConnection {
             .add_invite(call_id, self.user_id, receiver_id as u64, secret.clone())
             .await;
         if !invited {
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidCallId)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                 .await;
             return;
         }
@@ -532,7 +570,7 @@ impl ClientConnection {
             .call_manager
             .should_forward_invite(self.user_id, receiver_id as u64)
         {
-            let response = CommunicationValue::new(CommunicationType::Success).with_id(cv.get_id());
+            let response = CommunicationValue::new(CommunicationType::Success).with_id(message_id);
             self.send_message(&response).await;
             return;
         }
@@ -564,7 +602,7 @@ impl ClientConnection {
                 });
 
                 let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                    .with_id(cv.get_id())
+                    .with_id(message_id)
                     .add_typed_default(
                         DataType::ReceiverId,
                         DataValue::SignedNumber(receiver_id.into()),
@@ -594,25 +632,28 @@ impl ClientConnection {
 
         target_rho.message_to_client(forward).await;
 
-        let response = CommunicationValue::new(CommunicationType::Success).with_id(cv.get_id());
+        let response = CommunicationValue::new(CommunicationType::Success).with_id(message_id);
         self.send_message(&response).await;
     }
 
     /// Handle get call request
     async fn handle_get_call(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let user_id = self.get_user_id().await;
 
         let call_id = match cv.get_data(DataType::CallId) {
             Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(_) => {
-                    self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidCallId)
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                         .await;
                     return;
                 }
             },
             _ => {
-                self.send_error_response(cv.get_id(), CommunicationType::ErrorNoCallId)
+                self.send_error_response(message_id, CommunicationType::ErrorNoCallId)
                     .await;
                 return;
             }
@@ -626,7 +667,7 @@ impl ClientConnection {
         {
             Ok(token) => {
                 let response = CommunicationValue::new(CommunicationType::CallToken)
-                    .with_id(cv.get_id())
+                    .with_id(message_id)
                     .with_receiver(user_id as u64)
                     .add_typed_default(DataType::CallToken, DataValue::Str(token));
                 self.send_message(&response).await;
@@ -634,26 +675,29 @@ impl ClientConnection {
             Err(error) => {
                 log::warn!("Unable to create call token for {}: {}", call_id, error);
                 let error_cv = CommunicationValue::new(CommunicationType::ErrorNoCallId)
-                    .with_id(cv.get_id())
+                    .with_id(message_id)
                     .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));
                 self.send_message(&error_cv).await;
             }
         }
     }
     async fn handle_get_call_data(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let user_id = self.get_user_id().await;
 
         let call_id = match cv.get_data(DataType::CallId) {
             Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
                 Ok(id) => id,
                 Err(_) => {
-                    self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidCallId)
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                         .await;
                     return;
                 }
             },
             _ => {
-                self.send_error_response(cv.get_id(), CommunicationType::ErrorNoCallId)
+                self.send_error_response(message_id, CommunicationType::ErrorNoCallId)
                     .await;
                 return;
             }
@@ -670,20 +714,20 @@ impl ClientConnection {
                 }
 
                 let response = CommunicationValue::new(CommunicationType::CallData)
-                    .with_id(cv.get_id())
+                    .with_id(message_id)
                     .with_receiver(user_id as u64)
                     .add_typed_default(DataType::UserIds, DataValue::Array(user_ids));
                 self.send_message(&response).await;
             } else {
                 let error_cv = CommunicationValue::new(CommunicationType::ErrorInvalidUserId)
-                    .with_id(cv.get_id())
+                    .with_id(message_id)
                     .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
                 self.send_message(&error_cv).await;
                 return;
             }
         } else {
             let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                .with_id(cv.get_id())
+                .with_id(message_id)
                 .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));
             self.send_message(&error_cv).await;
             return;
@@ -691,9 +735,12 @@ impl ClientConnection {
     }
 
     async fn handle_call_timeout_user(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let Ok(call_id) = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or(""))
         else {
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidCallId)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                 .await;
             return;
         };
@@ -707,13 +754,13 @@ impl ClientConnection {
             .unwrap_or(0);
 
         let Some(call) = self.state.call_manager.get_call(call_id).await else {
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorNotFound)
+            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
                 .await;
             return;
         };
 
         let Some(caller) = call.get_caller(self.get_user_id().await).await else {
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidUserId)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidUserId)
                 .await;
             return;
         };
@@ -729,9 +776,12 @@ impl ClientConnection {
         }
     }
     async fn handle_call_disconnect_user(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let Ok(call_id) = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or(""))
         else {
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidCallId)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                 .await;
             return;
         };
@@ -741,12 +791,12 @@ impl ClientConnection {
             .unwrap_or(0);
 
         let Some(call) = self.state.call_manager.get_call(call_id).await else {
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorNotFound)
+            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
                 .await;
             return;
         };
         let Some(caller) = call.get_caller(self.get_user_id().await).await else {
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidUserId)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidUserId)
                 .await;
             return;
         };
@@ -755,9 +805,12 @@ impl ClientConnection {
         }
     }
     async fn handle_call_set_anonymous_joining(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let Ok(call_id) = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or(""))
         else {
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidCallId)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                 .await;
             return;
         };
@@ -780,7 +833,7 @@ impl ClientConnection {
             short_link = call.get_short_link().await;
         }
         let mut response_cv = CommunicationValue::new(CommunicationType::CallSetAnonymousJoining)
-            .with_id(cv.get_id())
+            .with_id(message_id)
             .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
             .add_typed_default(DataType::Enabled, DataValue::Bool(enable));
         if let Some(short_link) = short_link {
@@ -790,6 +843,9 @@ impl ClientConnection {
     }
 
     async fn handle_load_txt_record(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         if let Some(path) = cv.get_data(DataType::Path).as_str() {
             let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
                 Ok(r) => r,
@@ -799,7 +855,7 @@ impl ClientConnection {
                         .cloned()
                         .unwrap_or(DataValue::Null);
                     let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                        .with_id(cv.get_id())
+                        .with_id(message_id)
                         .add_typed_default(DataType::Path, path_data);
                     self.send_message(&error_cv).await;
                     return;
@@ -818,7 +874,7 @@ impl ClientConnection {
                             Ok(text) => text,
                             Err(_) => {
                                 self.send_error_response(
-                                    cv.get_id(),
+                                    message_id,
                                     CommunicationType::ErrorInvalidData,
                                 )
                                 .await;
@@ -827,8 +883,8 @@ impl ClientConnection {
                         };
 
                         let response = CommunicationValue::new(CommunicationType::LoadTxtRecord)
-                            .with_id(cv.get_id())
-                            .add_typed_default(DataType::Content, DataValue::Str(record_text));
+                            .with_id(message_id)
+                            .add_typed_default(DataType::AppContent, DataValue::Str(record_text));
                         self.send_message(&response).await;
                         return;
                     }
@@ -838,7 +894,7 @@ impl ClientConnection {
                         .cloned()
                         .unwrap_or(DataValue::Null);
                     let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                        .with_id(cv.get_id())
+                        .with_id(message_id)
                         .add_typed_default(DataType::Path, path_data);
                     self.send_message(&error_cv).await;
                 }
@@ -848,7 +904,7 @@ impl ClientConnection {
                         .cloned()
                         .unwrap_or(DataValue::Null);
                     let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                        .with_id(cv.get_id())
+                        .with_id(message_id)
                         .add_typed_default(DataType::Path, path_data);
                     self.send_message(&error_cv).await;
                 }
@@ -862,7 +918,7 @@ impl ClientConnection {
             .cloned()
             .unwrap_or(DataValue::Null);
         let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-            .with_id(cv.get_id())
+            .with_id(message_id)
             .add_typed_default(DataType::Path, path_data);
         self.send_message(&error_cv).await;
     }

@@ -1,7 +1,7 @@
 use crate::anonymous_clients::anonymous_manager;
 use crate::app_state::AppState;
 use crate::rho::connection::{
-    GeneralConnection, MtpReceiver, MtpSender, MtpValueCompat, OptionalDataValueCompat,
+    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
 };
 use crate::rho::relay_router::{self, RelaySource};
 use crate::rho::rho_connection::RhoConnection;
@@ -89,12 +89,38 @@ impl AppConnection {
     /// Handle incoming message from app
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
         tokio::spawn(async move {
+            let message_id = match cv.require_id() {
+                Ok(message_id) => message_id,
+                Err(error) => {
+                    log_err!(
+                        self.user_id as i64,
+                        PrintType::App,
+                        "Rejected malformed message: {}",
+                        error
+                    );
+                    let response =
+                        CommunicationValue::new(CommunicationType::ErrorInvalidData).without_id();
+                    self.send_message(&response).await;
+                    return;
+                }
+            };
             log_cv_in!(PrintType::App, cv);
 
             if cv.is_type(CommunicationType::Relay) {
-                let cv = relay_router::ensure_relay_frame_id(cv);
-                let request_id = cv.get_id();
-                let next_hop = cv.receiver().unwrap_or_default();
+                let next_hop = match cv.require_receiver() {
+                    Ok(next_hop) => next_hop,
+                    Err(error) => {
+                        log_err!(
+                            self.user_id as i64,
+                            PrintType::App,
+                            "Rejected malformed relay: {}",
+                            error
+                        );
+                        self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                            .await;
+                        return;
+                    }
+                };
                 let result = match self.get_rho_connection().await {
                     Some(rho) => {
                         relay_router::route_relay(
@@ -102,7 +128,7 @@ impl AppConnection {
                             RelaySource::Client {
                                 iota_id: rho.get_iota_id().await,
                             },
-                            cv,
+                            relay_router::ensure_relay_frame_id(cv),
                         )
                         .await
                     }
@@ -110,7 +136,7 @@ impl AppConnection {
                 };
                 let response = match result {
                     Ok(()) => {
-                        CommunicationValue::new(CommunicationType::Success).with_id(request_id)
+                        CommunicationValue::new(CommunicationType::Success).with_id(message_id)
                     }
                     Err(error) => {
                         log_err!(
@@ -121,7 +147,7 @@ impl AppConnection {
                             error
                         );
                         CommunicationValue::new(relay_router::error_response_type(&error))
-                            .with_id(request_id)
+                            .with_id(message_id)
                     }
                 };
                 self.send_message(&response).await;
@@ -130,7 +156,7 @@ impl AppConnection {
 
             if cv.is_type(CommunicationType::Success) {
                 if let Some(rho) = self.get_rho_connection().await {
-                    rho.forward_relay_ack(self.user_id, cv.get_id()).await;
+                    rho.forward_relay_ack(self.user_id, message_id).await;
                 }
                 return;
             }
@@ -139,7 +165,7 @@ impl AppConnection {
                 relay_router::message_security_class(&cv),
                 relay_router::MessageSecurityClass::RelayOnly
             ) {
-                self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData)
+                self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
                     .await;
                 return;
             }
@@ -155,7 +181,7 @@ impl AppConnection {
                     }
                 } {
                     let response = CommunicationValue::new(CommunicationType::GetUserData)
-                        .with_id(cv.get_id())
+                        .with_id(message_id)
                         .add_typed_default(
                             DataType::Username,
                             DataValue::Str(anonymous.get_user_name().await),
@@ -197,7 +223,7 @@ impl AppConnection {
                 "Rejected unsupported communication type {}",
                 cv.get_type()
             );
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
                 .await;
         });
     }

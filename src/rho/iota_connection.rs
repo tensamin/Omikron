@@ -6,7 +6,7 @@ use crate::log_err;
 use crate::log_in;
 use crate::log_out;
 use crate::rho::connection::{
-    GeneralConnection, MtpReceiver, MtpSender, MtpValueCompat, OptionalDataValueCompat,
+    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
 };
 use crate::rho::relay_router::{self, RelaySource};
 use crate::util::data_type_id;
@@ -33,8 +33,9 @@ fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, Vec<i64>)> 
         return None;
     }
 
-    let user_id = i64::try_from(value.get_receiver())
-        .ok()
+    let user_id = value
+        .receiver()
+        .and_then(|id| i64::try_from(id).ok())
         .filter(|id| *id > 0)?;
     let session_id = value
         .get_data(DataType::SessionId)
@@ -222,6 +223,7 @@ impl IotaConnection {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn send_relay(&self, cv: &CommunicationValue) -> Result<(), String> {
         self.sender
             .send(cv)
@@ -235,20 +237,46 @@ impl IotaConnection {
             return;
         };
         let _permit = permit;
+        let message_id = match cv.require_id() {
+            Ok(message_id) => message_id,
+            Err(error) => {
+                log_err!(
+                    self.iota_id as i64,
+                    PrintType::Iota,
+                    "Rejected malformed message: {}",
+                    error
+                );
+                let response =
+                    CommunicationValue::new(CommunicationType::ErrorInvalidData).without_id();
+                self.send_message(&response).await;
+                return;
+            }
+        };
         if cv.is_type(CommunicationType::Relay) {
-            let cv = relay_router::ensure_relay_frame_id(cv);
-            let request_id = cv.get_id();
-            let next_hop = cv.receiver().unwrap_or_default();
+            let next_hop = match cv.require_receiver() {
+                Ok(next_hop) => next_hop,
+                Err(error) => {
+                    log_err!(
+                        self.iota_id as i64,
+                        PrintType::Iota,
+                        "Rejected malformed relay: {}",
+                        error
+                    );
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData, None)
+                        .await;
+                    return;
+                }
+            };
             let response = match relay_router::route_relay(
                 &self.state,
                 RelaySource::Iota {
                     iota_id: self.iota_id,
                 },
-                cv,
+                relay_router::ensure_relay_frame_id(cv),
             )
             .await
             {
-                Ok(()) => CommunicationValue::new(CommunicationType::Success).with_id(request_id),
+                Ok(()) => CommunicationValue::new(CommunicationType::Success).with_id(message_id),
                 Err(error) => {
                     log_err!(
                         self.iota_id as i64,
@@ -258,7 +286,7 @@ impl IotaConnection {
                         error
                     );
                     CommunicationValue::new(relay_router::error_response_type(&error))
-                        .with_id(request_id)
+                        .with_id(message_id)
                 }
             };
             self.send_message(&response).await;
@@ -269,12 +297,12 @@ impl IotaConnection {
             crate::rho::relay_router::message_security_class(&cv),
             crate::rho::relay_router::MessageSecurityClass::RelayOnly
         ) {
-            self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData, None)
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidData, None)
                 .await;
             return;
         }
 
-        let msg_id = cv.get_id();
+        let msg_id = message_id;
         if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
             if (task)(self.clone(), cv.clone()) {
                 return;
@@ -309,7 +337,7 @@ impl IotaConnection {
 
         if cv.is_type(CommunicationType::StateSubscribe) {
             self.send_error_response(
-                cv.get_id(),
+                message_id,
                 CommunicationType::ErrorInvalidData,
                 Some("StateSubscribe must come from an authoritative contact snapshot"),
             )
@@ -335,7 +363,7 @@ impl IotaConnection {
                 self.iota_id as i64,
                 PrintType::Omega,
                 "Forwarding CompleteRegisterUser to Omega (request_id={})",
-                request.get_id()
+                message_id
             );
             let mut response_cv = self
                 .state
@@ -348,7 +376,7 @@ impl IotaConnection {
                     self.iota_id as i64,
                     PrintType::Omega,
                     "CompleteRegisterUser request_id={} failed: {}; retrying once",
-                    request.get_id(),
+                    message_id,
                     error
                 );
                 response_cv = self
@@ -363,9 +391,9 @@ impl IotaConnection {
                     log_in!(
                         self.iota_id as i64,
                         PrintType::Omega,
-                        "Omega completed registration (request_id={}, response_id={}, type={})",
-                        request.get_id(),
-                        response_cv.get_id(),
+                        "Omega completed registration (request_id={}, response_id={:?}, type={})",
+                        message_id,
+                        response_cv.id(),
                         response_cv
                             .get_comm_type_enum()
                             .map(|kind| kind.to_string())
@@ -408,7 +436,7 @@ impl IotaConnection {
                                 self.add_user_id(user_id as u64).await;
                                 self.send_message(
                                     &CommunicationValue::new(CommunicationType::Success)
-                                        .with_id(cv.get_id()),
+                                        .with_id(message_id),
                                 )
                                 .await;
                                 return;
@@ -416,15 +444,15 @@ impl IotaConnection {
                             Ok(verified) => log_err!(
                                 self.iota_id as i64,
                                 PrintType::Omega,
-                                "Registration verification returned an unexpected user (request_id={}, response_id={})",
-                                verification.get_id(),
-                                verified.get_id()
+                                "Registration verification returned an unexpected user (request_id={:?}, response_id={:?})",
+                                verification.id(),
+                                verified.id()
                             ),
                             Err(verify_error) => log_err!(
                                 self.iota_id as i64,
                                 PrintType::Omega,
-                                "Registration verification failed after request_id={}: {}",
-                                verification.get_id(),
+                                "Registration verification failed after request_id={:?}: {}",
+                                verification.id(),
                                 verify_error
                             ),
                         }
@@ -436,7 +464,7 @@ impl IotaConnection {
                         error
                     );
                     self.send_error_response(
-                        cv.get_id(),
+                        message_id,
                         CommunicationType::ErrorInternal,
                         Some(&format!("Omega forwarding failed: {error}")),
                     )
@@ -477,7 +505,7 @@ impl IotaConnection {
             "Rejected unsupported communication type {}",
             cv.get_type()
         );
-        self.send_error_response(cv.get_id(), CommunicationType::ErrorInvalidData, None)
+        self.send_error_response(message_id, CommunicationType::ErrorInvalidData, None)
             .await;
     }
 
@@ -514,6 +542,9 @@ impl IotaConnection {
     }
 
     async fn handle_omega_forward_without_sender(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let iota_for_closure = self.clone();
         let request = cv.clone().add_typed_default(
             DataType::IotaId,
@@ -530,7 +561,7 @@ impl IotaConnection {
                 self.iota_id as i64,
                 PrintType::Omega,
                 "GetRegister request_id={} failed: {}; retrying once",
-                request.get_id(),
+                message_id,
                 error
             );
             response_cv = self
@@ -550,7 +581,7 @@ impl IotaConnection {
                     error
                 );
                 self.send_error_response(
-                    cv.get_id(),
+                    message_id,
                     CommunicationType::ErrorInternal,
                     Some(&format!("Omega forwarding failed: {error}")),
                 )
@@ -560,7 +591,17 @@ impl IotaConnection {
     }
     /// Handle GET_CHATS message
     async fn handle_get_chats(&self, cv: CommunicationValue) {
-        let user_id = cv.get_sender();
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
+        let Ok(user_id) = cv.require_sender() else {
+            log_err!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Rejected get_chats without an MTP sender"
+            );
+            return;
+        };
 
         // Authority check: user must be linked to this Iota
         if !self.get_user_ids().await.contains(&user_id) {
@@ -582,7 +623,7 @@ impl IotaConnection {
         else {
             self.forward_to_client(
                 CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                    .with_id(cv.get_id())
+                    .with_id(message_id)
                     .with_receiver(user_id),
             )
             .await;
@@ -763,7 +804,14 @@ impl IotaConnection {
 
     async fn add_call_state(&self, response: CommunicationValue) -> CommunicationValue {
         let mut output = response.clone();
-        let user_id = response.get_receiver();
+        let Some(user_id) = response.receiver() else {
+            log_err!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Discarded response without an MTP receiver"
+            );
+            return output;
+        };
 
         let typed_data: Vec<_> = response.iter_typed_data().collect();
         for (key, value) in typed_data {
@@ -807,7 +855,9 @@ impl IotaConnection {
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
         let (tx, mut rx) = mpsc::channel(1);
-        let msg_id = cv.get_id();
+        let msg_id = cv
+            .require_id()
+            .map_err(|error| format!("request is missing correlation id: {error}"))?;
 
         let task_tx = tx.clone();
         self.waiting_tasks.insert(

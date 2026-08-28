@@ -134,6 +134,7 @@ impl LiveKitService {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn garbage_collect_calls(self: Arc<Self>, manager: Arc<CallManager>) {
         tokio::spawn(async move {
             loop {
@@ -148,6 +149,7 @@ impl LiveKitService {
     }
 }
 
+#[allow(dead_code)]
 pub async fn clean_calls(manager: &CallManager, room_service: RoomClient) {
     let rooms =
         match tokio::time::timeout(LIVEKIT_REQUEST_TIMEOUT, room_service.list_rooms(Vec::new()))

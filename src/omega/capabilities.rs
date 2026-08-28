@@ -42,6 +42,7 @@ impl PeerCapabilities {
         format!("{OMIKRON_PREFIX}{}", names.join(","))
     }
 
+    #[allow(dead_code)]
     pub fn from_identification_description(description: Option<&str>) -> Result<Self, ()> {
         parse_capabilities(description, OMIKRON_PREFIX)
     }

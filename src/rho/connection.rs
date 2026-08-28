@@ -16,37 +16,38 @@ use crate::{
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::host::AuthState;
 use mtp::webserver::{WebMTPConnection, WebMtpReceiver, WebMtpSender};
+use thiserror::Error;
 
 pub type MtpSender = WebMtpSender;
 pub type MtpReceiver = WebMtpReceiver;
 
-/*
- * MTP 0.3 exposes absent frame fields and data entries as Options. These
- * adapters keep legacy control handlers explicit while Relay code uses the
- * native optional accessors directly.
- */
-pub(crate) trait MtpValueCompat {
-    fn get_id(&self) -> u32;
-    fn get_sender(&self) -> u64;
-    fn get_receiver(&self) -> u64;
-    fn get_data_opt(&self, data_type: DataType) -> Option<&DataValue>;
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum FrameValidationError {
+    #[error("message is missing an MTP id")]
+    MissingId,
+    #[error("message is missing an MTP sender")]
+    MissingSender,
+    #[error("message is missing an MTP receiver")]
+    MissingReceiver,
 }
 
-impl MtpValueCompat for CommunicationValue {
-    fn get_id(&self) -> u32 {
-        self.id().unwrap_or_default()
+pub trait RequiredMtpFields {
+    fn require_id(&self) -> Result<u32, FrameValidationError>;
+    fn require_sender(&self) -> Result<u64, FrameValidationError>;
+    fn require_receiver(&self) -> Result<u64, FrameValidationError>;
+}
+
+impl RequiredMtpFields for CommunicationValue {
+    fn require_id(&self) -> Result<u32, FrameValidationError> {
+        self.id().ok_or(FrameValidationError::MissingId)
     }
 
-    fn get_sender(&self) -> u64 {
-        self.sender().unwrap_or_default()
+    fn require_sender(&self) -> Result<u64, FrameValidationError> {
+        self.sender().ok_or(FrameValidationError::MissingSender)
     }
 
-    fn get_receiver(&self) -> u64 {
-        self.receiver().unwrap_or_default()
-    }
-
-    fn get_data_opt(&self, data_type: DataType) -> Option<&DataValue> {
-        self.get_data(data_type)
+    fn require_receiver(&self) -> Result<u64, FrameValidationError> {
+        self.receiver().ok_or(FrameValidationError::MissingReceiver)
     }
 }
 
@@ -55,6 +56,7 @@ pub(crate) trait OptionalDataValueCompat {
     fn as_number(&self) -> Option<i128>;
     fn as_signed_number(&self) -> Option<i128>;
     fn as_str(&self) -> Option<&str>;
+    #[allow(dead_code)]
     fn as_bytes(&self) -> Option<Vec<u8>>;
 }
 
@@ -77,6 +79,42 @@ impl OptionalDataValueCompat for Option<&DataValue> {
 
     fn as_bytes(&self) -> Option<Vec<u8>> {
         self.and_then(|value| value.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrameValidationError, RequiredMtpFields};
+    use mtp::codec::{CommunicationType, CommunicationValue};
+
+    #[test]
+    fn required_fields_preserve_missing_field_errors() {
+        let frame = CommunicationValue::new(CommunicationType::Success)
+            .without_id()
+            .without_sender()
+            .without_receiver();
+
+        assert_eq!(frame.require_id(), Err(FrameValidationError::MissingId));
+        assert_eq!(
+            frame.require_sender(),
+            Err(FrameValidationError::MissingSender)
+        );
+        assert_eq!(
+            frame.require_receiver(),
+            Err(FrameValidationError::MissingReceiver)
+        );
+    }
+
+    #[test]
+    fn zero_is_a_present_routing_value() {
+        let frame = CommunicationValue::new(CommunicationType::Success)
+            .with_id(0)
+            .with_sender(0)
+            .with_receiver(0);
+
+        assert_eq!(frame.require_id(), Ok(0));
+        assert_eq!(frame.require_sender(), Ok(0));
+        assert_eq!(frame.require_receiver(), Ok(0));
     }
 }
 
@@ -147,6 +185,10 @@ impl GeneralConnection {
             app_session: Arc::new(RwLock::new(None)),
             client_version: Arc::new(RwLock::new(conn.version.to_string())),
         }))
+    }
+
+    pub fn connection_kind(&self) -> ConnectionKind {
+        self.connection_kind
     }
 
     pub async fn handle(self: Arc<Self>) {

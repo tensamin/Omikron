@@ -2,7 +2,7 @@ use super::capabilities::PeerCapabilities;
 use crate::{
     config::Config,
     log_cv_in, log_cv_out, log_err, log_in, log_out,
-    rho::connection::{MtpValueCompat, OptionalDataValueCompat},
+    rho::connection::{OptionalDataValueCompat, RequiredMtpFields},
     rho::relay_router,
     rho::rho_manager::RhoManager,
     util::{data_type_id, logger::PrintType},
@@ -16,6 +16,7 @@ use mtp::{
     host::{Policy, SendMode},
 };
 use mtp_transport::ConnectionHandle;
+use rand::RngExt;
 use std::{sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, RwLock, mpsc, oneshot, watch},
@@ -27,6 +28,7 @@ use uuid::Uuid;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(300);
+const RECONNECT_JITTER: Duration = Duration::from_secs(1);
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const CAPABILITY_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(5);
@@ -36,13 +38,29 @@ const MAX_CONCURRENT_REQUESTS: usize = 128;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionOutcome {
+    HealthySessionEnded,
+    FailedBeforeHealthy,
+}
+
+fn reconnect_base_after_outcome(current: Duration, outcome: ConnectionOutcome) -> Duration {
+    match outcome {
+        ConnectionOutcome::HealthySessionEnded => RECONNECT_DELAY,
+        ConnectionOutcome::FailedBeforeHealthy => current,
+    }
+}
+
+fn reconnect_delay_with_jitter(delay: Duration) -> Duration {
+    let max_jitter_ms = std::cmp::min(delay, RECONNECT_JITTER).as_millis() as u64;
+    delay + Duration::from_millis(rand::rng().random_range(0..=max_jitter_ms))
+}
+
 fn client_changed_target(value: &CommunicationValue) -> Option<(i64, i64)> {
     if !value.is_type(CommunicationType::ClientChanged) {
         return None;
     }
-    let receiver = i64::try_from(value.get_receiver())
-        .ok()
-        .filter(|id| *id > 0)?;
+    let receiver = i64::try_from(value.receiver()?).ok().filter(|id| *id > 0)?;
     let session_id = value
         .get_data(DataType::SessionId)
         .as_signed_number()
@@ -284,33 +302,45 @@ impl OmegaConnection {
             }
 
             match self.clone().connect_once().await {
-                Ok(()) => {
-                    // Connection closed gracefully, check if we should reconnect
-                    if *self.reconnect_on_close.read().await {
-                        log_err!(
-                            0,
-                            PrintType::Omega,
-                            "Connection lost, reconnecting in {:?}...",
-                            reconnect_delay
-                        );
-                    } else {
-                        log_in!(0, PrintType::Omega, "Connection closed, not reconnecting");
-                        break;
+                Ok(outcome) => {
+                    reconnect_delay = reconnect_base_after_outcome(reconnect_delay, outcome);
+                    match outcome {
+                        ConnectionOutcome::HealthySessionEnded => {
+                            log_err!(
+                                0,
+                                PrintType::Omega,
+                                "Healthy Omega connection ended; reconnecting"
+                            );
+                        }
+                        ConnectionOutcome::FailedBeforeHealthy => {
+                            log_err!(
+                                0,
+                                PrintType::Omega,
+                                "Omega connection failed before synchronization"
+                            );
+                        }
                     }
                 }
-                Err(e) => {
-                    log_err!(
-                        0,
-                        PrintType::Omega,
-                        "Connection failed: {}, retrying in {:?}...",
-                        e,
-                        reconnect_delay
-                    );
+                Err(error) => {
+                    log_err!(0, PrintType::Omega, "Connection failed: {}", error);
                 }
             }
 
+            if !*self.reconnect_on_close.read().await {
+                log_in!(0, PrintType::Omega, "Connection closed, not reconnecting");
+                break;
+            }
+
+            let retry_delay = reconnect_delay_with_jitter(reconnect_delay);
+            log_err!(
+                0,
+                PrintType::Omega,
+                "Retrying Omega connection in {:?}...",
+                retry_delay
+            );
+
             tokio::select! {
-                _ = sleep(reconnect_delay) => {}
+                _ = sleep(retry_delay) => {}
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         break;
@@ -322,7 +352,7 @@ impl OmegaConnection {
         }
     }
 
-    async fn connect_once(self: Arc<Self>) -> Result<(), String> {
+    async fn connect_once(self: Arc<Self>) -> Result<ConnectionOutcome, String> {
         *self.state.write().await = ConnectionState::Connecting;
 
         let client_config = ClientConfig::new(format!("https://{}:{}", self.host, self.port))
@@ -331,7 +361,6 @@ impl OmegaConnection {
             .with_policy(
                 Policy::default()
                     .with_send_mode(SendMode::SingleStreamPerMessage)
-                    .with_max_message_size(1_000_000_000)
                     .with_timeouts(
                         Duration::from_millis(5_000),
                         Duration::from_millis(5_000),
@@ -343,8 +372,7 @@ impl OmegaConnection {
                     .with_max_concurrent_stream_tasks(64)
                     .with_persistent_stream_retries(5, Duration::from_secs(5)),
             )
-            .with_ping_interval(PING_INTERVAL)
-            .with_max_missed_pings(0);
+            .with_ping_interval(PING_INTERVAL);
 
         let host_public_key = load_public_key_bundle("./omega.mpkb")
             .map_err(|e| format!("Failed to load omega.mpkb: {}", e))?;
@@ -389,7 +417,7 @@ impl OmegaConnection {
                     self.fail_synchronization("capability negotiation", error)
                         .await;
                     let _ = read_handle.await;
-                    return Err("Omega capability negotiation failed".to_string());
+                    return Ok(ConnectionOutcome::FailedBeforeHealthy);
                 }
                 Ok(Err(_)) | Err(_) => {
                     // An Omega from before capability negotiation sends no second
@@ -403,7 +431,7 @@ impl OmegaConnection {
         // Tell omega our current state now that we're actually connected -
         // doing this after teardown (as before) sent into a sender that had
         // already been cleared, silently dropping the sync every time.
-        self.clone().sync_client_iota_status().await;
+        let reached_healthy_state = self.clone().sync_client_iota_status().await;
 
         // Wait for read loop to complete (connection closed)
         let result = read_handle.await;
@@ -428,19 +456,13 @@ impl OmegaConnection {
         *self.state.write().await = ConnectionState::Disconnected;
 
         match result {
-            Ok(()) => {
-                // Check if we should reconnect
-                if *self.reconnect_on_close.read().await {
-                    Err("Connection closed, will reconnect".to_string())
-                } else {
-                    Ok(())
-                }
-            }
+            Ok(()) if reached_healthy_state => Ok(ConnectionOutcome::HealthySessionEnded),
+            Ok(()) => Ok(ConnectionOutcome::FailedBeforeHealthy),
             Err(e) => Err(format!("Read loop error: {}", e)),
         }
     }
 
-    async fn sync_client_iota_status(&self) {
+    async fn sync_client_iota_status(&self) -> bool {
         *self.state.write().await = ConnectionState::SynchronizingRoutes;
         let mut connected_iota_ids: Vec<DataValue> = Vec::new();
         let mut connected_sessions: Vec<DataValue> = Vec::new();
@@ -497,16 +519,16 @@ impl OmegaConnection {
             if let Err(error) = self.send_message_result(&sync_msg).await {
                 self.fail_synchronization("legacy route synchronization", error)
                     .await;
-                return;
+                return false;
             }
             *self.state.write().await = ConnectionState::SynchronizingSubscriptions;
             if let Err(error) = self.restore_presence_subscriptions().await {
                 self.fail_synchronization("subscription restoration", error)
                     .await;
-                return;
+                return false;
             }
             *self.state.write().await = ConnectionState::Ready;
-            return;
+            return true;
         }
 
         let mut response = Err("route synchronization did not start".to_string());
@@ -535,7 +557,7 @@ impl OmegaConnection {
                     );
                     self.fail_synchronization("subscription restoration", error)
                         .await;
-                    return;
+                    return false;
                 }
                 *self.state.write().await = ConnectionState::Ready;
             }
@@ -546,14 +568,15 @@ impl OmegaConnection {
                 );
                 self.fail_synchronization("route synchronization", error)
                     .await;
-                return;
+                return false;
             }
             Err(error) => {
                 self.fail_synchronization("route synchronization", error)
                     .await;
-                return;
+                return false;
             }
         }
+        true
     }
 
     async fn fail_synchronization(&self, phase: &str, error: String) {
@@ -600,8 +623,39 @@ impl OmegaConnection {
                             }
 
                             if cv.is_type(CommunicationType::Relay) {
-                                let destination_iota = cv.receiver().unwrap_or_default();
-                                let request_id = cv.get_id();
+                                let request_id = match cv.require_id() {
+                                    Ok(request_id) => request_id,
+                                    Err(error) => {
+                                        log_err!(
+                                            self.omikron_id as i64,
+                                            PrintType::Omega,
+                                            "Rejected malformed relay: {}",
+                                            error
+                                        );
+                                        let response =
+                                            CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                                                .without_id();
+                                        let _ = self.send_message_result(&response).await;
+                                        continue;
+                                    }
+                                };
+                                let destination_iota = match cv.require_receiver() {
+                                    Ok(destination_iota) => destination_iota,
+                                    Err(error) => {
+                                        log_err!(
+                                            self.omikron_id as i64,
+                                            PrintType::Omega,
+                                            "Rejected malformed relay: {}",
+                                            error
+                                        );
+                                        let response = CommunicationValue::new(
+                                            CommunicationType::ErrorInvalidData,
+                                        )
+                                        .with_id(request_id);
+                                        let _ = self.send_message_result(&response).await;
+                                        continue;
+                                    }
+                                };
                                 let response = match relay_router::route_from_omega(&self.rho, cv).await {
                                     Ok(()) => CommunicationValue::new(CommunicationType::Success)
                                         .with_id(request_id),
@@ -630,7 +684,18 @@ impl OmegaConnection {
                                 continue;
                             }
 
-                            let msg_id = cv.get_id();
+                            let msg_id = match cv.require_id() {
+                                Ok(msg_id) => msg_id,
+                                Err(error) => {
+                                    log_err!(
+                                        self.omikron_id as i64,
+                                        PrintType::Omega,
+                                        "Discarded response without an MTP id: {}",
+                                        error
+                                    );
+                                    continue;
+                                }
+                            };
                             if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
                                 if (task.task)(self.clone(), cv.clone()) {
                                     continue;
@@ -749,6 +814,7 @@ impl OmegaConnection {
         self.try_send_message(cv).await
     }
 
+    #[allow(dead_code)]
     pub async fn supports_set_user_state(&self) -> bool {
         self.peer_capabilities.read().await.set_user_state_v1
     }
@@ -807,10 +873,12 @@ impl OmegaConnection {
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
+        let msg_id = cv
+            .require_id()
+            .map_err(|error| format!("request is missing correlation id: {error}"))?;
         self.await_connection(timeout_duration).await?;
 
         let (tx, mut rx) = mpsc::channel(1);
-        let msg_id = cv.get_id();
 
         self.waiting_tasks.insert(
             msg_id,
@@ -819,9 +887,9 @@ impl OmegaConnection {
                     log_in!(
                         0,
                         PrintType::Omega,
-                        "Matched Omega response (request_id={}, response_id={}, type={})",
+                        "Matched Omega response (request_id={}, response_id={:?}, type={})",
                         msg_id,
-                        response_cv.get_id(),
+                        response_cv.id(),
                         response_cv
                             .get_comm_type_enum()
                             .map(|kind| kind.to_string())
@@ -880,7 +948,7 @@ impl OmegaConnection {
     pub async fn close_iota(&self, iota_id: i64) -> Result<(), String> {
         let cv = CommunicationValue::new(CommunicationType::IotaDisconnected)
             .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()));
-        let request_id = cv.get_id();
+        let request_id = cv.require_id().map_err(|error| error.to_string())?;
         let result = self.lifecycle_request(&cv).await;
         if let Err(error) = &result {
             self.log_lifecycle_failure("IotaDisconnected", iota_id, None, request_id, error);
@@ -897,7 +965,7 @@ impl OmegaConnection {
                 DataType::SessionId,
                 DataValue::SignedNumber(session_id.into()),
             );
-        let request_id = cv.get_id();
+        let request_id = cv.require_id().map_err(|error| error.to_string())?;
         let result = self.lifecycle_request(&cv).await;
         if let Err(error) = &result {
             self.log_lifecycle_failure(
@@ -938,7 +1006,7 @@ impl OmegaConnection {
                         .as_millis() as i128,
                 ),
             );
-        let request_id = request.get_id();
+        let request_id = request.require_id().map_err(|error| error.to_string())?;
         let result = self.lifecycle_request(&request).await;
         if let Err(error) = &result {
             self.log_lifecycle_failure(
@@ -956,7 +1024,7 @@ impl OmegaConnection {
     pub async fn iota_connected(&self, iota_id: i64) -> Result<(), String> {
         let request = CommunicationValue::new(CommunicationType::IotaConnected)
             .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()));
-        let request_id = request.get_id();
+        let request_id = request.require_id().map_err(|error| error.to_string())?;
         let result = self.lifecycle_request(&request).await;
         if let Err(error) = &result {
             self.log_lifecycle_failure("IotaConnected", iota_id, None, request_id, error);
@@ -965,6 +1033,7 @@ impl OmegaConnection {
         result
     }
 
+    #[allow(dead_code)]
     pub async fn reconcile_routes(&self) {
         self.sync_client_iota_status().await;
     }
@@ -1174,7 +1243,11 @@ impl OmegaConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{PeerCapabilities, client_changed_target, parse_omega_capability_response};
+    use super::{
+        ConnectionOutcome, MAX_RECONNECT_DELAY, PeerCapabilities, RECONNECT_DELAY,
+        client_changed_target, parse_omega_capability_response, reconnect_base_after_outcome,
+        reconnect_delay_with_jitter,
+    };
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 
     fn notification() -> CommunicationValue {
@@ -1196,6 +1269,9 @@ mod tests {
         let mut missing_state = notification();
         missing_state.remove_data(DataType::UserState);
         assert_eq!(client_changed_target(&missing_state), None);
+
+        let missing_receiver = notification().without_receiver();
+        assert_eq!(client_changed_target(&missing_receiver), None);
     }
 
     #[test]
@@ -1206,6 +1282,35 @@ mod tests {
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(20))
             .add_typed_default(DataType::UserState, DataValue::Str("user_online".into()));
         assert_eq!(client_changed_target(&invalid), None);
+    }
+
+    #[test]
+    fn reconnect_jitter_is_bounded_without_changing_the_base_delay() {
+        for _ in 0..32 {
+            let delay = reconnect_delay_with_jitter(RECONNECT_DELAY);
+            assert!(delay >= RECONNECT_DELAY);
+            assert!(delay <= RECONNECT_DELAY + std::time::Duration::from_secs(1));
+        }
+
+        assert!(MAX_RECONNECT_DELAY > RECONNECT_DELAY);
+    }
+
+    #[test]
+    fn healthy_session_resets_accumulated_reconnect_backoff() {
+        let mut delay = RECONNECT_DELAY;
+        for _ in 0..4 {
+            delay = std::cmp::min(delay * 2, MAX_RECONNECT_DELAY);
+        }
+        assert!(delay > RECONNECT_DELAY);
+
+        assert_eq!(
+            reconnect_base_after_outcome(delay, ConnectionOutcome::FailedBeforeHealthy),
+            delay
+        );
+        assert_eq!(
+            reconnect_base_after_outcome(delay, ConnectionOutcome::HealthySessionEnded),
+            RECONNECT_DELAY
+        );
     }
 
     #[test]
