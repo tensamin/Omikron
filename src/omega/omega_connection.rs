@@ -657,8 +657,7 @@ impl OmegaConnection {
                                     }
                                 };
                                 let response = match relay_router::route_from_omega(&self.rho, cv).await {
-                                    Ok(()) => CommunicationValue::new(CommunicationType::Success)
-                                        .with_id(request_id),
+                                    Ok(response) => response.with_id(request_id),
                                     Err(error) => {
                                         log_err!(
                                             self.omikron_id as i64,

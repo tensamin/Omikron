@@ -166,8 +166,8 @@ impl ClientConnection {
                     None => Err(relay_router::RelayRouteError::DestinationIotaNotLocal),
                 };
                 let response = match result {
-                    Ok(()) => {
-                        CommunicationValue::new(CommunicationType::Success).with_id(message_id)
+                    Ok(response) => {
+                        response.with_id(message_id)
                     }
                     Err(error) => {
                         log_err!(
@@ -198,6 +198,25 @@ impl ClientConnection {
             ) {
                 self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
                     .await;
+                return;
+            }
+
+            if matches!(
+                relay_router::message_security_class(&cv),
+                relay_router::MessageSecurityClass::AuthenticatedPeerControl
+            ) {
+                let Some(rho) = self.get_rho_connection().await else {
+                    self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                        .await;
+                    return;
+                };
+                match rho.await_peer_control(&cv.with_sender(self.user_id)).await {
+                    Ok(response) => self.send_message(&response).await,
+                    Err(_) => {
+                        self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                            .await;
+                    }
+                }
                 return;
             }
 
@@ -884,7 +903,7 @@ impl ClientConnection {
 
                         let response = CommunicationValue::new(CommunicationType::LoadTxtRecord)
                             .with_id(message_id)
-                            .add_typed_default(DataType::AppContent, DataValue::Str(record_text));
+                            .add_typed_default(DataType::Content, DataValue::Str(record_text));
                         self.send_message(&response).await;
                         return;
                     }

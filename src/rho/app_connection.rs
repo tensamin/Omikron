@@ -135,9 +135,7 @@ impl AppConnection {
                     None => Err(relay_router::RelayRouteError::DestinationIotaNotLocal),
                 };
                 let response = match result {
-                    Ok(()) => {
-                        CommunicationValue::new(CommunicationType::Success).with_id(message_id)
-                    }
+                    Ok(response) => response.with_id(message_id),
                     Err(error) => {
                         log_err!(
                             self.user_id as i64,

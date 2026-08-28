@@ -129,6 +129,20 @@ where
     }
 }
 
+fn parse_positive_or_default<T>(name: &'static str, default: T) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr + PartialEq + Default,
+{
+    let value = parse_or_default(name, default)?;
+    if value == T::default() {
+        return Err(ConfigError::InvalidValue {
+            name,
+            kind: "positive number",
+        });
+    }
+    Ok(value)
+}
+
 fn livekit_from_environment() -> Result<Option<LiveKitConfig>, ConfigError> {
     livekit_from_values(
         env::var("LIVEKIT_HOSTNAME").ok(),

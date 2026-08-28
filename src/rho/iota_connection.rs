@@ -276,7 +276,7 @@ impl IotaConnection {
             )
             .await
             {
-                Ok(()) => CommunicationValue::new(CommunicationType::Success).with_id(message_id),
+                Ok(response) => response.with_id(message_id),
                 Err(error) => {
                     log_err!(
                         self.iota_id as i64,

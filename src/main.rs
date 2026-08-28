@@ -57,6 +57,17 @@ async fn main() {
             return;
         }
     };
+    let keyring = match load_or_create_keyring(
+        &identity_secret,
+        KEYRING_PATH,
+        PUBLIC_KEY_PATH,
+    ) {
+        Ok(keyring) => keyring,
+        Err(error) => {
+            eprintln!("Unable to load Omikron keyring: {error}");
+            return;
+        }
+    };
     let public_key = match omega_database_public_key(&keyring) {
         Ok(public_key) => public_key,
         Err(error) => {

@@ -328,6 +328,16 @@ impl RhoConnection {
             .await
     }
 
+    pub async fn await_peer_control(
+        &self,
+        cv: &CommunicationValue,
+    ) -> Result<CommunicationValue, String> {
+        self.iota_connection
+            .clone()
+            .await_response(cv, Some(std::time::Duration::from_secs(20)))
+            .await
+    }
+
     pub async fn forward_relay_ack(&self, user_id: u64, frame_id: u32) {
         let acknowledgement = CommunicationValue::new(CommunicationType::Success)
             .with_id(frame_id)

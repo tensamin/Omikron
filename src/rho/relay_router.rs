@@ -140,7 +140,7 @@ pub async fn route_relay(
     state: &Arc<AppState>,
     source: RelaySource,
     frame: CommunicationValue,
-) -> Result<(), RelayRouteError> {
+) -> Result<CommunicationValue, RelayRouteError> {
     let (next_hop, frame) = prepare_frame(ensure_relay_frame_id(frame))?;
     validate_source_next_hop(source, next_hop)?;
 
@@ -169,7 +169,7 @@ pub async fn route_relay(
 pub async fn route_from_omega(
     rho: &RhoManager,
     frame: CommunicationValue,
-) -> Result<(), RelayRouteError> {
+) -> Result<CommunicationValue, RelayRouteError> {
     let (next_hop, frame) = prepare_frame(ensure_relay_frame_id(frame))?;
     let RouteTarget::Iota(iota_id) = next_hop else {
         return Err(RelayRouteError::InvalidRouteTarget(next_hop.id()));
@@ -193,7 +193,7 @@ async fn route_from_iota(
     source_iota_id: u64,
     next_hop: RouteTarget,
     frame: CommunicationValue,
-) -> Result<(), RelayRouteError> {
+) -> Result<CommunicationValue, RelayRouteError> {
     match next_hop {
         RouteTarget::User(user_id) => {
             let target = rho
@@ -206,7 +206,7 @@ async fn route_from_iota(
             if !target.has_local_client(user_id).await {
                 return Err(RelayRouteError::ClientOffline);
             }
-            target.send_relay_to_client(&frame).await.map_err(|error| {
+            target.send_relay_to_client(&frame).await.map(|_| CommunicationValue::new(CommunicationType::Success)).map_err(|error| {
                 if error == "client offline" {
                     RelayRouteError::ClientOffline
                 } else {
@@ -240,9 +240,9 @@ async fn route_from_iota(
     }
 }
 
-fn route_response(response: CommunicationValue) -> Result<(), RelayRouteError> {
+fn route_response(response: CommunicationValue) -> Result<CommunicationValue, RelayRouteError> {
     if response.is_type(CommunicationType::Success) {
-        Ok(())
+        Ok(response)
     } else {
         Err(RelayRouteError::Send(format!(
             "next Relay hop rejected the frame with {}",
@@ -406,5 +406,16 @@ mod tests {
             Some(RouteTarget::Iota(7))
         );
         assert_eq!(RouteTarget::from_wire_id(7), None);
+    }
+
+    #[test]
+    fn successful_route_response_is_not_reconstructed() {
+        let response = CommunicationValue::new(CommunicationType::Success)
+            .with_payload(DataValue::Bytes(vec![9, 8, 7]));
+        let routed = match super::route_response(response.clone()) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        assert_eq!(routed.payload(), response.payload());
     }
 }
