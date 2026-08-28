@@ -78,6 +78,13 @@ impl CallManager {
         call_groups
     }
 
+    pub async fn remove_user_from_calls(&self, user_id: u64) {
+        let call_groups = self.get_call_groups(user_id).await;
+        for call_group in call_groups {
+            call_group.remove_caller(user_id).await;
+        }
+    }
+
     pub async fn get_call_token(&self, user_id: u64, call_id: Uuid) -> Result<String, CallError> {
         if let Some(cg) = self.groups.get(&call_id) {
             let mut members = cg.members.write().await;
@@ -219,6 +226,30 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn removing_user_from_calls_removes_membership_and_invitation_secret() {
+        let call_id = Uuid::new_v4();
+        let sender_id = 55;
+        let anonymous_user_id = 66;
+        let group = Arc::new(CallGroup::new(
+            call_id,
+            Arc::new(Caller::new(sender_id, call_id, true)),
+        ));
+        let manager = CallManager::default();
+        manager.groups.insert(call_id, group.clone());
+
+        assert!(
+            manager
+                .add_invite(call_id, sender_id, anonymous_user_id, envelope("anonymous"),)
+                .await
+        );
+
+        manager.remove_user_from_calls(anonymous_user_id).await;
+
+        assert!(group.get_caller(anonymous_user_id).await.is_none());
+        assert!(group.get_secret_for_user(anonymous_user_id).await.is_none());
     }
 
     #[test]

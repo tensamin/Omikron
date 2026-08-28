@@ -31,7 +31,7 @@ pub struct AnonymousClientConnection {
 
 impl AnonymousClientConnection {
     pub async fn from_general(general: Arc<GeneralConnection>, user_id: u64) -> Arc<Self> {
-        let username: String = generate_username();
+        let username = generate_username(user_id);
         Arc::new(Self {
             state: general.state.clone(),
             user_id: user_id,
@@ -47,6 +47,7 @@ impl AnonymousClientConnection {
         })
     }
     pub fn start(self: Arc<Self>) {
+        anonymous_manager::add_anonymous_user(self.clone());
         let self_clone = self.clone();
         tokio::spawn(async move {
             while let Ok(cv) = self_clone.receiver.receive().await {
@@ -608,10 +609,13 @@ impl AnonymousClientConnection {
         }
     }
 
-    /// Handle connection close
     pub async fn handle_close(&self) {
-
-        // TODO delete temp user
+        *self.is_open.write().await = false;
+        self.state
+            .call_manager
+            .remove_user_from_calls(self.user_id)
+            .await;
+        anonymous_manager::remove_anonymous_user(self.user_id).await;
     }
 }
 

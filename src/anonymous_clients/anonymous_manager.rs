@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use once_cell::sync::Lazy;
 use rand::prelude::{IndexedRandom, RngExt};
 use std::sync::Arc;
@@ -7,15 +8,20 @@ use crate::anonymous_clients::anonymous_client_connection::AnonymousClientConnec
 
 static ANONYMOUS_USERS: Lazy<DashMap<u64, Arc<AnonymousClientConnection>>> =
     Lazy::new(|| DashMap::new());
+static ANONYMOUS_USERNAMES: Lazy<DashMap<String, u64>> = Lazy::new(|| DashMap::new());
 
-#[allow(dead_code)]
-pub async fn add_anonymous_user(connection: Arc<AnonymousClientConnection>) {
+pub fn add_anonymous_user(connection: Arc<AnonymousClientConnection>) {
     ANONYMOUS_USERS.insert(connection.get_user_id(), connection);
 }
 
 #[allow(dead_code)]
 pub async fn remove_anonymous_user(user_id: u64) {
-    ANONYMOUS_USERS.remove(&user_id);
+    if let Some((_, connection)) = ANONYMOUS_USERS.remove(&user_id) {
+        let username = connection.get_user_name().await;
+        ANONYMOUS_USERNAMES.remove_if(&username, |_, reserved_user_id| {
+            *reserved_user_id == user_id
+        });
+    }
 }
 
 pub async fn get_anonymous_user(user_id: u64) -> Option<Arc<AnonymousClientConnection>> {
@@ -25,30 +31,52 @@ pub async fn get_anonymous_user(user_id: u64) -> Option<Arc<AnonymousClientConne
 pub async fn get_anonymous_user_by_name(
     username: String,
 ) -> Option<Arc<AnonymousClientConnection>> {
-    let users: Vec<_> = ANONYMOUS_USERS
-        .iter()
-        .map(|ref_multi| ref_multi.value().clone())
-        .collect();
-
-    for user_conn in users {
-        if user_conn.get_user_name().await == username {
-            return Some(user_conn);
-        }
-    }
-
-    return None;
+    let user_id = ANONYMOUS_USERNAMES
+        .get(&username.to_lowercase())?
+        .value()
+        .to_owned();
+    get_anonymous_user(user_id).await
 }
 
-// TODO: implement check if taken
-pub fn generate_username() -> String {
+pub fn generate_username(user_id: u64) -> String {
     let adjectives = ["Swift", "Clever", "Brave", "Sneaky", "Fierce"];
     let nouns = ["Tiger", "Eagle", "Shark", "Wolf", "Dragon"];
 
     let mut rng = rand::rng();
-    let adj = adjectives.choose(&mut rng).unwrap();
-    let noun = nouns.choose(&mut rng).unwrap();
+    loop {
+        let Some(adj) = adjectives.choose(&mut rng) else {
+            continue;
+        };
+        let Some(noun) = nouns.choose(&mut rng) else {
+            continue;
+        };
+        let username = format!("{}{}{}", adj, noun, rng.random_range(0..10000));
+        let canonical_username = username.to_lowercase();
 
-    let number: u16 = rng.random_range(0..10000);
+        if reserve_username(canonical_username, user_id) {
+            return username;
+        }
+    }
+}
 
-    format!("{}{}{}", adj, noun, number)
+fn reserve_username(username: String, user_id: u64) -> bool {
+    if let Entry::Vacant(entry) = ANONYMOUS_USERNAMES.entry(username) {
+        entry.insert(user_id);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn username_reservation_is_unique() {
+        let username = "anonymous-manager-reservation-test".to_string();
+        assert!(reserve_username(username.clone(), 1));
+        assert!(!reserve_username(username.clone(), 2));
+        ANONYMOUS_USERNAMES.remove(&username);
+    }
 }

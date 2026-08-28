@@ -1,4 +1,3 @@
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,10 +74,23 @@ pub async fn complete_register(
     }
     println!("Iota connection request");
 
+    let pub_key_bytes = match pub_key.try_as_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log_err!(
+                0,
+                PrintType::General,
+                "Failed to serialize Iota public key: {}",
+                error
+            );
+            return 0;
+        }
+    };
+
     let request = CommunicationValue::new(CommunicationType::CompleteRegisterIota)
         .add_typed_default(
             DataType::PublicKey,
-            DataValue::Str(BASE64_STD.encode(pub_key.as_bytes())),
+            DataValue::Str(BASE64_STD.encode(pub_key_bytes)),
         );
 
     let response = match omega
@@ -109,7 +121,7 @@ pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
     let key_pem = load_file_vec("certs", "key.pem").expect("Error loading Keyfile");
 
     let host_config = HostConfig::new(
-        IpAddr::from(Ipv4Addr::new(0, 0, 0, 0)),
+        state.config.bind_address,
         state.config.rho_port,
         cert_pem,
         key_pem,
@@ -154,7 +166,8 @@ pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
     log!(
         0,
         PrintType::General,
-        "Server listening on port {}.",
+        "Server listening on {}:{}.",
+        state.config.bind_address,
         state.config.rho_port
     );
 

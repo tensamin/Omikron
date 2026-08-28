@@ -45,6 +45,10 @@ impl AppState {
     }
 
     pub fn keyring_for_host(&self) -> Result<Keyring, String> {
-        Keyring::from_bytes(&self.keyring.to_bytes()).map_err(|error| error.to_string())
+        let bytes = self
+            .keyring
+            .try_to_bytes()
+            .map_err(|error| error.to_string())?;
+        Keyring::from_bytes(&bytes).map_err(|error| error.to_string())
     }
 }

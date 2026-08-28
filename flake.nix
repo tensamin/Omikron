@@ -145,6 +145,12 @@
                 description = "Port the Omikron server listens on for incoming QUIC connections.";
               };
 
+              bindAddress = lib.mkOption {
+                type = lib.types.str;
+                default = "0.0.0.0";
+                description = "IP address to bind the Omikron server to.";
+              };
+
               omegaHost = lib.mkOption {
                 type = lib.types.str;
                 default = "tensamin.net";
@@ -189,6 +195,7 @@
 
                 environment = {
                   RHO_PORT = toString cfg.rhoPort;
+                  BIND_ADDRESS = cfg.bindAddress;
                   OMEGA_HOST = cfg.omegaHost;
                   OMEGA_PORT = toString cfg.omegaPort;
                 };

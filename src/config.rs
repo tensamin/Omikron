@@ -1,8 +1,9 @@
-use std::{env, time::Duration};
+use std::{env, net::IpAddr, time::Duration};
 
 use thiserror::Error;
 
 const DEFAULT_RHO_PORT: u16 = 443;
+const DEFAULT_BIND_ADDRESS: &str = "0.0.0.0";
 const DEFAULT_OMEGA_HOST: &str = "tensamin.net";
 const DEFAULT_OMEGA_PORT: u16 = 9187;
 const DEFAULT_OMEGA_SYNC_TIMEOUT_SECONDS: u64 = 20;
@@ -18,6 +19,7 @@ pub struct LiveKitConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub rho_port: u16,
+    pub bind_address: IpAddr,
     pub omega_host: String,
     pub omega_port: u16,
     pub omikron_id: u64,
@@ -43,6 +45,7 @@ pub enum ConfigError {
 impl Config {
     pub fn from_environment() -> Result<Self, ConfigError> {
         let rho_port = parse_or_default("RHO_PORT", DEFAULT_RHO_PORT)?;
+        let bind_address = parse_bind_address(env::var("BIND_ADDRESS").ok())?;
         let omega_port = parse_or_default("OMEGA_PORT", DEFAULT_OMEGA_PORT)?;
         let omikron_id = parse_or_default("ID", 0_u64)?;
         // Each synchronization request is bounded by this timeout. After
@@ -68,6 +71,7 @@ impl Config {
 
         Ok(Self {
             rho_port,
+            bind_address,
             omega_host,
             omega_port,
             omikron_id,
@@ -76,6 +80,18 @@ impl Config {
             livekit: livekit_from_environment()?,
         })
     }
+}
+
+fn parse_bind_address(value: Option<String>) -> Result<IpAddr, ConfigError> {
+    value
+        .as_deref()
+        .unwrap_or(DEFAULT_BIND_ADDRESS)
+        .trim()
+        .parse()
+        .map_err(|_| ConfigError::InvalidValue {
+            name: "BIND_ADDRESS",
+            kind: "IP address",
+        })
 }
 
 fn parse_or_default<T>(name: &'static str, default: T) -> Result<T, ConfigError>
@@ -146,6 +162,25 @@ mod tests {
                 api_key: "key".to_string(),
                 api_secret: "secret".to_string(),
             }))
+        );
+    }
+
+    #[test]
+    fn parses_configured_bind_address() {
+        assert_eq!(
+            parse_bind_address(Some("10.200.2.0".to_string())),
+            Ok(IpAddr::V4(std::net::Ipv4Addr::new(10, 200, 2, 0)))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_bind_address() {
+        assert_eq!(
+            parse_bind_address(Some("not-an-address".to_string())),
+            Err(ConfigError::InvalidValue {
+                name: "BIND_ADDRESS",
+                kind: "IP address",
+            })
         );
     }
 }

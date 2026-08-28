@@ -205,7 +205,7 @@ fn format_data_container(data: Vec<(DataTypeId, DataValue)>, version: Version) -
             let key_str = key.to_string();
 
             match value {
-                DataValue::Str(s) => format!("{}=\"{}\"", key_str, s),
+                DataValue::Str(s) => format!("{}=\"{}\"", key_str, abbreviate_string(&s)),
 
                 DataValue::Container(inner) => {
                     let inner_formatted = format_data_container(inner, version.clone());
@@ -238,7 +238,7 @@ fn format_array(arr: Vec<DataValue>, version: Version) -> String {
     let parts: Vec<String> = arr
         .into_iter()
         .map(|value| match value {
-            DataValue::Str(s) => format!("\"{}\"", s),
+            DataValue::Str(s) => format!("\"{}\"", abbreviate_string(&s)),
 
             DataValue::Container(inner) => {
                 let inner_formatted = format_data_container(inner, version.clone());
@@ -264,6 +264,31 @@ fn format_array(arr: Vec<DataValue>, version: Version) -> String {
         .collect();
 
     parts.join(", ")
+}
+
+fn abbreviate_string(value: &str) -> String {
+    const EDGE_LENGTH: usize = 4;
+
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= EDGE_LENGTH * 2 {
+        return value.to_string();
+    }
+
+    let prefix: String = chars.iter().take(EDGE_LENGTH).collect();
+    let suffix: String = chars.iter().rev().take(EDGE_LENGTH).rev().collect();
+    format!("{prefix}...{suffix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::abbreviate_string;
+
+    #[test]
+    fn abbreviates_only_strings_longer_than_eight_characters() {
+        assert_eq!(abbreviate_string("12345678"), "12345678");
+        assert_eq!(abbreviate_string("123456789"), "1234...6789");
+        assert_eq!(abbreviate_string("YWJjZGVmZ2hpag=="), "YWJj...ag==");
+    }
 }
 
 #[macro_export]

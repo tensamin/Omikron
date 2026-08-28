@@ -260,6 +260,7 @@ impl CallGroup {
             .write()
             .await
             .retain(|caller| caller.user_id != user_id);
+        self.secrets.write().await.remove(&user_id);
     }
 
     pub async fn get_short_link(self: Arc<Self>) -> Option<String> {
