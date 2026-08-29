@@ -95,6 +95,10 @@ pub fn message_security_class(frame: &CommunicationValue) -> MessageSecurityClas
     } else if frame.is_type(CommunicationType::GetChatSecret)
         || frame.is_type(CommunicationType::MessageGet)
         || frame.is_type(CommunicationType::MessagesGet)
+        || frame.is_type(CommunicationType::SyncedSettingSet)
+        || frame.is_type(CommunicationType::SyncedSettingGet)
+        || frame.is_type(CommunicationType::SyncedSettingDelete)
+        || frame.is_type(CommunicationType::SyncedSettingsList)
     {
         MessageSecurityClass::AuthenticatedPeerControl
     } else {
@@ -296,7 +300,8 @@ mod tests {
     use mtp::codec::{CommunicationType, CommunicationValue, DataValue};
 
     use super::{
-        RelayRouteError, RelaySource, RouteTarget, prepare_frame, validate_source_next_hop,
+        MessageSecurityClass, RelayRouteError, RelaySource, RouteTarget, message_security_class,
+        prepare_frame, validate_source_next_hop,
     };
 
     fn wire(target: RouteTarget) -> u64 {
@@ -417,5 +422,38 @@ mod tests {
             Err(_) => return,
         };
         assert_eq!(routed.payload(), response.payload());
+    }
+
+    #[test]
+    fn synchronized_setting_requests_use_authenticated_peer_control() {
+        for setting_type in [
+            CommunicationType::SyncedSettingSet,
+            CommunicationType::SyncedSettingGet,
+            CommunicationType::SyncedSettingDelete,
+            CommunicationType::SyncedSettingsList,
+        ] {
+            let frame = CommunicationValue::new(setting_type);
+            assert_eq!(
+                message_security_class(&frame),
+                MessageSecurityClass::AuthenticatedPeerControl
+            );
+        }
+    }
+
+    #[test]
+    fn synchronized_setting_requests_are_not_relay_only() {
+        for setting_type in [
+            CommunicationType::SyncedSettingSet,
+            CommunicationType::SyncedSettingGet,
+            CommunicationType::SyncedSettingDelete,
+            CommunicationType::SyncedSettingsList,
+            CommunicationType::SyncedSettingChanged,
+        ] {
+            let frame = CommunicationValue::new(setting_type);
+            assert_ne!(
+                message_security_class(&frame),
+                MessageSecurityClass::RelayOnly
+            );
+        }
     }
 }

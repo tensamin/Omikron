@@ -18,6 +18,16 @@ pub struct RhoConnection {
     app_connections: DashMap<(u64, String, Uuid), Arc<AppConnection>>,
 }
 
+fn message_targets_client(cv: &CommunicationValue, user_id: u64, session_id: u64) -> bool {
+    if cv.receiver() != Some(user_id) {
+        return false;
+    }
+    let Some(target_session_id) = cv.get_data(DataType::SessionId).as_number() else {
+        return true;
+    };
+    target_session_id == i128::from(session_id)
+}
+
 impl RhoConnection {
     /// Create a new RhoConnection
     pub async fn new(iota_connection: Arc<IotaConnection>, user_ids: Vec<i64>) -> Self {
@@ -254,24 +264,18 @@ impl RhoConnection {
     /// Send message from Iota to specific client
     pub async fn message_to_client(&self, cv: CommunicationValue) {
         let connections = self.get_client_connections().await;
-        let Some(receiver_id) = cv.receiver() else {
+        if cv.receiver().is_none() {
             log_err!(
                 0,
                 crate::util::logger::PrintType::General,
                 "Discarded message without an MTP receiver"
             );
             return;
-        };
-        let session_id = cv.get_data(DataType::SessionId).as_number();
+        }
 
         for connection in connections.iter() {
-            if connection.user_id != receiver_id {
+            if !message_targets_client(&cv, connection.user_id, connection.session_id) {
                 continue;
-            }
-            if let Some(session_id) = session_id {
-                if connection.session_id as i128 != session_id {
-                    continue;
-                }
             }
             connection.clone().send_message(&cv).await;
         }
@@ -355,5 +359,22 @@ impl RhoConnection {
     #[allow(dead_code)]
     pub async fn client_count(&self) -> usize {
         self.client_connections.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::message_targets_client;
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType};
+
+    #[test]
+    fn sessionless_setting_change_targets_all_devices_for_one_user() {
+        let event =
+            CommunicationValue::new(CommunicationType::SyncedSettingChanged).with_receiver(7);
+
+        assert!(message_targets_client(&event, 7, 1));
+        assert!(message_targets_client(&event, 7, 2));
+        assert!(!message_targets_client(&event, 8, 1));
+        assert!(event.get_data(DataType::SessionId).is_none());
     }
 }

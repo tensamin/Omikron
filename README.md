@@ -7,7 +7,7 @@ The Omikron is only used when the Iota is in Centralized and Hybrid mode, or whe
 
 ## Configuration
 
-`OMIKRON_IDENTITY_SECRET` is required. Provision it through the deployment's secret environment before starting Omikron. Omikron uses it to load `omikron.mk` as a protected keyring and fails startup if the secret or existing identity cannot be loaded.
+Omikron stores its keyring unencrypted in `omikron.mk` and its public key bundle in `omikron.mpkb`. If the keyring does not exist, Omikron generates it on startup.
 
 Rho connection budgets can be configured with:
 
@@ -19,11 +19,3 @@ Rho connection budgets can be configured with:
 semaphore and to the MTP WebServer admission semaphore. This means the same
 budget limits transport handshakes and authenticated Rho sessions instead of
 only limiting connections after authentication.
-
-To migrate an existing raw `omikron.mk`, provision `OMIKRON_IDENTITY_SECRET` and run:
-
-```sh
-cargo run --features raw-migration --bin migrate_raw_keyring
-```
-
-The normal Omikron binary does not enable raw keyring support.

@@ -302,14 +302,19 @@ impl IotaConnection {
             return;
         }
 
+        log_cv_in!(PrintType::Iota, cv);
+
+        if cv.is_type(CommunicationType::SyncedSettingChanged) {
+            self.forward_to_client(cv).await;
+            return;
+        }
+
         let msg_id = message_id;
         if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
             if (task)(self.clone(), cv.clone()) {
                 return;
             }
         }
-
-        log_cv_in!(PrintType::Iota, cv);
 
         let cv = if cv.is_type(CommunicationType::ClientStateSync) {
             self.add_call_state(cv).await

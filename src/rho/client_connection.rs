@@ -17,6 +17,13 @@ use tokio::sync::RwLock;
 use trust_dns_resolver::TokioAsyncResolver;
 use uuid::Uuid;
 
+fn authenticated_peer_control_request(
+    cv: &CommunicationValue,
+    user_id: u64,
+) -> CommunicationValue {
+    cv.clone().with_sender(user_id)
+}
+
 pub struct ClientConnection {
     pub state: Arc<AppState>,
     pub user_id: u64,
@@ -210,7 +217,10 @@ impl ClientConnection {
                         .await;
                     return;
                 };
-                match rho.await_peer_control(&cv.with_sender(self.user_id)).await {
+                match rho
+                    .await_peer_control(&authenticated_peer_control_request(&cv, self.user_id))
+                    .await
+                {
                     Ok(response) => self.send_message(&response).await,
                     Err(_) => {
                         self.send_error_response(message_id, CommunicationType::ErrorInternal)
@@ -965,6 +975,29 @@ impl ClientConnection {
         if let Some(rho_conn) = self.state.rho.get_for_user(user_id as i64).await {
             rho_conn.close_client_connection(self.clone()).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::authenticated_peer_control_request;
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+
+    #[test]
+    fn peer_control_requests_replace_a_client_supplied_sender() {
+        let request = CommunicationValue::new(CommunicationType::SyncedSettingSet)
+            .with_sender(99)
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(99));
+
+        let authenticated = authenticated_peer_control_request(&request, 7);
+
+        assert_eq!(authenticated.sender(), Some(7));
+        assert_eq!(
+            authenticated
+                .get_data(DataType::UserId)
+                .and_then(|value| value.as_number()),
+            Some(99)
+        );
     }
 }
 

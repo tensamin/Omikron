@@ -24,9 +24,7 @@ use crate::{
     app_state::AppState,
     calls::{call_manager::CallManager, call_util::LiveKitService},
     config::Config,
-    identity::{
-        KEYRING_PATH, PUBLIC_KEY_PATH, identity_secret_from_environment, load_or_create_keyring,
-    },
+    identity::{KEYRING_PATH, PUBLIC_KEY_PATH, load_or_create_keyring},
     omega::omega_connection::{OmegaConnection, start_task_cleanup_loop},
     rho::rho_manager::RhoManager,
     rho::server::start,
@@ -50,18 +48,7 @@ async fn main() {
         }
     };
 
-    let identity_secret = match identity_secret_from_environment() {
-        Ok(secret) => secret,
-        Err(error) => {
-            eprintln!("Unable to load Omikron identity secret: {error}");
-            return;
-        }
-    };
-    let keyring = match load_or_create_keyring(
-        &identity_secret,
-        KEYRING_PATH,
-        PUBLIC_KEY_PATH,
-    ) {
+    let keyring = match load_or_create_keyring(KEYRING_PATH, PUBLIC_KEY_PATH) {
         Ok(keyring) => keyring,
         Err(error) => {
             eprintln!("Unable to load Omikron keyring: {error}");

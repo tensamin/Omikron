@@ -2030,7 +2030,6 @@ dependencies = [
  "tokio",
  "trust-dns-resolver",
  "uuid",
- "zeroize",
 ]
 
 [[package]]
