@@ -210,13 +210,17 @@ async fn route_from_iota(
             if !target.has_local_client(user_id).await {
                 return Err(RelayRouteError::ClientOffline);
             }
-            target.send_relay_to_client(&frame).await.map(|_| CommunicationValue::new(CommunicationType::Success)).map_err(|error| {
-                if error == "client offline" {
-                    RelayRouteError::ClientOffline
-                } else {
-                    RelayRouteError::Send(error)
-                }
-            })
+            target
+                .send_relay_to_client(&frame)
+                .await
+                .map(|_| CommunicationValue::new(CommunicationType::Success))
+                .map_err(|error| {
+                    if error == "client offline" {
+                        RelayRouteError::ClientOffline
+                    } else {
+                        RelayRouteError::Send(error)
+                    }
+                })
         }
         RouteTarget::Iota(iota_id) => {
             if iota_id == source_iota_id {
@@ -324,6 +328,19 @@ mod tests {
             prepare_frame(relay(None)),
             Err(RelayRouteError::MissingReceiver)
         ));
+    }
+
+    #[test]
+    fn iota_target_round_trips() {
+        let original = RouteTarget::Iota(42);
+        let wire = wire(original);
+
+        assert_eq!(RouteTarget::from_wire_id(wire), Some(original));
+    }
+
+    #[test]
+    fn raw_iota_id_is_not_a_valid_typed_route() {
+        assert_ne!(RouteTarget::from_wire_id(42), Some(RouteTarget::Iota(42)));
     }
 
     #[test]

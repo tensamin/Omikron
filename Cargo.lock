@@ -2016,6 +2016,7 @@ dependencies = [
  "base64 0.22.1",
  "dashmap",
  "dotenv",
+ "http",
  "livekit-api",
  "livekit-protocol",
  "log",

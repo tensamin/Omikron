@@ -155,18 +155,24 @@ impl IotaConnection {
     }
 
     pub async fn add_user_id(&self, user_id: u64) {
-        let mut should_sync = false;
+        let Ok(user_id) = i64::try_from(user_id) else {
+            return;
+        };
+        let manager_rho = self
+            .state
+            .rho
+            .bind_user_to_iota(user_id, self.iota_id as i64)
+            .await;
         {
             let mut guard = self.user_ids.write().await;
-            if !guard.contains(&user_id) {
-                guard.push(user_id);
-                should_sync = true;
+            if !guard.contains(&(user_id as u64)) {
+                guard.push(user_id as u64);
             }
         }
 
-        if should_sync {
+        if manager_rho.is_none() {
             if let Some(rho_conn) = self.get_rho_connection().await {
-                rho_conn.add_user_id(user_id as i64).await;
+                rho_conn.add_user_id(user_id).await;
             }
         }
     }
@@ -340,6 +346,11 @@ impl IotaConnection {
             }
         }
 
+        if cv.is_type(CommunicationType::ClientStateSync) {
+            self.forward_to_client(cv).await;
+            return;
+        }
+
         if cv.is_type(CommunicationType::StateSubscribe) {
             self.send_error_response(
                 message_id,
@@ -412,12 +423,14 @@ impl IotaConnection {
                     self.send_message(&response_cv).await;
                 }
                 Err(error) => {
-                    // Omega may have committed the insert even when its
-                    // Success response was lost in transit. Verify the exact
-                    // generated user ID before reporting failure; GetUserData
-                    // uses the proven request/response path and keeps this
-                    // recovery idempotent.
+                    /*
+                     * A lost Success can follow a committed insert. Verify
+                     * the requested identity and this authenticated Iota
+                     * before adding a local binding.
+                     */
                     let user_id = cv.get_data(DataType::UserId).as_number();
+                    let username = cv.get_data(DataType::Username).as_str().map(str::to_owned);
+                    let public_key = cv.get_data(DataType::PublicKey).as_str().map(str::to_owned);
                     if let Some(user_id) = user_id {
                         let verification = CommunicationValue::new(CommunicationType::GetUserData)
                             .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id));
@@ -430,7 +443,13 @@ impl IotaConnection {
                         {
                             Ok(verified)
                                 if verified.get_data(DataType::UserId).as_number()
-                                    == Some(user_id) =>
+                                    == Some(user_id)
+                                    && verified.get_data(DataType::IotaId).as_number()
+                                        == Some(self.iota_id.into())
+                                    && verified.get_data(DataType::Username).as_str()
+                                        == username.as_deref()
+                                    && verified.get_data(DataType::PublicKey).as_str()
+                                        == public_key.as_deref() =>
                             {
                                 log_in!(
                                     self.iota_id as i64,
@@ -479,8 +498,7 @@ impl IotaConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::ChangeIotaData)
-            || cv.is_type(CommunicationType::PushNotification)
+        if cv.is_type(CommunicationType::PushNotification)
             || cv.is_type(CommunicationType::GetUserData)
             || cv.is_type(CommunicationType::GetIotaData)
             || cv.is_type(CommunicationType::DeleteIota)

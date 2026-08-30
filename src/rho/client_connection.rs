@@ -17,10 +17,7 @@ use tokio::sync::RwLock;
 use trust_dns_resolver::TokioAsyncResolver;
 use uuid::Uuid;
 
-fn authenticated_peer_control_request(
-    cv: &CommunicationValue,
-    user_id: u64,
-) -> CommunicationValue {
+fn authenticated_peer_control_request(cv: &CommunicationValue, user_id: u64) -> CommunicationValue {
     cv.clone().with_sender(user_id)
 }
 
@@ -173,9 +170,7 @@ impl ClientConnection {
                     None => Err(relay_router::RelayRouteError::DestinationIotaNotLocal),
                 };
                 let response = match result {
-                    Ok(response) => {
-                        response.with_id(message_id)
-                    }
+                    Ok(response) => response.with_id(message_id),
                     Err(error) => {
                         log_err!(
                             self.user_id as i64,
@@ -322,6 +317,28 @@ impl ClientConnection {
 
                     return;
                 }
+            }
+
+            if cv.is_type(CommunicationType::ClientStateAck) {
+                let Some(rho) = self.get_rho_connection().await else {
+                    self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                        .await;
+                    return;
+                };
+                let request = cv.with_sender(self.user_id);
+                match rho
+                    .get_iota_connection()
+                    .clone()
+                    .await_response(&request, Some(Duration::from_secs(20)))
+                    .await
+                {
+                    Ok(response) => self.send_message(&response).await,
+                    Err(_) => {
+                        self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                            .await;
+                    }
+                }
+                return;
             }
 
             if cv.is_type(CommunicationType::ChangeUserData)

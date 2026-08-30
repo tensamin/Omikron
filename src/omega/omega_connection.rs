@@ -75,6 +75,33 @@ fn client_changed_target(value: &CommunicationValue) -> Option<(i64, i64)> {
     Some((receiver, session_id))
 }
 
+fn iota_user_snapshot(value: &CommunicationValue) -> Option<(i64, Vec<i64>)> {
+    if !value.is_type(CommunicationType::IotaUserData) {
+        return None;
+    }
+    let iota_id = value
+        .get_data(DataType::IotaId)
+        .as_number()
+        .and_then(|id| i64::try_from(id).ok())
+        .filter(|id| *id > 0)?;
+    let Some(DataValue::Array(values)) = value.get_data(DataType::UserIds) else {
+        return None;
+    };
+    let mut user_ids = Vec::with_capacity(values.len());
+    for value in values {
+        let DataValue::SignedNumber(user_id) = value else {
+            return None;
+        };
+        let user_id = i64::try_from(*user_id)
+            .ok()
+            .filter(|user_id| *user_id > 0)?;
+        user_ids.push(user_id);
+    }
+    user_ids.sort_unstable();
+    user_ids.dedup();
+    Some((iota_id, user_ids))
+}
+
 fn parse_omega_capability_response(value: &CommunicationValue) -> Result<PeerCapabilities, String> {
     if !value.is_type(CommunicationType::IdentificationResponse) {
         return Err("not an identification response".to_string());
@@ -203,6 +230,10 @@ pub struct SessionPresenceState {
 }
 
 impl OmegaConnection {
+    pub fn omikron_id(&self) -> u64 {
+        self.omikron_id
+    }
+
     pub fn from_config(
         config: &Config,
         keyring: mtp::crypto::Keyring,
@@ -622,6 +653,11 @@ impl OmegaConnection {
                                 continue;
                             }
 
+                            if let Some((iota_id, user_ids)) = iota_user_snapshot(&cv) {
+                                self.rho.replace_users_for_iota(iota_id, user_ids).await;
+                                continue;
+                            }
+
                             if cv.is_type(CommunicationType::Relay) {
                                 let request_id = match cv.require_id() {
                                     Ok(request_id) => request_id,
@@ -701,26 +737,6 @@ impl OmegaConnection {
                                 }
                             }
 
-                            if cv.is_type(CommunicationType::IotaUserData) {
-                                if let Some(DataValue::Array(users)) = cv.get_data(DataType::UserIds) {
-                                    let mut user_ids = Vec::new();
-                                    for value in users {
-                                        if let DataValue::SignedNumber(user_id) = value {
-                                            if let Ok(user_id) = i64::try_from(*user_id) {
-                                                user_ids.push(user_id);
-                                            }
-                                        }
-                                    }
-                                    if let Some(iota_id) = cv.get_data(DataType::IotaId).as_number() {
-                                        self.rho.replace_users_for_iota(iota_id as i64, user_ids).await;
-                                    } else {
-                                        let iota_ids = self.rho.iota_ids().await;
-                                        for iota_id in iota_ids {
-                                            self.rho.replace_users_for_iota(iota_id, user_ids.clone()).await;
-                                        }
-                                    }
-                                }
-                            }
                             if cv.is_type(CommunicationType::EraseHostedUserData) {
                                 let Some(iota_id) = cv
                                     .get_data(DataType::IotaId)
@@ -1244,8 +1260,8 @@ impl OmegaConnection {
 mod tests {
     use super::{
         ConnectionOutcome, MAX_RECONNECT_DELAY, PeerCapabilities, RECONNECT_DELAY,
-        client_changed_target, parse_omega_capability_response, reconnect_base_after_outcome,
-        reconnect_delay_with_jitter,
+        client_changed_target, iota_user_snapshot, parse_omega_capability_response,
+        reconnect_base_after_outcome, reconnect_delay_with_jitter,
     };
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 
@@ -1281,6 +1297,33 @@ mod tests {
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(20))
             .add_typed_default(DataType::UserState, DataValue::Str("user_online".into()));
         assert_eq!(client_changed_target(&invalid), None);
+    }
+
+    #[test]
+    fn iota_user_snapshot_requires_its_iota_and_valid_user_ids() {
+        let snapshot = CommunicationValue::new(CommunicationType::IotaUserData)
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(8))
+            .add_typed_default(
+                DataType::UserIds,
+                DataValue::Array(vec![
+                    DataValue::SignedNumber(20),
+                    DataValue::SignedNumber(19),
+                    DataValue::SignedNumber(20),
+                ]),
+            );
+        assert_eq!(iota_user_snapshot(&snapshot), Some((8, vec![19, 20])));
+
+        let missing_iota = CommunicationValue::new(CommunicationType::IotaUserData)
+            .add_typed_default(DataType::UserIds, DataValue::Array(Vec::new()));
+        assert_eq!(iota_user_snapshot(&missing_iota), None);
+
+        let malformed_user = CommunicationValue::new(CommunicationType::IotaUserData)
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(8))
+            .add_typed_default(
+                DataType::UserIds,
+                DataValue::Array(vec![DataValue::Str("not-a-user".into())]),
+            );
+        assert_eq!(iota_user_snapshot(&malformed_user), None);
     }
 
     #[test]

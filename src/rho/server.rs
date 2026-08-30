@@ -11,15 +11,38 @@ use crate::{
     rho::connection::{ConnectionKind, GeneralConnection, OptionalDataValueCompat},
     util::{file_util::load_file_vec, logger::PrintType},
 };
+use http::{Method, StatusCode};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::PublicKeyBundle;
 use mtp::host::{AuthenticationPolicy, HostConfig, Policy, SendMode};
-use mtp::webserver::{MTPWebServer, WebServerConfig};
+use mtp::webserver::{HttpResponse, MTPWebServer, WebServerConfig};
+
+fn with_cors(response: HttpResponse) -> HttpResponse {
+    response
+        .header("access-control-allow-origin", "*")
+        .header("access-control-allow-methods", "GET, POST, OPTIONS")
+        .header("access-control-allow-headers", "*")
+}
 
 fn web_config(max_connections: usize) -> Result<WebServerConfig, mtp::webserver::RouterError> {
     WebServerConfig::new()
         .max_connections(max_connections)
-        .route("/", |_request, response| async move { response.body("OK") })
+        .route("/", |request, response| async move {
+            let response = if request.method == Method::OPTIONS {
+                response.status(StatusCode::NO_CONTENT)
+            } else {
+                response.body("OK")
+            };
+            with_cors(response)
+        })?
+        .fallback(|request, response| async move {
+            let status = if request.method == Method::OPTIONS {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            with_cors(response.status(status))
+        })
 }
 
 fn rho_policy() -> Policy {
@@ -49,16 +72,7 @@ pub async fn get_by_connector_id(
     client_id: u64,
     description: Option<String>,
 ) -> Option<PublicKeyBundle> {
-    let request = match description.as_deref() {
-        Some("iota") => {
-            println!("Iota connection request for client_id: {}", client_id);
-            CommunicationValue::new(CommunicationType::GetIotaData)
-                .add_typed_default(DataType::IotaId, DataValue::SignedNumber(client_id as i128))
-        }
-        Some("client") => CommunicationValue::new(CommunicationType::GetUserData)
-            .add_typed_default(DataType::UserId, DataValue::SignedNumber(client_id as i128)),
-        _ => return None,
-    };
+    let request = public_key_lookup_request(omega.omikron_id(), client_id, description.as_deref())?;
 
     let response = match omega
         .await_response(&request, Some(Duration::from_secs(20)))
@@ -81,6 +95,25 @@ pub async fn get_by_connector_id(
         .decode(response.get_data(DataType::PublicKey).as_str()?)
         .ok()?;
     PublicKeyBundle::from_bytes(&bytes).ok()
+}
+
+fn public_key_lookup_request(
+    omikron_id: u64,
+    client_id: u64,
+    description: Option<&str>,
+) -> Option<CommunicationValue> {
+    Some(match description {
+        Some("iota") => {
+            println!("Iota connection request for client_id: {}", client_id);
+            CommunicationValue::new(CommunicationType::GetIotaData)
+                .with_sender(omikron_id)
+                .add_typed_default(DataType::IotaId, DataValue::SignedNumber(client_id as i128))
+        }
+        Some("client") => CommunicationValue::new(CommunicationType::GetUserData)
+            .with_sender(omikron_id)
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(client_id as i128)),
+        _ => return None,
+    })
 }
 
 /* Only Iota registration goes through mtp's Register flow; users are registered out of band. */
@@ -279,13 +312,37 @@ pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
 
 #[cfg(test)]
 mod tests {
-    use super::{rho_policy, web_config};
+    use super::{HttpResponse, public_key_lookup_request, rho_policy, web_config, with_cors};
+    use mtp::codec::{CommunicationType, DataType, DataValue};
     use std::time::Duration;
 
     #[test]
     fn rho_connection_budget_configures_mtp_admission() {
         let config = web_config(7).expect("health route is valid");
         assert_eq!(config.max_connections, 7);
+    }
+
+    #[test]
+    fn web_responses_allow_all_origins() {
+        let response = with_cors(HttpResponse::default());
+        assert_eq!(response.headers["access-control-allow-origin"], "*");
+        assert_eq!(
+            response.headers["access-control-allow-methods"],
+            "GET, POST, OPTIONS"
+        );
+        assert_eq!(response.headers["access-control-allow-headers"], "*");
+    }
+
+    #[test]
+    fn public_key_lookup_identifies_the_omikron() {
+        let request = public_key_lookup_request(17, 42, Some("client")).unwrap();
+
+        assert!(request.is_type(CommunicationType::GetUserData));
+        assert_eq!(request.sender(), Some(17));
+        assert_eq!(
+            request.get_data(DataType::UserId),
+            Some(&DataValue::SignedNumber(42))
+        );
     }
 
     #[test]
