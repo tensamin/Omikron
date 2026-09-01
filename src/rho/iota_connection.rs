@@ -310,7 +310,12 @@ impl IotaConnection {
 
         log_cv_in!(PrintType::Iota, cv);
 
-        if cv.is_type(CommunicationType::SyncedSettingChanged) {
+        if cv.is_type(CommunicationType::SyncedSettingChanged)
+            || cv.is_type(CommunicationType::UserBlobChanged)
+            || cv.is_type(CommunicationType::BlockedUsersChanged)
+            || cv.is_type(CommunicationType::ReceiptPolicyChanged)
+            || cv.is_type(CommunicationType::MessageStoragePolicyChanged)
+        {
             self.forward_to_client(cv).await;
             return;
         }

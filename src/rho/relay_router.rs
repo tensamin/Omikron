@@ -99,6 +99,17 @@ pub fn message_security_class(frame: &CommunicationValue) -> MessageSecurityClas
         || frame.is_type(CommunicationType::SyncedSettingGet)
         || frame.is_type(CommunicationType::SyncedSettingDelete)
         || frame.is_type(CommunicationType::SyncedSettingsList)
+        || frame.is_type(CommunicationType::UserBlobPut)
+        || frame.is_type(CommunicationType::UserBlobGet)
+        || frame.is_type(CommunicationType::UserBlobDelete)
+        || frame.is_type(CommunicationType::UserBlobList)
+        || frame.is_type(CommunicationType::UserBlock)
+        || frame.is_type(CommunicationType::UserUnblock)
+        || frame.is_type(CommunicationType::BlockedUsersGet)
+        || frame.is_type(CommunicationType::ReceiptPolicyGet)
+        || frame.is_type(CommunicationType::ReceiptPolicySet)
+        || frame.is_type(CommunicationType::MessageStoragePolicyGet)
+        || frame.is_type(CommunicationType::MessageStoragePolicySet)
     {
         MessageSecurityClass::AuthenticatedPeerControl
     } else {

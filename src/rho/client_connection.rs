@@ -12,10 +12,19 @@ use crate::{log_cv_in, log_cv_out, log_err, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use trust_dns_resolver::TokioAsyncResolver;
 use uuid::Uuid;
+
+static NEXT_POLICY_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
+
+fn next_policy_request_id() -> u32 {
+    NEXT_POLICY_REQUEST_ID
+        .fetch_add(1, Ordering::Relaxed)
+        .max(1)
+}
 
 fn authenticated_peer_control_request(cv: &CommunicationValue, user_id: u64) -> CommunicationValue {
     cv.clone().with_sender(user_id)
@@ -600,6 +609,48 @@ impl ClientConnection {
                 return;
             }
         };
+        // Resolve the recipient before creating call state. Without the
+        // recipient Iota, policy cannot be evaluated and delivery must fail.
+        let target_rho = match self.state.rho.get_for_user(receiver_id as i64).await {
+            Some(rho) => rho,
+            None => {
+                self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                    .await;
+                return;
+            }
+        };
+        let sender_id = self.get_user_id().await as i64;
+        let policy_request = CommunicationValue::new(CommunicationType::UserBlockCheck)
+            .with_id(next_policy_request_id())
+            .add_typed_default(
+                DataType::SenderId,
+                DataValue::SignedNumber(sender_id.into()),
+            )
+            .add_typed_default(DataType::ReceiverId, DataValue::SignedNumber(receiver_id));
+        let policy_response = target_rho
+            .get_iota_connection()
+            .clone()
+            .await_response(&policy_request, Some(Duration::from_secs(8)))
+            .await;
+        let blocked = match policy_response {
+            Ok(response) if response.is_type(CommunicationType::UserBlockCheck) => {
+                response.get_data(DataType::IsBlocked).as_bool()
+            }
+            _ => None,
+        };
+        match blocked {
+            Some(true) => {
+                self.send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
+                    .await;
+                return;
+            }
+            Some(false) => {}
+            None => {
+                self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                    .await;
+                return;
+            }
+        }
         let invited = self
             .state
             .call_manager
@@ -620,46 +671,6 @@ impl ClientConnection {
             self.send_message(&response).await;
             return;
         }
-
-        // Find target RhoConnection
-        let target_rho = match self.state.rho.get_for_user(receiver_id as i64).await {
-            Some(rho) => rho,
-            _ => {
-                // Get sender user ID
-                let sender_id = self.get_user_id().await;
-
-                // User is offline - send push notification for call invite
-                let push_cv = CommunicationValue::new(CommunicationType::PushNotification)
-                    .with_receiver(receiver_id as u64)
-                    .add_typed_default(
-                        DataType::SenderId,
-                        DataValue::SignedNumber(sender_id.into()),
-                    )
-                    .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
-                    .add_typed_default(
-                        DataType::Notifications,
-                        DataValue::Str("call_invite".to_string()),
-                    );
-
-                let omega_conn = self.state.omega.clone();
-                // Send fire-and-forget, don't await to avoid blocking
-                tokio::spawn(async move {
-                    let _ = omega_conn.send_message(&push_cv).await;
-                });
-
-                let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                    .with_id(message_id)
-                    .add_typed_default(
-                        DataType::ReceiverId,
-                        DataValue::SignedNumber(receiver_id.into()),
-                    );
-                self.send_message(&error_cv).await;
-                return;
-            }
-        };
-
-        // Get sender user ID
-        let sender_id = self.get_user_id().await as i64;
 
         // Create and send call distribution message
         let forward = CommunicationValue::new(CommunicationType::CallInvite)
