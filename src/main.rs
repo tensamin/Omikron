@@ -32,10 +32,9 @@ use crate::{
 };
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(_) = default_provider().install_default() {
-        println!("Error loading Provider");
-        return;
+        return Err("Error loading Provider".into());
     }
     dotenv().ok();
     startup();
@@ -43,23 +42,20 @@ async fn main() {
     let config = match Config::from_environment() {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("Invalid configuration: {error}");
-            return;
+            return Err(format!("Invalid configuration: {error}").into());
         }
     };
 
     let keyring = match load_or_create_keyring(KEYRING_PATH, PUBLIC_KEY_PATH) {
         Ok(keyring) => keyring,
         Err(error) => {
-            eprintln!("Unable to load Omikron keyring: {error}");
-            return;
+            return Err(format!("Unable to load Omikron keyring: {error}").into());
         }
     };
     let public_key = match omega_database_public_key(&keyring) {
         Ok(public_key) => public_key,
         Err(error) => {
-            eprintln!("Unable to serialize public key for Omega: {error}");
-            return;
+            return Err(format!("Unable to serialize public key for Omega: {error}").into());
         }
     };
     log!(
@@ -71,8 +67,7 @@ async fn main() {
     let omega_keyring = match keyring_for_omega(&keyring) {
         Ok(keyring) => keyring,
         Err(error) => {
-            eprintln!("Unable to copy keyring for Omega: {error}");
-            return;
+            return Err(format!("Unable to copy keyring for Omega: {error}").into());
         }
     };
     let rho = std::sync::Arc::new(RhoManager::new());
@@ -83,18 +78,27 @@ async fn main() {
     ));
     omega.clone().start().await;
     start_task_cleanup_loop(omega.clone());
+    tokio::select! {
+        _ = omega.await_ready() => {}
+        result = tokio::signal::ctrl_c() => {
+            result.map_err(|error| format!("Unable to wait for shutdown signal: {error}"))?;
+            omega.stop().await;
+            return Ok(());
+        }
+    }
     let livekit = std::sync::Arc::new(LiveKitService::new(config.livekit.clone()));
     let call_manager = std::sync::Arc::new(CallManager::new(livekit.clone()));
     let state = AppState::new(config.clone(), keyring, omega, rho, call_manager, livekit);
-    tokio::spawn(async move {
-        if let Err(e) = start(state).await {
-            log_err!(0, util::logger::PrintType::General, "{}", e);
+    tokio::select! {
+        result = start(state) => {
+            result.map_err(|error| format!("Rho listener terminated: {error}"))?;
+            return Err("Rho listener stopped unexpectedly".into());
         }
-    });
-
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        eprintln!("Unable to wait for shutdown signal: {error}");
+        result = tokio::signal::ctrl_c() => {
+            result.map_err(|error| format!("Unable to wait for shutdown signal: {error}"))?;
+        }
     }
+    Ok(())
 }
 
 fn keyring_for_omega(keyring: &Keyring) -> Result<Keyring, String> {

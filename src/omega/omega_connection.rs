@@ -12,7 +12,7 @@ use mtp::client::{Client, MTPConnection, Sender};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::{
     client::ClientConfig,
-    files::load_public_key_bundle,
+    files::{load_public_key_bundle, save_public_key_bundle},
     host::{Policy, SendMode},
 };
 use mtp_transport::ConnectionHandle;
@@ -37,6 +37,12 @@ const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_REQUESTS: usize = 128;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+
+fn authenticated_key_path(client_id: u64) -> std::path::PathBuf {
+    crate::WORKING_DIR
+        .join("iota-public-keys")
+        .join(format!("{client_id}.mpkb"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionOutcome {
@@ -218,6 +224,7 @@ pub struct OmegaConnection {
     circuit_breaker: Mutex<CircuitBreaker>,
     keyring: mtp::crypto::Keyring,
     rho: Arc<RhoManager>,
+    authenticated_key_cache: DashMap<u64, mtp::crypto::PublicKeyBundle>,
     waiting_tasks: DashMap<u32, WaitingTask>,
     session_presence: DashMap<(i64, i64), SessionPresenceState>,
     peer_capabilities: Arc<RwLock<PeerCapabilities>>,
@@ -260,6 +267,7 @@ impl OmegaConnection {
             }),
             keyring,
             rho,
+            authenticated_key_cache: DashMap::new(),
             waiting_tasks: DashMap::new(),
             session_presence: DashMap::new(),
             peer_capabilities: Arc::new(RwLock::new(PeerCapabilities::default())),
@@ -957,6 +965,55 @@ impl OmegaConnection {
 
     pub async fn is_ready(&self) -> bool {
         self.state.read().await.is_ready()
+    }
+
+    pub async fn await_ready(&self) {
+        while !self.is_ready().await {
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub fn cached_authenticated_key(&self, client_id: u64) -> Option<mtp::crypto::PublicKeyBundle> {
+        if let Some(key) = self
+            .authenticated_key_cache
+            .get(&client_id)
+            .map(|key| key.clone())
+        {
+            return Some(key);
+        }
+
+        let key = load_public_key_bundle(&authenticated_key_path(client_id)).ok()?;
+        self.authenticated_key_cache.insert(client_id, key.clone());
+        Some(key)
+    }
+
+    pub fn cache_authenticated_key(
+        &self,
+        client_id: u64,
+        public_key: mtp::crypto::PublicKeyBundle,
+    ) {
+        let path = authenticated_key_path(client_id);
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                log_err!(
+                    client_id as i64,
+                    PrintType::General,
+                    "Create authenticated key cache directory failed: {}",
+                    error
+                );
+                return;
+            }
+        }
+        if let Err(error) = save_public_key_bundle(&public_key, &path) {
+            log_err!(
+                client_id as i64,
+                PrintType::General,
+                "Persist authenticated key cache failed: {}",
+                error
+            );
+            return;
+        }
+        self.authenticated_key_cache.insert(client_id, public_key);
     }
 
     #[allow(dead_code)]

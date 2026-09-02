@@ -156,7 +156,11 @@ pub async fn route_relay(
     source: RelaySource,
     frame: CommunicationValue,
 ) -> Result<CommunicationValue, RelayRouteError> {
-    let (next_hop, frame) = prepare_frame(ensure_relay_frame_id(frame))?;
+    let frame = ensure_relay_frame_id(frame);
+    let (next_hop, frame) = match source {
+        RelaySource::Client { iota_id } => prepare_client_frame(frame, iota_id)?,
+        RelaySource::Iota { .. } => prepare_frame(frame)?,
+    };
     validate_source_next_hop(source, next_hop)?;
 
     match source {
@@ -288,6 +292,31 @@ fn prepare_frame(
     Ok((target, frame))
 }
 
+/*
+ * Older clients sent their authenticated Iota's raw ID as the first relay
+ * hop. Accept only that exact value, then restore the namespace tag before
+ * forwarding so legacy clients cannot select a different route.
+ */
+fn prepare_client_frame(
+    frame: CommunicationValue,
+    source_iota_id: u64,
+) -> Result<(RouteTarget, CommunicationValue), RelayRouteError> {
+    let receiver = frame.receiver().ok_or(RelayRouteError::MissingReceiver)?;
+    if let Some(target) = RouteTarget::from_wire_id(receiver) {
+        let frame = forward_relay_frame(&frame, receiver)?;
+        return Ok((target, frame));
+    }
+    if receiver != source_iota_id {
+        return Err(RelayRouteError::InvalidRouteTarget(receiver));
+    }
+    let target = RouteTarget::Iota(source_iota_id);
+    let wire_id = target
+        .wire_id()
+        .ok_or(RelayRouteError::InvalidRouteTarget(source_iota_id))?;
+    let frame = forward_relay_frame(&frame, wire_id)?;
+    Ok((target, frame))
+}
+
 fn validate_source_next_hop(
     source: RelaySource,
     next_hop: RouteTarget,
@@ -316,7 +345,7 @@ mod tests {
 
     use super::{
         MessageSecurityClass, RelayRouteError, RelaySource, RouteTarget, message_security_class,
-        prepare_frame, validate_source_next_hop,
+        prepare_client_frame, prepare_frame, validate_source_next_hop,
     };
 
     fn wire(target: RouteTarget) -> u64 {
@@ -352,6 +381,25 @@ mod tests {
     #[test]
     fn raw_iota_id_is_not_a_valid_typed_route() {
         assert_ne!(RouteTarget::from_wire_id(42), Some(RouteTarget::Iota(42)));
+    }
+
+    #[test]
+    fn client_raw_iota_receiver_is_rewritten_to_a_typed_route() {
+        let (target, forwarded) = match prepare_client_frame(relay(Some(42)), 42) {
+            Ok(value) => value,
+            Err(error) => panic!("legacy client relay was rejected: {error}"),
+        };
+
+        assert_eq!(target, RouteTarget::Iota(42));
+        assert_eq!(forwarded.receiver(), Some(wire(RouteTarget::Iota(42))));
+    }
+
+    #[test]
+    fn client_raw_receiver_cannot_select_another_iota() {
+        assert!(matches!(
+            prepare_client_frame(relay(Some(43)), 42),
+            Err(RelayRouteError::InvalidRouteTarget(43))
+        ));
     }
 
     #[test]

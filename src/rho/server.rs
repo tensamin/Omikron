@@ -74,6 +74,10 @@ pub async fn get_by_connector_id(
 ) -> Option<PublicKeyBundle> {
     let request = public_key_lookup_request(omega.omikron_id(), client_id, description.as_deref())?;
 
+    if !omega.is_ready().await {
+        return omega.cached_authenticated_key(client_id);
+    }
+
     let response = match omega
         .await_response(&request, Some(Duration::from_secs(20)))
         .await
@@ -87,14 +91,16 @@ pub async fn get_by_connector_id(
                 description,
                 e
             );
-            return None;
+            return omega.cached_authenticated_key(client_id);
         }
     };
 
     let bytes = BASE64_STD
         .decode(response.get_data(DataType::PublicKey).as_str()?)
         .ok()?;
-    PublicKeyBundle::from_bytes(&bytes).ok()
+    let public_key = PublicKeyBundle::from_bytes(&bytes).ok()?;
+    omega.cache_authenticated_key(client_id, public_key.clone());
+    Some(public_key)
 }
 
 fn public_key_lookup_request(
@@ -170,9 +176,11 @@ pub async fn complete_register(
 }
 
 pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
-    let cert_pem = load_file_vec("certs", "cert.pem").expect("Error loading Pemfile");
+    let cert_pem = load_file_vec("certs", "cert.pem")
+        .map_err(|error| format!("load certs/cert.pem: {error}"))?;
 
-    let key_pem = load_file_vec("certs", "key.pem").expect("Error loading Keyfile");
+    let key_pem = load_file_vec("certs", "key.pem")
+        .map_err(|error| format!("load certs/key.pem: {error}"))?;
 
     let host_config = HostConfig::new(
         state.config.bind_address,
