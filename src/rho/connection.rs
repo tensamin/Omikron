@@ -82,10 +82,26 @@ impl OptionalDataValueCompat for Option<&DataValue> {
     }
 }
 
+fn initial_client_state_request(user_id: i64, session_id: i64) -> CommunicationValue {
+    CommunicationValue::new(CommunicationType::ClientConnected)
+        .with_sender(user_id as u64)
+        .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
+        .add_typed_default(
+            DataType::SessionId,
+            DataValue::SignedNumber(session_id.into()),
+        )
+        .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(0))
+        .add_typed_default(DataType::CacheValid, DataValue::Bool(false))
+        .add_typed_default(DataType::CacheSchemaVersion, DataValue::SignedNumber(0))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FrameValidationError, RequiredMtpFields};
-    use mtp::codec::{CommunicationType, CommunicationValue};
+    use super::{
+        FrameValidationError, OptionalDataValueCompat, RequiredMtpFields,
+        initial_client_state_request,
+    };
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType};
 
     #[test]
     fn required_fields_preserve_missing_field_errors() {
@@ -115,6 +131,26 @@ mod tests {
         assert_eq!(frame.require_id(), Ok(0));
         assert_eq!(frame.require_sender(), Ok(0));
         assert_eq!(frame.require_receiver(), Ok(0));
+    }
+
+    #[test]
+    fn initial_state_request_targets_the_authenticated_client_session() {
+        let request = initial_client_state_request(7, 11);
+
+        assert!(request.is_type(CommunicationType::ClientConnected));
+        assert_eq!(request.sender(), Some(7));
+        assert_eq!(
+            request.get_data(DataType::UserId).as_signed_number(),
+            Some(7)
+        );
+        assert_eq!(
+            request.get_data(DataType::SessionId).as_signed_number(),
+            Some(11)
+        );
+        assert_eq!(
+            request.get_data(DataType::CacheValid).as_bool(),
+            Some(false)
+        );
     }
 }
 
@@ -238,23 +274,43 @@ impl GeneralConnection {
         if let Some(rho_conn) = rho {
             rho_conn.bind_user_id(user_id).await;
             rho_conn.add_client_connection(client.clone()).await;
-            match self
-                .notify_user_connected(user_id, rho_conn.get_iota_id().await as i64)
-                .await
-            {
+            client.clone().start();
+
+            let iota_id = rho_conn.get_iota_id().await as i64;
+            let session_id = *self.session_id.read().await as i64;
+            log_out!(
+                user_id,
+                PrintType::Client,
+                "InitialSync user={} session={} stage=request_iota iota={}",
+                user_id,
+                session_id,
+                iota_id
+            );
+            self.send_initial_client_state_request(&rho_conn, user_id)
+                .await;
+
+            match self.notify_user_connected(user_id, iota_id).await {
                 Ok(()) => {
-                    self.send_initial_client_state_request(&rho_conn, user_id)
-                        .await;
+                    log_out!(
+                        user_id,
+                        PrintType::Client,
+                        "InitialSync user={} session={} stage=user_connected_ok",
+                        user_id,
+                        session_id
+                    );
                 }
                 Err(error) => {
                     log_err!(
                         user_id,
                         PrintType::Client,
-                        "UserConnected acknowledgement failed: {}",
+                        "InitialSync user={} session={} stage=user_connected_failed error={}",
+                        user_id,
+                        session_id,
                         error
                     );
                 }
             }
+            return true;
         } else {
             log_err!(
                 user_id,
@@ -285,6 +341,7 @@ impl GeneralConnection {
         }
 
         let get_user_msg = CommunicationValue::new(CommunicationType::GetUserData)
+            .with_sender(self.state.omega.omikron_id())
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
         let Ok(user_data_cv) = self
             .state
@@ -299,27 +356,28 @@ impl GeneralConnection {
         let Some(DataValue::SignedNumber(iota_id)) = user_data_cv.get_data(DataType::IotaId) else {
             return None;
         };
-        let rho = self
+        let Some(rho) = self
             .state
             .rho
             .bind_user_to_iota(user_id, *iota_id as i64)
-            .await?;
+            .await
+        else {
+            log_err!(
+                user_id,
+                PrintType::Client,
+                "Omega maps user {} to Iota {}, but no local Rho exists",
+                user_id,
+                iota_id
+            );
+            return None;
+        };
         rho.bind_user_id(user_id).await;
         Some(rho)
     }
 
     async fn send_initial_client_state_request(&self, rho: &Arc<RhoConnection>, user_id: i64) {
         let session_id = *self.session_id.read().await as i64;
-        let request = CommunicationValue::new(CommunicationType::ClientConnected)
-            .with_sender(user_id as u64)
-            .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
-            .add_typed_default(
-                DataType::SessionId,
-                DataValue::SignedNumber(session_id.into()),
-            )
-            .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(0))
-            .add_typed_default(DataType::CacheValid, DataValue::Bool(false))
-            .add_typed_default(DataType::CacheSchemaVersion, DataValue::SignedNumber(0));
+        let request = initial_client_state_request(user_id, session_id);
         rho.get_iota_connection().send_message(&request).await;
     }
 
@@ -341,45 +399,55 @@ impl GeneralConnection {
                 rho.add_client_connection(client).await;
             }
         }
-        self.state.rho.add(rho).await;
-        if let Err(error) = self.state.omega.clone().iota_connected(id as i64).await {
-            log_err!(
-                id as i64,
-                PrintType::Iota,
-                "IotaConnected acknowledgement failed: {}",
-                error
-            );
-        }
-        self.load_iota_users(id).await;
+        self.state.rho.add(rho.clone()).await;
         iota.start();
-    }
 
-    async fn load_iota_users(&self, iota_id: u64) {
-        let request = CommunicationValue::new(CommunicationType::GetIotaData)
-            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()));
-        let Ok(response) = self
-            .state
-            .omega
-            .clone()
-            .await_response(&request, Some(Duration::from_secs(20)))
-            .await
-        else {
-            return;
-        };
-        let Some(DataValue::Array(users)) = response.get_data(DataType::UserIds) else {
-            return;
-        };
-        let user_ids = users
-            .iter()
-            .filter_map(|value| match value {
-                DataValue::SignedNumber(id) => Some(*id as i64),
-                _ => None,
-            })
-            .collect();
-        self.state
-            .rho
-            .replace_users_for_iota(iota_id as i64, user_ids)
-            .await;
+        /*
+         * Omega can accept the transport connection before its route index is
+         * synchronized. Keep the Rho available for client lookups, then
+         * retry lifecycle synchronization until the authoritative user
+         * snapshot has been received. Stop when this Rho is no longer current
+         * so a disconnected Iota cannot recreate stale routes.
+         */
+        let state = self.state.clone();
+        let rho = rho.clone();
+        tokio::spawn(async move {
+            let mut retry_delay = Duration::from_millis(250);
+            loop {
+                if !state.rho.is_current(id as i64, &rho).await {
+                    return;
+                }
+
+                if !state.omega.is_ready().await {
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(5));
+                    continue;
+                }
+
+                match state.omega.clone().iota_connected(id as i64).await {
+                    Ok(()) => {
+                        log_in!(
+                            id as i64,
+                            PrintType::Iota,
+                            "Iota {} synchronized with Omega",
+                            id
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        log_err!(
+                            id as i64,
+                            PrintType::Iota,
+                            "Iota synchronization failed, retrying: {}",
+                            error
+                        );
+                    }
+                }
+
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(5));
+            }
+        });
     }
 
     async fn migrate_anonymous_client(self: &Arc<Self>) {

@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-use mtp::codec::{CommunicationType, CommunicationValue, RelayError, forward_relay_frame};
+use mtp::codec::{
+    CommunicationType, CommunicationValue, DataType, DataValue, RelayError, forward_relay_frame,
+};
 use thiserror::Error;
 
 use crate::{
@@ -51,6 +53,15 @@ impl RouteTarget {
     pub const fn id(self) -> u64 {
         match self {
             Self::User(id) | Self::Iota(id) => id,
+        }
+    }
+}
+
+impl std::fmt::Display for RouteTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::User(id) => write!(formatter, "User({id})"),
+            Self::Iota(id) => write!(formatter, "Iota({id})"),
         }
     }
 }
@@ -149,6 +160,31 @@ pub fn error_response_type(error: &RelayRouteError) -> CommunicationType {
         | RelayRouteError::RouteLoop
         | RelayRouteError::Relay(_) => CommunicationType::ErrorInvalidData,
     }
+}
+
+pub fn relay_route_error_response(
+    message_id: u32,
+    target: Option<RouteTarget>,
+    error: &RelayRouteError,
+) -> CommunicationValue {
+    let mut response = CommunicationValue::new(error_response_type(error)).with_id(message_id);
+    match (error, target) {
+        (RelayRouteError::ClientOffline, Some(RouteTarget::User(user_id))) => {
+            response = response
+                .add_typed_default(DataType::ErrorType, DataValue::Str("client_offline".into()))
+                .add_typed_default(DataType::UserId, DataValue::UnsignedNumber(user_id.into()));
+        }
+        (RelayRouteError::DestinationIotaNotLocal, Some(RouteTarget::Iota(iota_id))) => {
+            response = response
+                .add_typed_default(
+                    DataType::ErrorType,
+                    DataValue::Str("destination_iota_not_local".into()),
+                )
+                .add_typed_default(DataType::IotaId, DataValue::UnsignedNumber(iota_id.into()));
+        }
+        _ => {}
+    }
+    response
 }
 
 pub async fn route_relay(
@@ -264,7 +300,11 @@ async fn route_from_iota(
 }
 
 fn route_response(response: CommunicationValue) -> Result<CommunicationValue, RelayRouteError> {
-    if response.is_type(CommunicationType::Success) {
+    if response.is_type(CommunicationType::Success)
+        || response
+            .get_type_name()
+            .is_some_and(|name| name.starts_with("Error"))
+    {
         Ok(response)
     } else {
         Err(RelayRouteError::Send(format!(
@@ -341,11 +381,13 @@ fn validate_source_next_hop(
 
 #[cfg(test)]
 mod tests {
-    use mtp::codec::{CommunicationType, CommunicationValue, DataValue};
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+
+    use crate::rho::connection::OptionalDataValueCompat;
 
     use super::{
         MessageSecurityClass, RelayRouteError, RelaySource, RouteTarget, message_security_class,
-        prepare_client_frame, prepare_frame, validate_source_next_hop,
+        prepare_client_frame, prepare_frame, relay_route_error_response, validate_source_next_hop,
     };
 
     fn wire(target: RouteTarget) -> u64 {
@@ -487,6 +529,36 @@ mod tests {
             Some(RouteTarget::Iota(7))
         );
         assert_eq!(RouteTarget::from_wire_id(7), None);
+    }
+
+    #[test]
+    fn client_offline_response_keeps_legacy_type_and_identifies_user() {
+        let response = relay_route_error_response(
+            4,
+            Some(RouteTarget::User(42)),
+            &RelayRouteError::ClientOffline,
+        );
+        assert!(response.is_type(CommunicationType::ErrorNoIota));
+        assert_eq!(
+            response.get_data(DataType::ErrorType).as_str(),
+            Some("client_offline")
+        );
+        assert_eq!(response.get_data(DataType::UserId).as_number(), Some(42));
+    }
+
+    #[test]
+    fn unavailable_iota_response_keeps_legacy_type_and_identifies_iota() {
+        let response = relay_route_error_response(
+            4,
+            Some(RouteTarget::Iota(99)),
+            &RelayRouteError::DestinationIotaNotLocal,
+        );
+        assert!(response.is_type(CommunicationType::ErrorNoIota));
+        assert_eq!(
+            response.get_data(DataType::ErrorType).as_str(),
+            Some("destination_iota_not_local")
+        );
+        assert_eq!(response.get_data(DataType::IotaId).as_number(), Some(99));
     }
 
     #[test]

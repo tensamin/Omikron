@@ -144,8 +144,11 @@ impl AppConnection {
                             next_hop,
                             error
                         );
-                        CommunicationValue::new(relay_router::error_response_type(&error))
-                            .with_id(message_id)
+                        relay_router::relay_route_error_response(
+                            message_id,
+                            relay_router::RouteTarget::from_wire_id(next_hop),
+                            &error,
+                        )
                     }
                 };
                 self.send_message(&response).await;

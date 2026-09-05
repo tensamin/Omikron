@@ -161,6 +161,7 @@ impl AnonymousClientConnection {
                         .clone()
                         .await_response(
                             &CommunicationValue::new(CommunicationType::GetUserData)
+                                .with_sender(self.state.omega.omikron_id())
                                 .add_typed_default(
                                     DataType::UserId,
                                     DataValue::SignedNumber(call_invitee.user_id.into()),

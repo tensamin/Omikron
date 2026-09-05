@@ -1214,6 +1214,13 @@ impl OmegaConnection {
                         .collect(),
                 ),
             );
+        log_out!(
+            user_id,
+            PrintType::Omega,
+            "PresenceSync user={} session={} stage=subscribe",
+            user_id,
+            session_id
+        );
         let response = self
             .await_response(&subscription, Some(Duration::from_secs(20)))
             .await?;
@@ -1287,6 +1294,13 @@ impl OmegaConnection {
                         .collect(),
                 ),
             );
+        log_out!(
+            user_id,
+            PrintType::Omega,
+            "PresenceSync user={} session={} stage=get_states",
+            user_id,
+            session_id
+        );
         let response = self
             .await_response(&request, Some(Duration::from_secs(20)))
             .await?;
@@ -1308,6 +1322,13 @@ impl OmegaConnection {
 
         if let Some(client) = self.rho.get_client_connection(user_id, session_id).await {
             client.send_message(&response).await;
+            log_out!(
+                user_id,
+                PrintType::Client,
+                "PresenceSync user={} session={} stage=get_states_forwarded",
+                user_id,
+                session_id
+            );
         }
         Ok(())
     }

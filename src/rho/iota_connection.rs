@@ -216,6 +216,37 @@ impl IotaConnection {
             .await
     }
 
+    fn update_presence_subscription(
+        self: &Arc<Self>,
+        user_id: i64,
+        session_id: i64,
+        contact_ids: Vec<i64>,
+    ) {
+        let connection = self.clone();
+        tokio::spawn(async move {
+            log_in!(
+                connection.iota_id as i64,
+                PrintType::Omega,
+                "PresenceSync user={} session={} stage=subscribe",
+                user_id,
+                session_id
+            );
+            if let Err(error) = connection
+                .replace_state_subscription(user_id, session_id, contact_ids)
+                .await
+            {
+                log_err!(
+                    connection.iota_id as i64,
+                    PrintType::Omega,
+                    "Failed to replace presence subscription for user {} session {}: {}",
+                    user_id,
+                    session_id,
+                    error
+                );
+            }
+        });
+    }
+
     /// Send a CommunicationValue to the Iota
     pub async fn send_message(&self, cv: &CommunicationValue) {
         log_cv_out!(PrintType::Iota, cv);
@@ -259,7 +290,7 @@ impl IotaConnection {
             }
         };
         if cv.is_type(CommunicationType::Relay) {
-            let next_hop = match cv.require_receiver() {
+            let wire_receiver = match cv.require_receiver() {
                 Ok(next_hop) => next_hop,
                 Err(error) => {
                     log_err!(
@@ -273,6 +304,7 @@ impl IotaConnection {
                     return;
                 }
             };
+            let route_target = relay_router::RouteTarget::from_wire_id(wire_receiver);
             let response = match relay_router::route_relay(
                 &self.state,
                 RelaySource::Iota {
@@ -284,15 +316,23 @@ impl IotaConnection {
             {
                 Ok(response) => response.with_id(message_id),
                 Err(error) => {
-                    log_err!(
-                        self.iota_id as i64,
-                        PrintType::Iota,
-                        "Relay routing failed for destination {}: {}",
-                        next_hop,
-                        error
-                    );
-                    CommunicationValue::new(relay_router::error_response_type(&error))
-                        .with_id(message_id)
+                    match route_target {
+                        Some(target) => log_err!(
+                            self.iota_id as i64,
+                            PrintType::Iota,
+                            "Relay routing failed for {}: {}",
+                            target,
+                            error
+                        ),
+                        None => log_err!(
+                            self.iota_id as i64,
+                            PrintType::Iota,
+                            "Relay routing failed for invalid route target {}: {}",
+                            wire_receiver,
+                            error
+                        ),
+                    }
+                    relay_router::relay_route_error_response(message_id, route_target, &error)
                 }
             };
             self.send_message(&response).await;
@@ -303,8 +343,25 @@ impl IotaConnection {
             crate::rho::relay_router::message_security_class(&cv),
             crate::rho::relay_router::MessageSecurityClass::RelayOnly
         ) {
+            if matches!(
+                cv.get_comm_type_enum(),
+                Some(
+                    CommunicationType::MessageLive
+                        | CommunicationType::MessageEditLive
+                        | CommunicationType::MessageReactionLive
+                        | CommunicationType::MessageDeleteLive
+                )
+            ) {
+                self.forward_to_client(cv).await;
+                return;
+            }
             self.send_error_response(message_id, CommunicationType::ErrorInvalidData, None)
                 .await;
+            return;
+        }
+
+        if cv.is_type(CommunicationType::ChatSecretForward) {
+            self.forward_to_client(cv).await;
             return;
         }
 
@@ -333,27 +390,35 @@ impl IotaConnection {
             cv
         };
 
+        if cv.is_type(CommunicationType::ClientStateSync) {
+            let presence_snapshot = contact_snapshot(&cv);
+            let user_id = cv.receiver();
+            let session_id = cv.get_data(DataType::SessionId).as_number();
+            log_in!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "ClientStateSync user={:?} session={:?} stage=received_from_iota",
+                user_id,
+                session_id
+            );
+            self.forward_to_client(cv).await;
+            log_out!(
+                self.iota_id as i64,
+                PrintType::Client,
+                "ClientStateSync user={:?} session={:?} stage=forwarded_to_client",
+                user_id,
+                session_id
+            );
+            if let Some((user_id, session_id, contact_ids)) = presence_snapshot {
+                self.update_presence_subscription(user_id, session_id, contact_ids);
+            }
+            return;
+        }
+
         // Iota's UserIds field is an authoritative replacement snapshot for
         // the requesting client session, including contact mutations.
         if let Some((user_id, session_id, contact_ids)) = contact_snapshot(&cv) {
-            if let Err(error) = self
-                .replace_state_subscription(user_id, session_id, contact_ids)
-                .await
-            {
-                log_err!(
-                    self.iota_id as i64,
-                    PrintType::Omega,
-                    "Failed to replace presence subscription for user {} session {}: {}",
-                    user_id,
-                    session_id,
-                    error
-                );
-            }
-        }
-
-        if cv.is_type(CommunicationType::ClientStateSync) {
-            self.forward_to_client(cv).await;
-            return;
+            self.update_presence_subscription(user_id, session_id, contact_ids);
         }
 
         if cv.is_type(CommunicationType::StateSubscribe) {
@@ -438,6 +503,7 @@ impl IotaConnection {
                     let public_key = cv.get_data(DataType::PublicKey).as_str().map(str::to_owned);
                     if let Some(user_id) = user_id {
                         let verification = CommunicationValue::new(CommunicationType::GetUserData)
+                            .with_sender(self.state.omega.omikron_id())
                             .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id));
                         match self
                             .state

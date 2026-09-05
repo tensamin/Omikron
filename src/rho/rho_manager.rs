@@ -129,6 +129,12 @@ impl RhoManager {
             .map(|entry| entry.value().clone())
     }
 
+    pub async fn is_current(&self, iota_id: i64, expected: &Arc<RhoConnection>) -> bool {
+        self.connections
+            .get(&iota_id)
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), expected))
+    }
+
     pub async fn connection_count(&self) -> usize {
         self.connections.len()
     }
