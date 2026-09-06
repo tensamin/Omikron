@@ -15,7 +15,7 @@ use mtp::{
     files::{load_public_key_bundle, save_public_key_bundle},
     host::{Policy, SendMode},
 };
-use mtp_transport::ConnectionHandle;
+use mtp_native::ConnectionHandle;
 use rand::RngExt;
 use std::{sync::Arc, time::Duration};
 use tokio::{

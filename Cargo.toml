@@ -11,7 +11,7 @@ mtp = { git = "https://git.methanium.net/Methanium/mtp.git",  features = [
     "files",
     "raw",
 ] }
-mtp-transport = { git = "https://git.methanium.net/Methanium/mtp.git" }
+mtp-native = { git = "https://git.methanium.net/Methanium/mtp.git" }
 
 ansi_term = "0.12.1"
 uuid = { version = "1.24.0", features = ["v4"] }
