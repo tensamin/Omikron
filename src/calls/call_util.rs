@@ -109,6 +109,20 @@ impl LiveKitService {
         Ok(())
     }
 
+    pub async fn delete_room(&self, call_id: Uuid) -> Result<(), CallError> {
+        tokio::time::timeout(
+            LIVEKIT_REQUEST_TIMEOUT,
+            self.room_client()?.delete_room(&call_id.to_string()),
+        )
+        .await
+        .map_err(|_| CallError::RequestTimedOut { call_id })?
+        .map_err(|error| CallError::RoomCreationFailed {
+            call_id,
+            detail: error.to_string(),
+        })?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub async fn get_room_metadata(&self, call_id: Uuid) -> Result<String, CallError> {
         let (_, room) = self.get_room(call_id).await?;
@@ -171,12 +185,8 @@ pub async fn clean_calls(manager: &CallManager, room_service: RoomClient) {
         };
 
     let mut call_ids = Vec::new();
-    let mut no_users = Vec::new();
     for room in rooms {
         if let Ok(id) = Uuid::from_str(&room.name) {
-            if room.num_participants == 0 {
-                no_users.push(id);
-            }
             call_ids.push(id);
         }
     }
@@ -191,15 +201,6 @@ pub async fn clean_calls(manager: &CallManager, room_service: RoomClient) {
         if !call_ids.contains(&id) {
             manager.groups.remove(&id);
         }
-    }
-
-    let call_groups = manager
-        .groups
-        .iter()
-        .map(|entry| entry.value().clone())
-        .collect::<Vec<_>>();
-    for call_group in call_groups {
-        *call_group.show.write().await = !no_users.contains(&call_group.call_id);
     }
 
     let size_post = manager.groups.len();

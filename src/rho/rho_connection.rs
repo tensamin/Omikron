@@ -292,6 +292,28 @@ impl RhoConnection {
             .any(|entry| entry.key().0 == user_id)
     }
 
+    pub async fn send_to_local_user(
+        &self,
+        user_id: u64,
+        cv: &CommunicationValue,
+    ) -> Result<usize, String> {
+        let connections = self.get_client_connections_for_user(user_id as i64).await;
+        if connections.is_empty() {
+            return Err("client offline".to_string());
+        }
+        let mut sent = 0;
+        for connection in connections {
+            if connection.send_relay(cv).await.is_ok() {
+                sent += 1;
+            }
+        }
+        if sent == 0 {
+            Err("all local client sends failed".to_string())
+        } else {
+            Ok(sent)
+        }
+    }
+
     pub async fn send_relay_to_client(&self, cv: &CommunicationValue) -> Result<(), String> {
         let receiver_id = cv
             .receiver()

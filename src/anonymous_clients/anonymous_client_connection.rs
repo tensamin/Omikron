@@ -154,7 +154,7 @@ impl AnonymousClientConnection {
                 };
 
                 let mut invited = Vec::new();
-                for call_invitee in call.members.read().await.clone() {
+                for call_invitee in call.state.read().await.members.values().cloned() {
                     let Ok(call_invitee_cv) = self
                         .state
                         .omega
@@ -396,19 +396,9 @@ impl AnonymousClientConnection {
             .call_manager
             .add_invite(call_id, self.user_id, receiver_id as u64, secret.clone())
             .await;
-        if !invited {
+        if invited.is_err() {
             self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
                 .await;
-            return;
-        }
-
-        if !self
-            .state
-            .call_manager
-            .should_forward_invite(self.user_id, receiver_id as u64)
-        {
-            let response = CommunicationValue::new(CommunicationType::Success).with_id(message_id);
-            self.send_message(&response).await;
             return;
         }
 
@@ -496,29 +486,30 @@ impl AnonymousClientConnection {
             }
         };
 
-        match self
-            .state
-            .call_manager
-            .get_call_token(user_id, call_id)
-            .await
-        {
-            Ok(token) => {
-                let response = CommunicationValue::new(CommunicationType::CallToken)
-                    .with_id(message_id)
-                    .with_receiver(user_id)
-                    .add_typed_default(DataType::CallToken, DataValue::Str(token));
-                self.send_message(&response).await;
-            }
-            Err(error) => {
-                log::warn!(
-                    "Unable to create anonymous call token for {}: {}",
-                    call_id,
-                    error
-                );
-                let error_cv = CommunicationValue::new(CommunicationType::ErrorNoCallId)
-                    .with_id(message_id)
-                    .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));
-                self.send_message(&error_cv).await;
+        match self.state.call_manager.get_call(call_id).await {
+            Some(call) => match call.create_anonymous_token(user_id).await {
+                Ok(Some(token)) => {
+                    let response = CommunicationValue::new(CommunicationType::CallToken)
+                        .with_id(message_id)
+                        .with_receiver(user_id)
+                        .add_typed_default(DataType::CallToken, DataValue::Str(token));
+                    self.send_message(&response).await;
+                }
+                _ => {
+                    log::warn!(
+                        "Unable to create anonymous call token for {}: {}",
+                        call_id,
+                        "anonymous joining is disabled"
+                    );
+                    let error_cv = CommunicationValue::new(CommunicationType::ErrorNoCallId)
+                        .with_id(message_id)
+                        .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));
+                    self.send_message(&error_cv).await;
+                }
+            },
+            None => {
+                self.send_error_response(message_id, CommunicationType::ErrorNotFound)
+                    .await;
             }
         }
     }
@@ -636,10 +627,7 @@ impl AnonymousClientConnection {
 
     pub async fn handle_close(&self) {
         *self.is_open.write().await = false;
-        self.state
-            .call_manager
-            .remove_user_from_calls(self.user_id)
-            .await;
+        self.state.call_manager.get_call_groups(self.user_id).await;
         anonymous_manager::remove_anonymous_user(self.user_id).await;
     }
 }

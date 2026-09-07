@@ -758,18 +758,19 @@ impl IotaConnection {
         let empty = calls.is_empty();
 
         for call in calls {
-            let members = call.members.read().await;
+            let state = call.state.read().await;
 
             // Find ourselves in the call to get our specific status
-            let call_self = members.iter().find(|m| m.user_id == user_id).cloned();
+            let call_self = state.members.get(&user_id).cloned();
 
             if let Some(call_self) = call_self {
-                let timeout = *call_self.timeout.read().await;
-                let admin = call_self.has_admin();
+                let timeout = call_self.timeout_until_ms.unwrap_or(0);
+                let admin = call_self.role == crate::calls::call_group::CallRole::Admin;
 
                 // List of all members in the call
-                let member_ids: Vec<DataValue> = members
-                    .iter()
+                let member_ids: Vec<DataValue> = state
+                    .members
+                    .values()
                     .map(|m| DataValue::SignedNumber(m.user_id.into()))
                     .collect();
 
@@ -807,7 +808,7 @@ impl IotaConnection {
                 global_calls.push(DataValue::container_from_map(&base_call_map));
 
                 // Attach this call to EVERY member of the call (other than ourselves)
-                for member in members.iter() {
+                for member in state.members.values() {
                     let member_id = member.user_id;
                     if member_id == user_id {
                         continue;

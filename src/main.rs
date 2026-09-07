@@ -87,7 +87,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let livekit = std::sync::Arc::new(LiveKitService::new(config.livekit.clone()));
-    let call_manager = std::sync::Arc::new(CallManager::new(livekit.clone()));
+    let call_manager = std::sync::Arc::new(CallManager::new_with_owner(
+        livekit.clone(),
+        config.omikron_id,
+    ));
+    livekit.clone().garbage_collect_calls(call_manager.clone());
     let state = AppState::new(config.clone(), keyring, omega, rho, call_manager, livekit);
     tokio::select! {
         result = start(state) => {

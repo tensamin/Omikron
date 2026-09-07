@@ -24,8 +24,8 @@ impl CallStateAggregator {
         let mut global_calls = Vec::new();
 
         for call in self.call_manager.get_call_groups(user_id).await {
-            let members = call.members.read().await;
-            let Some(call_self) = members.iter().find(|member| member.user_id == user_id) else {
+            let state = call.state.read().await;
+            let Some(call_self) = state.members.get(&user_id) else {
                 continue;
             };
 
@@ -37,21 +37,21 @@ impl CallStateAggregator {
             call_map.insert(
                 data_type_id(DataType::CallMembers, &tm),
                 DataValue::Array(
-                    members
-                        .iter()
+                    state
+                        .members
+                        .values()
                         .map(|member| DataValue::SignedNumber(member.user_id.into()))
                         .collect(),
                 ),
             );
 
-            let timeout = *call_self.timeout.read().await;
-            if timeout > 0 {
+            if let Some(timeout) = call_self.timeout_until_ms {
                 call_map.insert(
                     data_type_id(DataType::Timeout, &tm),
                     DataValue::SignedNumber((timeout as i64).into()),
                 );
             }
-            if call_self.has_admin() {
+            if call_self.role == crate::calls::call_group::CallRole::Admin {
                 call_map.insert(data_type_id(DataType::HasAdmin, &tm), DataValue::Bool(true));
             }
             if let Some(secret) = call.get_secret_for_user(user_id).await {
@@ -63,7 +63,11 @@ impl CallStateAggregator {
 
             let call_value = DataValue::container_from_map(&call_map);
             global_calls.push(call_value.clone());
-            for member in members.iter().filter(|member| member.user_id != user_id) {
+            for member in state
+                .members
+                .values()
+                .filter(|member| member.user_id != user_id)
+            {
                 invites
                     .entry(member.user_id as i64)
                     .or_insert_with(Vec::new)
@@ -97,7 +101,7 @@ impl CallStateAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calls::{call_group::CallGroup, caller::Caller};
+    use crate::calls::call_group::{CallGroup, CallSecretEnvelope};
     use uuid::Uuid;
 
     #[tokio::test]
@@ -115,15 +119,34 @@ mod tests {
     async fn augment_contacts_adds_call_to_member_contact() {
         let call_id = Uuid::new_v4();
         let manager = Arc::new(CallManager::default());
-        let group = Arc::new(CallGroup::new(
+        let group = Arc::new(CallGroup::new_with_service(
             call_id,
-            Arc::new(Caller::new(1, call_id, true)),
+            0,
+            1,
+            CallSecretEnvelope {
+                secret_id: "s".into(),
+                version_number: 1,
+                encrypted_secret: vec![],
+                kem_ciphertext: vec![],
+                wrapping_scheme: "s".into(),
+            },
+            Arc::new(crate::calls::call_util::LiveKitService::new(None)),
         ));
         group
-            .members
-            .write()
+            .invite(
+                1,
+                2,
+                CallSecretEnvelope {
+                    secret_id: "s2".into(),
+                    version_number: 1,
+                    encrypted_secret: vec![],
+                    kem_ciphertext: vec![],
+                    wrapping_scheme: "s".into(),
+                },
+            )
             .await
-            .push(Arc::new(Caller::new(2, call_id, false)));
+            .unwrap();
+        group.accept_invite(2).await.unwrap();
         manager.groups.insert(call_id, group);
 
         let tm = TypeMap::latest();

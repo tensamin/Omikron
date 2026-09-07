@@ -1,6 +1,6 @@
 use crate::anonymous_clients::anonymous_manager;
 use crate::app_state::AppState;
-use crate::calls::call_group::call_invite_secret_from_cv;
+use crate::calls::{call_group::call_invite_secret_from_cv, call_manager::CallServiceError};
 use crate::data::user::UserStatus;
 use crate::rho::connection::{
     GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
@@ -9,7 +9,7 @@ use crate::rho::relay_router::{self, RelaySource};
 use crate::rho::rho_connection::RhoConnection;
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err, log_out};
-use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -28,6 +28,19 @@ fn next_policy_request_id() -> u32 {
 
 fn authenticated_peer_control_request(cv: &CommunicationValue, user_id: u64) -> CommunicationValue {
     cv.clone().with_sender(user_id)
+}
+
+fn call_error_type(error: &CallServiceError) -> CommunicationType {
+    match error {
+        CallServiceError::NotFound => CommunicationType::ErrorNotFound,
+        CallServiceError::NotAuthorized | CallServiceError::TimedOut { .. } => {
+            CommunicationType::ErrorNotAuthenticated
+        }
+        CallServiceError::InvalidUser => CommunicationType::ErrorInvalidUserId,
+        CallServiceError::InvalidRequest => CommunicationType::ErrorInvalidData,
+        CallServiceError::DeliveryFailed => CommunicationType::ErrorNotFound,
+        CallServiceError::LiveKit(_) => CommunicationType::ErrorInternal,
+    }
 }
 
 pub struct ClientConnection {
@@ -286,6 +299,10 @@ impl ClientConnection {
 
             if cv.is_type(CommunicationType::CallSetAnonymousJoining) {
                 self.handle_call_set_anonymous_joining(cv).await;
+                return;
+            }
+            if cv.is_type(CommunicationType::EndCall) {
+                self.handle_end_call(cv).await;
                 return;
             }
             if cv.is_type(CommunicationType::LoadTxtRecord) {
@@ -658,8 +675,8 @@ impl ClientConnection {
             .call_manager
             .add_invite(call_id, self.user_id, receiver_id as u64, secret.clone())
             .await;
-        if !invited {
-            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
+        if let Err(error) = invited {
+            self.send_error_response(message_id, call_error_type(&error))
                 .await;
             return;
         }
@@ -687,9 +704,25 @@ impl ClientConnection {
             .add_typed_default(
                 DataType::SenderId,
                 DataValue::SignedNumber(sender_id.into()),
+            )
+            .add_typed_default(
+                DataType::OmikronId,
+                DataValue::SignedNumber((self.state.call_manager.owner_omikron_id as i64).into()),
             );
 
-        target_rho.message_to_client(forward).await;
+        if target_rho
+            .send_to_local_user(receiver_id as u64, &forward)
+            .await
+            .is_err()
+        {
+            self.state
+                .call_manager
+                .rollback_invite(call_id, receiver_id as u64)
+                .await;
+            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
+                .await;
+            return;
+        }
 
         let response = CommunicationValue::new(CommunicationType::Success).with_id(message_id);
         self.send_message(&response).await;
@@ -721,21 +754,55 @@ impl ClientConnection {
         match self
             .state
             .call_manager
-            .get_call_token(user_id, call_id)
+            .get_or_create_token(
+                user_id,
+                call_id,
+                cv.get_data(DataType::CallSecret)
+                    .and_then(crate::calls::call_group::CallSecretEnvelope::from_data_value),
+            )
             .await
         {
             Ok(token) => {
                 let response = CommunicationValue::new(CommunicationType::CallToken)
                     .with_id(message_id)
                     .with_receiver(user_id as u64)
-                    .add_typed_default(DataType::CallToken, DataValue::Str(token));
-                self.send_message(&response).await;
+                    .add_typed_default(DataType::CallToken, DataValue::Str(token))
+                    .add_typed_default(
+                        DataType::OmikronId,
+                        DataValue::SignedNumber(
+                            (self.state.call_manager.owner_omikron_id as i64).into(),
+                        ),
+                    )
+                    .add_data(
+                        DataTypeId(189),
+                        DataValue::Str(
+                            self.state
+                                .config
+                                .livekit
+                                .as_ref()
+                                .map(|config| config.client_url.clone())
+                                .unwrap_or_default(),
+                        ),
+                    );
+                match response {
+                    Ok(response) => self.send_message(&response).await,
+                    Err(_) => {
+                        self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                            .await
+                    }
+                }
             }
             Err(error) => {
                 log::warn!("Unable to create call token for {}: {}", call_id, error);
-                let error_cv = CommunicationValue::new(CommunicationType::ErrorNoCallId)
+                let mut error_cv = CommunicationValue::new(call_error_type(&error))
                     .with_id(message_id)
                     .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));
+                if let CallServiceError::TimedOut { until_ms } = error {
+                    error_cv = error_cv.add_typed_default(
+                        DataType::Timeout,
+                        DataValue::SignedNumber(until_ms.into()),
+                    );
+                }
                 self.send_message(&error_cv).await;
             }
         }
@@ -762,34 +829,22 @@ impl ClientConnection {
             }
         };
 
-        if let Some(call) = self.state.call_manager.get_call(call_id).await {
-            if let Some(_) = call.get_caller(user_id).await {
-                let mut user_ids: Vec<DataValue> = Vec::new();
-                let members = call.members.read().await.clone();
-                for member in members {
-                    if member.user_id == user_id {
-                        user_ids.push(DataValue::SignedNumber(member.user_id.into()));
-                    }
-                }
-
+        match self.state.call_manager.call_data(call_id, user_id).await {
+            Ok(member_ids) => {
+                let user_ids = member_ids
+                    .into_iter()
+                    .map(|id| DataValue::SignedNumber(id.into()))
+                    .collect();
                 let response = CommunicationValue::new(CommunicationType::CallData)
                     .with_id(message_id)
                     .with_receiver(user_id as u64)
                     .add_typed_default(DataType::UserIds, DataValue::Array(user_ids));
                 self.send_message(&response).await;
-            } else {
-                let error_cv = CommunicationValue::new(CommunicationType::ErrorInvalidUserId)
-                    .with_id(message_id)
-                    .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()));
-                self.send_message(&error_cv).await;
-                return;
             }
-        } else {
-            let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                .with_id(message_id)
-                .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));
-            self.send_message(&error_cv).await;
-            return;
+            Err(error) => {
+                self.send_error_response(message_id, call_error_type(&error))
+                    .await;
+            }
         }
     }
 
@@ -812,25 +867,26 @@ impl ClientConnection {
             .as_signed_number()
             .unwrap_or(0);
 
-        let Some(call) = self.state.call_manager.get_call(call_id).await else {
-            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
+        if user_id <= 0 || untill <= 0 {
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
                 .await;
             return;
-        };
-
-        let Some(caller) = call.get_caller(self.get_user_id().await).await else {
-            self.send_error_response(message_id, CommunicationType::ErrorInvalidUserId)
-                .await;
-            return;
-        };
-        if caller.has_admin() {
-            let _ = self
-                .state
-                .livekit
-                .remove_participant(call_id, user_id as u64)
-                .await;
-            if let Some(target) = call.get_caller(user_id as u64).await {
-                target.set_timeout(untill as i64).await;
+        }
+        match self
+            .state
+            .call_manager
+            .timeout_user(call_id, self.user_id, user_id as u64, untill as i64)
+            .await
+        {
+            Ok(()) => {
+                self.send_message(
+                    &CommunicationValue::new(CommunicationType::Success).with_id(message_id),
+                )
+                .await
+            }
+            Err(error) => {
+                self.send_error_response(message_id, call_error_type(&error))
+                    .await
             }
         }
     }
@@ -849,18 +905,27 @@ impl ClientConnection {
             .as_signed_number()
             .unwrap_or(0);
 
-        let Some(call) = self.state.call_manager.get_call(call_id).await else {
-            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
-                .await;
-            return;
-        };
-        let Some(caller) = call.get_caller(self.get_user_id().await).await else {
+        if user_id <= 0 {
             self.send_error_response(message_id, CommunicationType::ErrorInvalidUserId)
                 .await;
             return;
-        };
-        if caller.has_admin() {
-            call.remove_caller(user_id as u64).await;
+        }
+        match self
+            .state
+            .call_manager
+            .disconnect_user(call_id, self.user_id, user_id as u64)
+            .await
+        {
+            Ok(()) => {
+                self.send_message(
+                    &CommunicationValue::new(CommunicationType::Success).with_id(message_id),
+                )
+                .await
+            }
+            Err(error) => {
+                self.send_error_response(message_id, call_error_type(&error))
+                    .await
+            }
         }
     }
     async fn handle_call_set_anonymous_joining(self: Arc<Self>, cv: CommunicationValue) {
@@ -875,30 +940,75 @@ impl ClientConnection {
         };
         let enable = cv.get_data(DataType::Enabled).as_bool().unwrap_or(true);
 
-        let call = self.state.call_manager.get_call(call_id).await;
-
-        let mut short_link = None;
-        if let Some(call) = call {
-            if let Some(caller) = call.get_caller(self.get_user_id().await).await {
-                if caller.has_admin() {
-                    call.set_anonymous_joining(
-                        enable,
-                        &self.state.omega,
-                        self.state.config.omikron_id,
-                    )
-                    .await;
+        let Some(call) = self.state.call_manager.get_call(call_id).await else {
+            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
+                .await;
+            return;
+        };
+        if call.member(self.user_id).await.is_none()
+            || call
+                .member(self.user_id)
+                .await
+                .map(|member| member.role == crate::calls::call_group::CallRole::Admin)
+                != Some(true)
+        {
+            self.send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
+                .await;
+            return;
+        }
+        match call.set_anonymous_joining(enable, &self.state.omega).await {
+            Ok(link) => {
+                let mut response =
+                    CommunicationValue::new(CommunicationType::CallSetAnonymousJoining)
+                        .with_id(message_id)
+                        .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
+                        .add_typed_default(DataType::Enabled, DataValue::Bool(enable));
+                if let Some(link) = link {
+                    response = response.add_typed_default(DataType::Link, DataValue::Str(link));
                 }
+                self.send_message(&response).await;
             }
-            short_link = call.get_short_link().await;
+            Err(_) => {
+                self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                    .await
+            }
         }
-        let mut response_cv = CommunicationValue::new(CommunicationType::CallSetAnonymousJoining)
-            .with_id(message_id)
-            .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
-            .add_typed_default(DataType::Enabled, DataValue::Bool(enable));
-        if let Some(short_link) = short_link {
-            response_cv = response_cv.add_typed_default(DataType::Link, DataValue::Str(short_link));
+    }
+
+    async fn handle_end_call(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
+        let Some(id) = cv
+            .get_data(DataType::CallId)
+            .and_then(|value| value.as_str())
+        else {
+            self.send_error_response(message_id, CommunicationType::ErrorNoCallId)
+                .await;
+            return;
+        };
+        let Ok(call_id) = Uuid::parse_str(id) else {
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
+                .await;
+            return;
+        };
+        match self
+            .state
+            .call_manager
+            .end_call(call_id, self.user_id)
+            .await
+        {
+            Ok(()) => {
+                self.send_message(
+                    &CommunicationValue::new(CommunicationType::Success).with_id(message_id),
+                )
+                .await
+            }
+            Err(error) => {
+                self.send_error_response(message_id, call_error_type(&error))
+                    .await
+            }
         }
-        self.send_message(&response_cv).await;
     }
 
     async fn handle_load_txt_record(self: Arc<Self>, cv: CommunicationValue) {

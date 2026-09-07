@@ -15,6 +15,7 @@ const DEFAULT_RHO_MAX_ANONYMOUS_CONNECTIONS_PER_IP: usize = 16;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveKitConfig {
     pub hostname: String,
+    pub client_url: String,
     pub api_key: String,
     pub api_secret: String,
 }
@@ -47,7 +48,9 @@ pub enum ConfigError {
         name: &'static str,
         kind: &'static str,
     },
-    #[error("LIVEKIT_HOSTNAME, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET must be set together")]
+    #[error(
+        "LIVEKIT_HOSTNAME, LIVEKIT_CLIENT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET must be set together"
+    )]
     IncompleteLiveKitCredentials,
 }
 
@@ -146,6 +149,7 @@ where
 fn livekit_from_environment() -> Result<Option<LiveKitConfig>, ConfigError> {
     livekit_from_values(
         env::var("LIVEKIT_HOSTNAME").ok(),
+        env::var("LIVEKIT_CLIENT_URL").ok(),
         env::var("LIVEKIT_API_KEY").ok(),
         env::var("LIVEKIT_API_SECRET").ok(),
     )
@@ -153,18 +157,21 @@ fn livekit_from_environment() -> Result<Option<LiveKitConfig>, ConfigError> {
 
 fn livekit_from_values(
     hostname: Option<String>,
+    client_url: Option<String>,
     api_key: Option<String>,
     api_secret: Option<String>,
 ) -> Result<Option<LiveKitConfig>, ConfigError> {
-    match (hostname, api_key, api_secret) {
-        (None, None, None) => Ok(None),
-        (Some(hostname), Some(api_key), Some(api_secret))
+    match (hostname, client_url, api_key, api_secret) {
+        (None, None, None, None) => Ok(None),
+        (Some(hostname), Some(client_url), Some(api_key), Some(api_secret))
             if !hostname.trim().is_empty()
+                && !client_url.trim().is_empty()
                 && !api_key.trim().is_empty()
                 && !api_secret.trim().is_empty() =>
         {
             Ok(Some(LiveKitConfig {
                 hostname,
+                client_url,
                 api_key,
                 api_secret,
             }))
@@ -180,7 +187,12 @@ mod tests {
     #[test]
     fn livekit_credentials_must_be_complete() {
         assert_eq!(
-            livekit_from_values(Some("host".to_string()), Some("key".to_string()), None),
+            livekit_from_values(
+                Some("host".to_string()),
+                Some("url".to_string()),
+                Some("key".to_string()),
+                None
+            ),
             Err(ConfigError::IncompleteLiveKitCredentials)
         );
     }
@@ -190,11 +202,13 @@ mod tests {
         assert_eq!(
             livekit_from_values(
                 Some("https://livekit.example".to_string()),
+                Some("wss://livekit.example".to_string()),
                 Some("key".to_string()),
                 Some("secret".to_string()),
             ),
             Ok(Some(LiveKitConfig {
                 hostname: "https://livekit.example".to_string(),
+                client_url: "wss://livekit.example".to_string(),
                 api_key: "key".to_string(),
                 api_secret: "secret".to_string(),
             }))

@@ -2057,6 +2057,7 @@ dependencies = [
  "once_cell",
  "rand 0.10.2",
  "rustls",
+ "serde",
  "serde_json",
  "strum_macros",
  "thiserror 2.0.20",
