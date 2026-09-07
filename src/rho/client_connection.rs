@@ -354,7 +354,6 @@ impl ClientConnection {
             }
 
             if cv.is_type(CommunicationType::ChangeUserData)
-                || cv.is_type(CommunicationType::ReadNotification)
                 || cv.is_type(CommunicationType::GetNotifications)
                 || cv.is_type(CommunicationType::GetUserData)
                 || cv.is_type(CommunicationType::GetIotaData)

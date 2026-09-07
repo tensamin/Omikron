@@ -121,6 +121,7 @@ pub fn message_security_class(frame: &CommunicationValue) -> MessageSecurityClas
         || frame.is_type(CommunicationType::ReceiptPolicySet)
         || frame.is_type(CommunicationType::MessageStoragePolicyGet)
         || frame.is_type(CommunicationType::MessageStoragePolicySet)
+        || frame.is_type(CommunicationType::ReadNotification)
     {
         MessageSecurityClass::AuthenticatedPeerControl
     } else {

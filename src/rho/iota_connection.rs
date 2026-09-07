@@ -372,6 +372,7 @@ impl IotaConnection {
             || cv.is_type(CommunicationType::BlockedUsersChanged)
             || cv.is_type(CommunicationType::ReceiptPolicyChanged)
             || cv.is_type(CommunicationType::MessageStoragePolicyChanged)
+            || cv.is_type(CommunicationType::PushNotification)
         {
             self.forward_to_client(cv).await;
             return;
@@ -569,8 +570,7 @@ impl IotaConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::PushNotification)
-            || cv.is_type(CommunicationType::GetUserData)
+        if cv.is_type(CommunicationType::GetUserData)
             || cv.is_type(CommunicationType::GetIotaData)
             || cv.is_type(CommunicationType::DeleteIota)
             || cv.is_type(CommunicationType::AttachUserBegin)
