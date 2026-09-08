@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 use super::rho_connection::RhoConnection;
 
-fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, Vec<i64>)> {
+pub(crate) fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, Vec<i64>)> {
     if !value.is_type(CommunicationType::ClientStateSync)
         && !value.is_type(CommunicationType::AddConversation)
     {
@@ -386,7 +386,7 @@ impl IotaConnection {
         }
 
         let cv = if cv.is_type(CommunicationType::ClientStateSync) {
-            self.add_call_state(cv).await
+            self.augment_client_state_sync(cv).await
         } else {
             cv
         };
@@ -898,7 +898,10 @@ impl IotaConnection {
         }
     }
 
-    async fn add_call_state(&self, response: CommunicationValue) -> CommunicationValue {
+    pub(crate) async fn augment_client_state_sync(
+        &self,
+        response: CommunicationValue,
+    ) -> CommunicationValue {
         let mut output = response.clone();
         let Some(user_id) = response.receiver() else {
             log_err!(

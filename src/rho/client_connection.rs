@@ -2,6 +2,7 @@ use crate::anonymous_clients::anonymous_manager;
 use crate::app_state::AppState;
 use crate::calls::{call_group::call_invite_secret_from_cv, call_manager::CallServiceError};
 use crate::data::user::UserStatus;
+use crate::omega::omega_connection::InitialPresenceError;
 use crate::rho::connection::{
     GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
 };
@@ -10,15 +11,37 @@ use crate::rho::rho_connection::RhoConnection;
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-use tokio::sync::RwLock;
+use std::{collections::VecDeque, str::FromStr};
+use tokio::sync::{Mutex, RwLock};
 use trust_dns_resolver::TokioAsyncResolver;
 use uuid::Uuid;
 
 static NEXT_POLICY_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
+const MAX_CLIENT_STATE_SYNC_BUFFERED_EVENTS: usize = 1_024;
+
+#[derive(Clone, Debug, Default)]
+enum ClientStateSyncPhase {
+    #[default]
+    Idle,
+    Requesting {
+        device_id: String,
+    },
+    AwaitingAck {
+        device_id: String,
+        version: i64,
+    },
+    Draining,
+}
+
+#[derive(Default)]
+struct ClientStateSyncState {
+    phase: ClientStateSyncPhase,
+    buffered_events: VecDeque<CommunicationValue>,
+    overflowed: bool,
+}
 
 fn next_policy_request_id() -> u32 {
     NEXT_POLICY_REQUEST_ID
@@ -55,6 +78,7 @@ pub struct ClientConnection {
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     is_open: Arc<RwLock<bool>>,
     message_slots: Arc<tokio::sync::Semaphore>,
+    client_state_sync: Arc<Mutex<ClientStateSyncState>>,
 }
 
 impl ClientConnection {
@@ -70,6 +94,7 @@ impl ClientConnection {
             session_id: general.session_id.read().await.clone(),
             client_version: general.client_version.read().await.clone(),
             message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
+            client_state_sync: Arc::new(Mutex::new(ClientStateSyncState::default())),
         })
     }
     pub fn start(self: Arc<Self>) {
@@ -124,6 +149,49 @@ impl ClientConnection {
         }
         log_cv_out!(PrintType::Client, &cv);
         let _ = self.sender.send(&cv).await;
+    }
+
+    /// Routes unsolicited state changes behind the ClientStateAck barrier.
+    /// The state response itself deliberately uses `send_message` directly.
+    pub async fn send_or_buffer_live(self: Arc<Self>, value: CommunicationValue) -> Result<(), ()> {
+        let mut state = self.client_state_sync.lock().await;
+        if matches!(state.phase, ClientStateSyncPhase::Idle) {
+            drop(state);
+            self.send_message(&value).await;
+            return Ok(());
+        }
+        if state.overflowed || state.buffered_events.len() >= MAX_CLIENT_STATE_SYNC_BUFFERED_EVENTS
+        {
+            state.overflowed = true;
+            return Err(());
+        }
+        state.buffered_events.push_back(value);
+        Ok(())
+    }
+
+    async fn reset_client_state_sync(&self) {
+        let mut state = self.client_state_sync.lock().await;
+        *state = ClientStateSyncState::default();
+    }
+
+    async fn drain_buffered_live_events(self: Arc<Self>) {
+        loop {
+            let next = {
+                let mut state = self.client_state_sync.lock().await;
+                match state.buffered_events.pop_front() {
+                    Some(event) => Some(event),
+                    None => {
+                        state.phase = ClientStateSyncPhase::Idle;
+                        state.overflowed = false;
+                        None
+                    }
+                }
+            };
+            let Some(event) = next else {
+                return;
+            };
+            self.clone().send_message(&event).await;
+        }
     }
 
     pub async fn send_relay(&self, cv: &CommunicationValue) -> Result<(), String> {
@@ -348,20 +416,260 @@ impl ClientConnection {
                 }
             }
 
-            if cv.is_type(CommunicationType::ClientStateAck) {
+            if cv.is_type(CommunicationType::ClientStateGet) {
+                let Some(device_id) = cv
+                    .get_data(DataType::DeviceId)
+                    .and_then(DataValue::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                else {
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                };
+                let can_request = {
+                    let mut state = self.client_state_sync.lock().await;
+                    if matches!(state.phase, ClientStateSyncPhase::Idle) {
+                        state.phase = ClientStateSyncPhase::Requesting {
+                            device_id: device_id.clone(),
+                        };
+                        state.buffered_events.clear();
+                        state.overflowed = false;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !can_request {
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                }
                 let Some(rho) = self.get_rho_connection().await else {
+                    self.reset_client_state_sync().await;
                     self.send_error_response(message_id, CommunicationType::ErrorNoIota)
                         .await;
                     return;
                 };
-                let request = cv.with_sender(self.user_id);
+                let mut request = cv.clone();
+                request.remove_data(DataType::SessionId);
+                let request = request.with_sender(self.user_id).add_typed_default(
+                    DataType::SessionId,
+                    DataValue::UnsignedNumber(self.session_id.into()),
+                );
                 match rho
                     .get_iota_connection()
                     .clone()
                     .await_response(&request, Some(Duration::from_secs(20)))
                     .await
                 {
-                    Ok(response) => self.send_message(&response).await,
+                    Ok(response)
+                        if response.is_type(CommunicationType::ClientStateSync)
+                            && response.get_data(DataType::SessionId).as_number()
+                                == Some(self.session_id as i128) =>
+                    {
+                        let version = response
+                            .get_data(DataType::VersionNumber)
+                            .as_number()
+                            .and_then(|value| i64::try_from(value).ok());
+                        let Some(version) = version else {
+                            self.reset_client_state_sync().await;
+                            self.send_error_response(
+                                message_id,
+                                CommunicationType::ErrorInvalidData,
+                            )
+                            .await;
+                            return;
+                        };
+                        let response = rho
+                            .get_iota_connection()
+                            .augment_client_state_sync(response)
+                            .await;
+                        let response = if let Some((_, _, contacts)) =
+                            crate::rho::iota_connection::contact_snapshot(&response)
+                        {
+                            match self
+                                .state
+                                .omega
+                                .initial_presence_snapshot(
+                                    self.user_id as i64,
+                                    self.session_id as i64,
+                                    contacts,
+                                )
+                                .await
+                            {
+                                Ok(snapshot) => response
+                                    .add_typed_default(
+                                        DataType::UserStates,
+                                        snapshot
+                                            .get_data(DataType::UserStates)
+                                            .cloned()
+                                            .unwrap_or(DataValue::Array(Vec::new())),
+                                    )
+                                    .add_typed_default(
+                                        DataType::MissingUserIds,
+                                        snapshot
+                                            .get_data(DataType::MissingUserIds)
+                                            .cloned()
+                                            .unwrap_or(DataValue::Array(Vec::new())),
+                                    )
+                                    .add_typed_default(
+                                        DataType::PresenceSnapshotComplete,
+                                        DataValue::Bool(true),
+                                    ),
+                                Err(error) => {
+                                    // An incomplete presence response has no ACK-backed
+                                    // ordering window, so its local presence barrier must
+                                    // not retain later events.
+                                    self.state.omega.abort_initial_presence_sync(
+                                        self.user_id as i64,
+                                        self.session_id as i64,
+                                    );
+                                    if matches!(
+                                        error,
+                                        InitialPresenceError::OrderingLost
+                                            | InitialPresenceError::AlreadyInProgress
+                                            | InitialPresenceError::InvalidSnapshot(_)
+                                            | InitialPresenceError::SubscriptionRejected(_)
+                                    ) {
+                                        self.reset_client_state_sync().await;
+                                        self.send_error_response(
+                                            message_id,
+                                            CommunicationType::ErrorInternal,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                    response
+                                        .add_typed_default(
+                                            DataType::UserStates,
+                                            DataValue::Array(Vec::new()),
+                                        )
+                                        .add_typed_default(
+                                            DataType::MissingUserIds,
+                                            DataValue::Array(Vec::new()),
+                                        )
+                                        .add_typed_default(
+                                            DataType::PresenceSnapshotComplete,
+                                            DataValue::Bool(false),
+                                        )
+                                }
+                            }
+                        } else {
+                            response
+                                .add_typed_default(
+                                    DataType::UserStates,
+                                    DataValue::Array(Vec::new()),
+                                )
+                                .add_typed_default(
+                                    DataType::MissingUserIds,
+                                    DataValue::Array(Vec::new()),
+                                )
+                                .add_typed_default(
+                                    DataType::PresenceSnapshotComplete,
+                                    DataValue::Bool(true),
+                                )
+                        };
+                        self.client_state_sync.lock().await.phase =
+                            ClientStateSyncPhase::AwaitingAck { device_id, version };
+                        self.clone().send_message(&response).await;
+                    }
+                    Ok(_) => {
+                        self.reset_client_state_sync().await;
+                        self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                            .await;
+                    }
+                    Err(_) => {
+                        self.reset_client_state_sync().await;
+                        self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                            .await;
+                    }
+                }
+                return;
+            }
+
+            if cv.is_type(CommunicationType::ClientStateAck) {
+                let ack_device_id = cv.get_data(DataType::DeviceId).and_then(DataValue::as_str);
+                let ack_version = cv
+                    .get_data(DataType::VersionNumber)
+                    .as_number()
+                    .and_then(|value| i64::try_from(value).ok());
+                let ack_matches = {
+                    let state = self.client_state_sync.lock().await;
+                    match &state.phase {
+                        ClientStateSyncPhase::AwaitingAck { device_id, version } => {
+                            ack_device_id == Some(device_id.as_str())
+                                && ack_version == Some(*version)
+                        }
+                        _ => false,
+                    }
+                };
+                if !ack_matches {
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                }
+                let Some(rho) = self.get_rho_connection().await else {
+                    self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                        .await;
+                    return;
+                };
+                let mut request = cv.clone();
+                request.remove_data(DataType::SessionId);
+                let request = request.with_sender(self.user_id).add_typed_default(
+                    DataType::SessionId,
+                    DataValue::UnsignedNumber(self.session_id.into()),
+                );
+                match rho
+                    .get_iota_connection()
+                    .clone()
+                    .await_response(&request, Some(Duration::from_secs(20)))
+                    .await
+                {
+                    Ok(response) => {
+                        if response.is_type(CommunicationType::Success) {
+                            let overflowed = {
+                                let state = self.client_state_sync.lock().await;
+                                state.overflowed
+                            };
+                            if overflowed {
+                                self.state.omega.abort_initial_presence_sync(
+                                    self.user_id as i64,
+                                    self.session_id as i64,
+                                );
+                                self.reset_client_state_sync().await;
+                                self.send_error_response(
+                                    message_id,
+                                    CommunicationType::ErrorInternal,
+                                )
+                                .await;
+                                return;
+                            }
+                            if let Err(_) = self
+                                .state
+                                .omega
+                                .finish_initial_presence_sync(
+                                    self.user_id as i64,
+                                    self.session_id as i64,
+                                )
+                                .await
+                            {
+                                self.reset_client_state_sync().await;
+                                self.send_error_response(
+                                    message_id,
+                                    CommunicationType::ErrorInternal,
+                                )
+                                .await;
+                                return;
+                            }
+                            self.client_state_sync.lock().await.phase =
+                                ClientStateSyncPhase::Draining;
+                            self.clone().send_message(&response).await;
+                            self.clone().drain_buffered_live_events().await;
+                        } else {
+                            self.send_message(&response).await;
+                        }
+                    }
                     Err(_) => {
                         self.send_error_response(message_id, CommunicationType::ErrorInternal)
                             .await;
@@ -1155,6 +1463,7 @@ impl Clone for ClientConnection {
             rho_connection: Arc::clone(&self.rho_connection),
             is_open: Arc::clone(&self.is_open),
             message_slots: Arc::clone(&self.message_slots),
+            client_state_sync: Arc::clone(&self.client_state_sync),
         }
     }
 }

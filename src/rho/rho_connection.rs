@@ -28,6 +28,26 @@ fn message_targets_client(cv: &CommunicationValue, user_id: u64, session_id: u64
     target_session_id == i128::from(session_id)
 }
 
+fn must_follow_initial_state(cv: &CommunicationValue) -> bool {
+    matches!(
+        cv.get_comm_type_enum(),
+        Some(
+            CommunicationType::MessageLive
+                | CommunicationType::MessageEditLive
+                | CommunicationType::MessageReactionLive
+                | CommunicationType::MessageDeleteLive
+                | CommunicationType::ClientChanged
+                | CommunicationType::SyncedSettingChanged
+                | CommunicationType::UserBlobChanged
+                | CommunicationType::BlockedUsersChanged
+                | CommunicationType::ReceiptPolicyChanged
+                | CommunicationType::MessageStoragePolicyChanged
+                | CommunicationType::PushNotification
+                | CommunicationType::ChatSecretForward
+        )
+    )
+}
+
 impl RhoConnection {
     /// Create a new RhoConnection
     pub async fn new(iota_connection: Arc<IotaConnection>, user_ids: Vec<i64>) -> Self {
@@ -277,7 +297,11 @@ impl RhoConnection {
             if !message_targets_client(&cv, connection.user_id, connection.session_id) {
                 continue;
             }
-            connection.clone().send_message(&cv).await;
+            if must_follow_initial_state(&cv) {
+                let _ = connection.clone().send_or_buffer_live(cv.clone()).await;
+            } else {
+                connection.clone().send_message(&cv).await;
+            }
         }
     }
 

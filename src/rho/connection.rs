@@ -82,25 +82,9 @@ impl OptionalDataValueCompat for Option<&DataValue> {
     }
 }
 
-fn initial_client_state_request(user_id: i64, session_id: i64) -> CommunicationValue {
-    CommunicationValue::new(CommunicationType::ClientConnected)
-        .with_sender(user_id as u64)
-        .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
-        .add_typed_default(
-            DataType::SessionId,
-            DataValue::SignedNumber(session_id.into()),
-        )
-        .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(0))
-        .add_typed_default(DataType::CacheValid, DataValue::Bool(false))
-        .add_typed_default(DataType::CacheSchemaVersion, DataValue::SignedNumber(0))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        FrameValidationError, OptionalDataValueCompat, RequiredMtpFields,
-        initial_client_state_request,
-    };
+    use super::{FrameValidationError, OptionalDataValueCompat, RequiredMtpFields};
     use mtp::codec::{CommunicationType, CommunicationValue, DataType};
 
     #[test]
@@ -131,26 +115,6 @@ mod tests {
         assert_eq!(frame.require_id(), Ok(0));
         assert_eq!(frame.require_sender(), Ok(0));
         assert_eq!(frame.require_receiver(), Ok(0));
-    }
-
-    #[test]
-    fn initial_state_request_targets_the_authenticated_client_session() {
-        let request = initial_client_state_request(7, 11);
-
-        assert!(request.is_type(CommunicationType::ClientConnected));
-        assert_eq!(request.sender(), Some(7));
-        assert_eq!(
-            request.get_data(DataType::UserId).as_signed_number(),
-            Some(7)
-        );
-        assert_eq!(
-            request.get_data(DataType::SessionId).as_signed_number(),
-            Some(11)
-        );
-        assert_eq!(
-            request.get_data(DataType::CacheValid).as_bool(),
-            Some(false)
-        );
     }
 }
 
@@ -278,17 +242,6 @@ impl GeneralConnection {
 
             let iota_id = rho_conn.get_iota_id().await as i64;
             let session_id = *self.session_id.read().await as i64;
-            log_out!(
-                user_id,
-                PrintType::Client,
-                "InitialSync user={} session={} stage=request_iota iota={}",
-                user_id,
-                session_id,
-                iota_id
-            );
-            self.send_initial_client_state_request(&rho_conn, user_id)
-                .await;
-
             match self.notify_user_connected(user_id, iota_id).await {
                 Ok(()) => {
                     log_out!(
@@ -373,12 +326,6 @@ impl GeneralConnection {
         };
         rho.bind_user_id(user_id).await;
         Some(rho)
-    }
-
-    async fn send_initial_client_state_request(&self, rho: &Arc<RhoConnection>, user_id: i64) {
-        let session_id = *self.session_id.read().await as i64;
-        let request = initial_client_state_request(user_id, session_id);
-        rho.get_iota_connection().send_message(&request).await;
     }
 
     async fn migrate_iota(self: &Arc<Self>) {
