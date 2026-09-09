@@ -126,15 +126,14 @@ impl ClientConnection {
         response: CommunicationValue,
     ) -> Result<CommunicationValue, InitialPresenceError> {
         let response = iota.augment_client_state_sync(response).await;
-        let Some((response_user_id, response_session_id, contacts)) =
+        let Some((response_user_id, _, contacts)) =
             crate::rho::iota_connection::contact_snapshot(&response)
         else {
             return Err(InitialPresenceError::InvalidSnapshot(
                 "ClientStateSync is missing a valid contact snapshot".into(),
             ));
         };
-        if response_user_id != self.user_id as i64 || response_session_id != self.session_id as i64
-        {
+        if response_user_id != self.user_id as i64 {
             return Err(InitialPresenceError::InvalidSnapshot(
                 "ClientStateSync does not belong to the authenticated session".into(),
             ));
@@ -538,23 +537,11 @@ impl ClientConnection {
                 }
             }
 
-            if cv.is_type(CommunicationType::ClientStateGet) {
-                let Some(device_id) = cv
-                    .get_data(DataType::DeviceId)
-                    .and_then(DataValue::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned)
-                else {
-                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
-                        .await;
-                    return;
-                };
+            if cv.is_type(CommunicationType::AccountStateRequest) {
                 let can_request = {
                     let mut state = self.client_state_sync.lock().await;
                     if matches!(state.phase, ClientStateSyncPhase::Idle) {
-                        state.phase = ClientStateSyncPhase::Requesting {
-                            device_id: device_id.clone(),
-                        };
+                        state.phase = ClientStateSyncPhase::Requesting { device_id: String::new() };
                         state.buffered_events.clear();
                         state.overflowed = false;
                         true
@@ -586,24 +573,9 @@ impl ClientConnection {
                     .await
                 {
                     Ok(response)
-                        if response.is_type(CommunicationType::ClientStateSync)
-                            && response.receiver() == Some(self.user_id)
-                            && response.get_data(DataType::SessionId).as_number()
-                                == Some(self.session_id as i128) =>
+                        if response.is_type(CommunicationType::AccountStateSnapshot)
+                            && response.receiver() == Some(self.user_id) =>
                     {
-                        let version = response
-                            .get_data(DataType::VersionNumber)
-                            .as_number()
-                            .and_then(|value| i64::try_from(value).ok());
-                        let Some(version) = version else {
-                            self.reset_client_state_sync().await;
-                            self.send_error_response(
-                                message_id,
-                                CommunicationType::ErrorInvalidData,
-                            )
-                            .await;
-                            return;
-                        };
                         let response = match self
                             .compose_initial_client_state(
                                 rho.get_iota_connection().clone(),
@@ -623,7 +595,7 @@ impl ClientConnection {
                             }
                         };
                         self.client_state_sync.lock().await.phase =
-                            ClientStateSyncPhase::AwaitingAck { device_id, version };
+                            ClientStateSyncPhase::AwaitingAck { device_id: String::new(), version: 0 };
                         self.clone().send_message(&response).await;
                     }
                     Ok(_) => {
@@ -640,21 +612,12 @@ impl ClientConnection {
                 return;
             }
 
-            if cv.is_type(CommunicationType::ClientStateAck) {
-                let ack_device_id = cv.get_data(DataType::DeviceId).and_then(DataValue::as_str);
-                let ack_version = cv
-                    .get_data(DataType::VersionNumber)
-                    .as_number()
-                    .and_then(|value| i64::try_from(value).ok());
+            if cv.is_type(CommunicationType::AccountStateApplied) {
                 let begin_commit = {
                     let mut state = self.client_state_sync.lock().await;
                     match &state.phase {
                         ClientStateSyncPhase::AwaitingAck { device_id, version } => {
-                            if ack_device_id != Some(device_id.as_str())
-                                || ack_version != Some(*version)
-                            {
-                                AckCommitStart::Invalid
-                            } else if state.overflowed {
+                            if state.overflowed {
                                 AckCommitStart::Overflowed
                             } else {
                                 state.phase = ClientStateSyncPhase::Committing {

@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use super::rho_connection::RhoConnection;
 
 pub(crate) fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, Vec<i64>)> {
-    if !value.is_type(CommunicationType::ClientStateSync)
+    if !value.is_type(CommunicationType::AccountStateSnapshot)
         && !value.is_type(CommunicationType::AddConversation)
     {
         return None;
@@ -35,11 +35,6 @@ pub(crate) fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, 
 
     let user_id = value
         .receiver()
-        .and_then(|id| i64::try_from(id).ok())
-        .filter(|id| *id > 0)?;
-    let session_id = value
-        .get_data(DataType::SessionId)
-        .as_signed_number()
         .and_then(|id| i64::try_from(id).ok())
         .filter(|id| *id > 0)?;
     let Some(DataValue::Array(values)) = value.get_data(DataType::UserIds) else {
@@ -65,7 +60,7 @@ pub(crate) fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, 
     contact_ids.sort_unstable();
     contact_ids.dedup();
 
-    Some((user_id, session_id, contact_ids))
+    Some((user_id, 0, contact_ids))
 }
 
 #[allow(dead_code)]
@@ -385,18 +380,18 @@ impl IotaConnection {
             }
         }
 
-        if cv.is_type(CommunicationType::ClientStateSync) {
+        if cv.is_type(CommunicationType::AccountStateSnapshot) {
             let user_id = cv.receiver();
             let session_id = cv.get_data(DataType::SessionId).as_number();
             log_in!(
                 self.iota_id as i64,
                 PrintType::Iota,
-                "ClientStateSync user={:?} session={:?} stage=ignored_unsolicited",
+                "AccountStateSnapshot user={:?} session={:?} stage=ignored_unsolicited",
                 user_id,
                 session_id
             );
             // Request-correlated state responses are consumed above by
-            // `await_response`.  An unsolicited ClientStateSync cannot form
+            // `await_response`.  An unsolicited account-state snapshot cannot form
             // an initial snapshot because it has not crossed the Omega
             // presence barrier, so ClientConnection owns that transaction.
             return;
@@ -991,7 +986,7 @@ mod tests {
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 
     fn snapshot(user_ids: DataValue) -> CommunicationValue {
-        CommunicationValue::new(CommunicationType::ClientStateSync)
+        CommunicationValue::new(CommunicationType::AccountStateSnapshot)
             .with_receiver(7)
             .add_typed_default(DataType::SessionId, DataValue::SignedNumber(11))
             .add_typed_default(DataType::UserIds, user_ids)
