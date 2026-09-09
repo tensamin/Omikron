@@ -33,6 +33,12 @@ enum ClientStateSyncPhase {
         device_id: String,
         version: i64,
     },
+    /// Iota's acknowledgement is in flight. Post-initial-state messages must
+    /// remain queued until its durable commit succeeds.
+    Committing {
+        device_id: String,
+        version: i64,
+    },
     Draining,
 }
 
@@ -41,6 +47,12 @@ struct ClientStateSyncState {
     phase: ClientStateSyncPhase,
     buffered_events: VecDeque<CommunicationValue>,
     overflowed: bool,
+}
+
+enum AckCommitStart {
+    Started,
+    Invalid,
+    Overflowed,
 }
 
 fn next_policy_request_id() -> u32 {
@@ -66,6 +78,29 @@ fn call_error_type(error: &CallServiceError) -> CommunicationType {
     }
 }
 
+fn merge_initial_presence_snapshot(
+    response: CommunicationValue,
+    snapshot: CommunicationValue,
+) -> CommunicationValue {
+    let user_states = snapshot
+        .get_data(DataType::UserStates)
+        .cloned()
+        .unwrap_or(DataValue::Array(Vec::new()));
+    let missing_user_ids = snapshot
+        .get_data(DataType::MissingUserIds)
+        .cloned()
+        .unwrap_or(DataValue::Array(Vec::new()));
+    let complete = matches!(&missing_user_ids, DataValue::Array(ids) if ids.is_empty());
+
+    response
+        .add_typed_default(DataType::UserStates, user_states)
+        .add_typed_default(DataType::MissingUserIds, missing_user_ids)
+        .add_typed_default(
+            DataType::PresenceSnapshotComplete,
+            DataValue::Bool(complete),
+        )
+}
+
 pub struct ClientConnection {
     pub state: Arc<AppState>,
     pub user_id: u64,
@@ -82,6 +117,76 @@ pub struct ClientConnection {
 }
 
 impl ClientConnection {
+    /// Produces the one client-facing initial state response.  The Iota
+    /// response is an internal input: presence is subscribed and fetched
+    /// before this value is sent to the client.
+    async fn compose_initial_client_state(
+        &self,
+        iota: Arc<crate::rho::iota_connection::IotaConnection>,
+        response: CommunicationValue,
+    ) -> Result<CommunicationValue, InitialPresenceError> {
+        let response = iota.augment_client_state_sync(response).await;
+        let Some((response_user_id, response_session_id, contacts)) =
+            crate::rho::iota_connection::contact_snapshot(&response)
+        else {
+            return Err(InitialPresenceError::InvalidSnapshot(
+                "ClientStateSync is missing a valid contact snapshot".into(),
+            ));
+        };
+        if response_user_id != self.user_id as i64 || response_session_id != self.session_id as i64
+        {
+            return Err(InitialPresenceError::InvalidSnapshot(
+                "ClientStateSync does not belong to the authenticated session".into(),
+            ));
+        }
+
+        match self
+            .state
+            .omega
+            .initial_presence_snapshot(
+                self.user_id as i64,
+                self.session_id as i64,
+                contacts.clone(),
+            )
+            .await
+        {
+            Ok(snapshot) => Ok(merge_initial_presence_snapshot(response, snapshot)),
+            Err(error) => {
+                self.state
+                    .omega
+                    .abort_initial_presence_sync(self.user_id as i64, self.session_id as i64);
+                if matches!(
+                    error,
+                    InitialPresenceError::OrderingLost
+                        | InitialPresenceError::AlreadyInProgress
+                        | InitialPresenceError::InvalidSnapshot(_)
+                        | InitialPresenceError::SubscriptionRejected(_)
+                ) {
+                    Err(error)
+                } else {
+                    // Omega can be unavailable without withholding the Iota
+                    // state.  The response explicitly describes that its
+                    // presence section is incomplete.
+                    Ok(response
+                        .add_typed_default(DataType::UserStates, DataValue::Array(Vec::new()))
+                        .add_typed_default(
+                            DataType::MissingUserIds,
+                            DataValue::Array(
+                                contacts
+                                    .into_iter()
+                                    .map(|id| DataValue::SignedNumber(id.into()))
+                                    .collect(),
+                            ),
+                        )
+                        .add_typed_default(
+                            DataType::PresenceSnapshotComplete,
+                            DataValue::Bool(false),
+                        ))
+                }
+            }
+        }
+    }
+
     pub async fn from_general(general: Arc<GeneralConnection>, user_id: u64) -> Arc<Self> {
         Arc::new(Self {
             state: general.state.clone(),
@@ -151,9 +256,12 @@ impl ClientConnection {
         let _ = self.sender.send(&cv).await;
     }
 
-    /// Routes unsolicited state changes behind the ClientStateAck barrier.
+    /// Routes all post-initial-state messages behind the ClientStateAck barrier.
     /// The state response itself deliberately uses `send_message` directly.
-    pub async fn send_or_buffer_live(self: Arc<Self>, value: CommunicationValue) -> Result<(), ()> {
+    pub async fn send_or_buffer_post_initial_state(
+        self: Arc<Self>,
+        value: CommunicationValue,
+    ) -> Result<(), ()> {
         let mut state = self.client_state_sync.lock().await;
         if matches!(state.phase, ClientStateSyncPhase::Idle) {
             drop(state);
@@ -172,6 +280,20 @@ impl ClientConnection {
     async fn reset_client_state_sync(&self) {
         let mut state = self.client_state_sync.lock().await;
         *state = ClientStateSyncState::default();
+    }
+
+    /// Rolls back an ACK attempt that did not receive a successful response
+    /// from Iota. Iota cannot have committed the acknowledgement in these
+    /// paths, so the client may safely retry it.
+    async fn restore_client_state_ack(&self) {
+        let mut state = self.client_state_sync.lock().await;
+        let ClientStateSyncPhase::Committing { device_id, version } = &state.phase else {
+            return;
+        };
+        state.phase = ClientStateSyncPhase::AwaitingAck {
+            device_id: device_id.clone(),
+            version: *version,
+        };
     }
 
     async fn drain_buffered_live_events(self: Arc<Self>) {
@@ -465,6 +587,7 @@ impl ClientConnection {
                 {
                     Ok(response)
                         if response.is_type(CommunicationType::ClientStateSync)
+                            && response.receiver() == Some(self.user_id)
                             && response.get_data(DataType::SessionId).as_number()
                                 == Some(self.session_id as i128) =>
                     {
@@ -481,94 +604,23 @@ impl ClientConnection {
                             .await;
                             return;
                         };
-                        let response = rho
-                            .get_iota_connection()
-                            .augment_client_state_sync(response)
-                            .await;
-                        let response = if let Some((_, _, contacts)) =
-                            crate::rho::iota_connection::contact_snapshot(&response)
+                        let response = match self
+                            .compose_initial_client_state(
+                                rho.get_iota_connection().clone(),
+                                response,
+                            )
+                            .await
                         {
-                            match self
-                                .state
-                                .omega
-                                .initial_presence_snapshot(
-                                    self.user_id as i64,
-                                    self.session_id as i64,
-                                    contacts,
+                            Ok(response) => response,
+                            Err(_) => {
+                                self.reset_client_state_sync().await;
+                                self.send_error_response(
+                                    message_id,
+                                    CommunicationType::ErrorInternal,
                                 )
-                                .await
-                            {
-                                Ok(snapshot) => response
-                                    .add_typed_default(
-                                        DataType::UserStates,
-                                        snapshot
-                                            .get_data(DataType::UserStates)
-                                            .cloned()
-                                            .unwrap_or(DataValue::Array(Vec::new())),
-                                    )
-                                    .add_typed_default(
-                                        DataType::MissingUserIds,
-                                        snapshot
-                                            .get_data(DataType::MissingUserIds)
-                                            .cloned()
-                                            .unwrap_or(DataValue::Array(Vec::new())),
-                                    )
-                                    .add_typed_default(
-                                        DataType::PresenceSnapshotComplete,
-                                        DataValue::Bool(true),
-                                    ),
-                                Err(error) => {
-                                    // An incomplete presence response has no ACK-backed
-                                    // ordering window, so its local presence barrier must
-                                    // not retain later events.
-                                    self.state.omega.abort_initial_presence_sync(
-                                        self.user_id as i64,
-                                        self.session_id as i64,
-                                    );
-                                    if matches!(
-                                        error,
-                                        InitialPresenceError::OrderingLost
-                                            | InitialPresenceError::AlreadyInProgress
-                                            | InitialPresenceError::InvalidSnapshot(_)
-                                            | InitialPresenceError::SubscriptionRejected(_)
-                                    ) {
-                                        self.reset_client_state_sync().await;
-                                        self.send_error_response(
-                                            message_id,
-                                            CommunicationType::ErrorInternal,
-                                        )
-                                        .await;
-                                        return;
-                                    }
-                                    response
-                                        .add_typed_default(
-                                            DataType::UserStates,
-                                            DataValue::Array(Vec::new()),
-                                        )
-                                        .add_typed_default(
-                                            DataType::MissingUserIds,
-                                            DataValue::Array(Vec::new()),
-                                        )
-                                        .add_typed_default(
-                                            DataType::PresenceSnapshotComplete,
-                                            DataValue::Bool(false),
-                                        )
-                                }
+                                .await;
+                                return;
                             }
-                        } else {
-                            response
-                                .add_typed_default(
-                                    DataType::UserStates,
-                                    DataValue::Array(Vec::new()),
-                                )
-                                .add_typed_default(
-                                    DataType::MissingUserIds,
-                                    DataValue::Array(Vec::new()),
-                                )
-                                .add_typed_default(
-                                    DataType::PresenceSnapshotComplete,
-                                    DataValue::Bool(true),
-                                )
                         };
                         self.client_state_sync.lock().await.phase =
                             ClientStateSyncPhase::AwaitingAck { device_id, version };
@@ -594,22 +646,47 @@ impl ClientConnection {
                     .get_data(DataType::VersionNumber)
                     .as_number()
                     .and_then(|value| i64::try_from(value).ok());
-                let ack_matches = {
-                    let state = self.client_state_sync.lock().await;
+                let begin_commit = {
+                    let mut state = self.client_state_sync.lock().await;
                     match &state.phase {
                         ClientStateSyncPhase::AwaitingAck { device_id, version } => {
-                            ack_device_id == Some(device_id.as_str())
-                                && ack_version == Some(*version)
+                            if ack_device_id != Some(device_id.as_str())
+                                || ack_version != Some(*version)
+                            {
+                                AckCommitStart::Invalid
+                            } else if state.overflowed {
+                                AckCommitStart::Overflowed
+                            } else {
+                                state.phase = ClientStateSyncPhase::Committing {
+                                    device_id: device_id.clone(),
+                                    version: *version,
+                                };
+                                AckCommitStart::Started
+                            }
                         }
-                        _ => false,
+                        _ => AckCommitStart::Invalid,
                     }
                 };
-                if !ack_matches {
-                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
-                        .await;
-                    return;
+                match begin_commit {
+                    AckCommitStart::Started => {}
+                    AckCommitStart::Invalid => {
+                        self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                            .await;
+                        return;
+                    }
+                    AckCommitStart::Overflowed => {
+                        self.state.omega.abort_initial_presence_sync(
+                            self.user_id as i64,
+                            self.session_id as i64,
+                        );
+                        self.reset_client_state_sync().await;
+                        self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                            .await;
+                        return;
+                    }
                 }
                 let Some(rho) = self.get_rho_connection().await else {
+                    self.restore_client_state_ack().await;
                     self.send_error_response(message_id, CommunicationType::ErrorNoIota)
                         .await;
                     return;
@@ -620,6 +697,28 @@ impl ClientConnection {
                     DataType::SessionId,
                     DataValue::UnsignedNumber(self.session_id.into()),
                 );
+                if self.client_state_sync.lock().await.overflowed {
+                    self.state
+                        .omega
+                        .abort_initial_presence_sync(self.user_id as i64, self.session_id as i64);
+                    self.reset_client_state_sync().await;
+                    self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                        .await;
+                    return;
+                }
+                if self
+                    .state
+                    .omega
+                    .finish_initial_presence_sync(self.user_id as i64, self.session_id as i64)
+                    .await
+                    .is_err()
+                    || self.client_state_sync.lock().await.overflowed
+                {
+                    self.reset_client_state_sync().await;
+                    self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                        .await;
+                    return;
+                }
                 match rho
                     .get_iota_connection()
                     .clone()
@@ -628,38 +727,12 @@ impl ClientConnection {
                 {
                     Ok(response) => {
                         if response.is_type(CommunicationType::Success) {
-                            let overflowed = {
-                                let state = self.client_state_sync.lock().await;
-                                state.overflowed
-                            };
-                            if overflowed {
-                                self.state.omega.abort_initial_presence_sync(
-                                    self.user_id as i64,
-                                    self.session_id as i64,
-                                );
-                                self.reset_client_state_sync().await;
-                                self.send_error_response(
-                                    message_id,
-                                    CommunicationType::ErrorInternal,
-                                )
-                                .await;
-                                return;
-                            }
-                            if let Err(_) = self
-                                .state
-                                .omega
-                                .finish_initial_presence_sync(
-                                    self.user_id as i64,
-                                    self.session_id as i64,
-                                )
-                                .await
-                            {
-                                self.reset_client_state_sync().await;
-                                self.send_error_response(
-                                    message_id,
-                                    CommunicationType::ErrorInternal,
-                                )
-                                .await;
+                            if self.client_state_sync.lock().await.overflowed {
+                                // Iota has committed its ACK, so a retry on
+                                // this transport could incorrectly resume
+                                // delivery. Reconnect to establish a fresh
+                                // synchronization transaction.
+                                self.close().await;
                                 return;
                             }
                             self.client_state_sync.lock().await.phase =
@@ -667,10 +740,12 @@ impl ClientConnection {
                             self.clone().send_message(&response).await;
                             self.clone().drain_buffered_live_events().await;
                         } else {
+                            self.restore_client_state_ack().await;
                             self.send_message(&response).await;
                         }
                     }
                     Err(_) => {
+                        self.restore_client_state_ack().await;
                         self.send_error_response(message_id, CommunicationType::ErrorInternal)
                             .await;
                     }
@@ -1428,7 +1503,7 @@ impl ClientConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::authenticated_peer_control_request;
+    use super::{authenticated_peer_control_request, merge_initial_presence_snapshot};
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 
     #[test]
@@ -1445,6 +1520,39 @@ mod tests {
                 .get_data(DataType::UserId)
                 .and_then(|value| value.as_number()),
             Some(99)
+        );
+    }
+
+    #[test]
+    fn initial_state_composition_preserves_iota_state_and_marks_missing_presence_incomplete() {
+        let iota_state = CommunicationValue::new(CommunicationType::ClientStateSync)
+            .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(12));
+        let presence = CommunicationValue::new(CommunicationType::GetStates)
+            .add_typed_default(
+                DataType::UserStates,
+                DataValue::Array(vec![DataValue::Str("online".into())]),
+            )
+            .add_typed_default(
+                DataType::MissingUserIds,
+                DataValue::Array(vec![DataValue::SignedNumber(44)]),
+            );
+
+        let result = merge_initial_presence_snapshot(iota_state, presence);
+
+        assert!(result.is_type(CommunicationType::ClientStateSync));
+        assert_eq!(
+            result
+                .get_data(DataType::VersionNumber)
+                .and_then(DataValue::as_number),
+            Some(12)
+        );
+        assert!(matches!(
+            result.get_data(DataType::UserStates),
+            Some(DataValue::Array(states)) if states.len() == 1
+        ));
+        assert_eq!(
+            result.get_data(DataType::PresenceSnapshotComplete),
+            Some(&DataValue::Bool(false))
         );
     }
 }

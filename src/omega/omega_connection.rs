@@ -1347,7 +1347,9 @@ impl OmegaConnection {
         event: &CommunicationValue,
     ) {
         if let Some(client) = self.rho.get_client_connection(user_id, session_id).await {
-            let _ = client.send_or_buffer_live(event.clone()).await;
+            let _ = client
+                .send_or_buffer_post_initial_state(event.clone())
+                .await;
         }
     }
 
@@ -1605,7 +1607,10 @@ impl OmegaConnection {
         if self.is_current_presence_generation((user_id, session_id), generation)
             && let Some(client) = self.rho.get_client_connection(user_id, session_id).await
         {
-            client.send_message(&response).await;
+            client
+                .send_or_buffer_post_initial_state(response)
+                .await
+                .map_err(|_| InitialPresenceError::OrderingLost)?;
             log_out!(
                 user_id,
                 PrintType::Client,

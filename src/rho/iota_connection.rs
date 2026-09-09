@@ -385,34 +385,20 @@ impl IotaConnection {
             }
         }
 
-        let cv = if cv.is_type(CommunicationType::ClientStateSync) {
-            self.augment_client_state_sync(cv).await
-        } else {
-            cv
-        };
-
         if cv.is_type(CommunicationType::ClientStateSync) {
-            let presence_snapshot = contact_snapshot(&cv);
             let user_id = cv.receiver();
             let session_id = cv.get_data(DataType::SessionId).as_number();
             log_in!(
                 self.iota_id as i64,
                 PrintType::Iota,
-                "ClientStateSync user={:?} session={:?} stage=received_from_iota",
+                "ClientStateSync user={:?} session={:?} stage=ignored_unsolicited",
                 user_id,
                 session_id
             );
-            self.forward_to_client(cv).await;
-            log_out!(
-                self.iota_id as i64,
-                PrintType::Client,
-                "ClientStateSync user={:?} session={:?} stage=forwarded_to_client",
-                user_id,
-                session_id
-            );
-            if let Some((user_id, session_id, contact_ids)) = presence_snapshot {
-                self.update_presence_subscription(user_id, session_id, contact_ids);
-            }
+            // Request-correlated state responses are consumed above by
+            // `await_response`.  An unsolicited ClientStateSync cannot form
+            // an initial snapshot because it has not crossed the Omega
+            // presence barrier, so ClientConnection owns that transaction.
             return;
         }
 

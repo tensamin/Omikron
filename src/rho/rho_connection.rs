@@ -298,7 +298,10 @@ impl RhoConnection {
                 continue;
             }
             if must_follow_initial_state(&cv) {
-                let _ = connection.clone().send_or_buffer_live(cv.clone()).await;
+                let _ = connection
+                    .clone()
+                    .send_or_buffer_post_initial_state(cv.clone())
+                    .await;
             } else {
                 connection.clone().send_message(&cv).await;
             }
