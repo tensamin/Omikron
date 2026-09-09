@@ -17,6 +17,7 @@ use once_cell::sync::Lazy;
 pub static WORKING_DIR: Lazy<PathBuf> =
     Lazy::new(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 use rustls::crypto::aws_lc_rs::default_provider;
+use tokio::sync::watch;
 
 use mtp::crypto::Keyring;
 
@@ -93,13 +94,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     livekit.clone().garbage_collect_calls(call_manager.clone());
     let state = AppState::new(config.clone(), keyring, omega, rho, call_manager, livekit);
+    let (shutdown, _) = watch::channel(false);
+    let server = start(state, shutdown.subscribe());
+    tokio::pin!(server);
     tokio::select! {
-        result = start(state) => {
+        result = &mut server => {
             result.map_err(|error| format!("Rho listener terminated: {error}"))?;
             return Err("Rho listener stopped unexpectedly".into());
         }
         result = tokio::signal::ctrl_c() => {
             result.map_err(|error| format!("Unable to wait for shutdown signal: {error}"))?;
+            let _ = shutdown.send(true);
+            server
+                .await
+                .map_err(|error| format!("Rho listener shutdown failed: {error}"))?;
         }
     }
     Ok(())

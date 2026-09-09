@@ -16,6 +16,7 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::crypto::PublicKeyBundle;
 use mtp::host::{AuthenticationPolicy, HostConfig, Policy, SendMode};
 use mtp::webserver::{HttpResponse, MTPWebServer, WebServerConfig};
+use tokio::sync::watch;
 
 fn with_cors(response: HttpResponse) -> HttpResponse {
     response
@@ -175,7 +176,10 @@ pub async fn complete_register(
     }
 }
 
-pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cert_pem = load_file_vec("certs", "cert.pem")
         .map_err(|error| format!("load certs/cert.pem: {error}"))?;
 
@@ -219,7 +223,11 @@ pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
     );
 
     loop {
-        let conn = match host.accept().await {
+        let accepted = tokio::select! {
+            _ = shutdown.wait_for(|shutting_down| *shutting_down) => break,
+            accepted = host.accept() => accepted,
+        };
+        let conn = match accepted {
             Ok(Some(conn)) => {
                 println!("Accepted connection");
                 conn
@@ -313,6 +321,7 @@ pub async fn start(state: Arc<AppState>) -> Result<(), Box<dyn std::error::Error
             conn.handle().await;
         });
     }
+    host.shutdown().await;
     log!(0, PrintType::General, "Server stopped");
 
     Ok(())
