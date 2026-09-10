@@ -804,6 +804,31 @@ impl OmegaConnection {
                                 }
                                 continue;
                             }
+                            if cv.is_type(CommunicationType::ProvisionIotaUser) {
+                                let Some(iota_id) = cv
+                                    .get_data(DataType::IotaId)
+                                    .as_signed_number()
+                                    .and_then(|id| i64::try_from(id).ok())
+                                    .filter(|id| *id > 0)
+                                else {
+                                    log_err!(
+                                        0,
+                                        PrintType::Omega,
+                                        "Discarded user provisioning without a valid IotaId"
+                                    );
+                                    continue;
+                                };
+                                if let Some(rho) = self.rho.get_by_iota(iota_id).await {
+                                    rho.get_iota_connection().send_message(&cv).await;
+                                } else {
+                                    log_err!(
+                                        iota_id,
+                                        PrintType::Omega,
+                                        "User provisioning is pending because the Iota is offline"
+                                    );
+                                }
+                                continue;
+                            }
                             if cv.is_type(CommunicationType::ClientChanged) {
                                 let Some((receiver, session_id)) = client_changed_target(&cv)
                                 else {

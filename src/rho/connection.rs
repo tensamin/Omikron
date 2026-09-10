@@ -9,7 +9,8 @@ use crate::{
     log_err, log_in, log_out,
     rho::{
         app_connection::AppConnection, client_connection::ClientConnection,
-        iota_connection::IotaConnection, rho_connection::RhoConnection,
+        iota_connection::IotaConnection, registration_connection::RegistrationConnection,
+        rho_connection::RhoConnection,
     },
     util::logger::PrintType,
 };
@@ -132,6 +133,7 @@ pub enum ConnectionKind {
     Client,
     Iota,
     AnonymousClient,
+    RegisteringClient,
     Phi,
 }
 
@@ -165,18 +167,24 @@ impl GeneralConnection {
             (Some("iota"), AuthState::Authenticated) => ConnectionKind::Iota,
             (Some("client"), AuthState::Authenticated) => ConnectionKind::Client,
             (Some("anonymous"), _) => ConnectionKind::AnonymousClient,
+            (Some("registering-client"), _) => ConnectionKind::RegisteringClient,
             _ => return None,
         };
 
+        let id = if kind == ConnectionKind::RegisteringClient {
+            (rand::random::<u64>() & ((1_u64 << 48) - 1)).max(1)
+        } else {
+            conn.client_id
+        };
         Some(Arc::new(Self {
             state,
             sender: Arc::new(conn.sender),
             receiver: Arc::new(conn.receiver),
             connection_kind: kind,
-            id: conn.client_id,
+            id,
             rho_connection: Arc::new(RwLock::new(None)),
             session_id: Arc::new(RwLock::new(match kind {
-                ConnectionKind::Client => {
+                ConnectionKind::Client | ConnectionKind::RegisteringClient => {
                     ((Uuid::new_v4().as_u128() as u64) & ((1_u64 << 53) - 1)).max(1)
                 }
                 _ => conn.client_id,
@@ -218,6 +226,12 @@ impl GeneralConnection {
             }
             ConnectionKind::AnonymousClient => {
                 self.migrate_anonymous_client().await;
+                true
+            }
+            ConnectionKind::RegisteringClient => {
+                RegistrationConnection::from_general(self.clone())
+                    .start()
+                    .await;
                 true
             }
             ConnectionKind::Phi => {
@@ -400,6 +414,30 @@ impl GeneralConnection {
     async fn migrate_anonymous_client(self: &Arc<Self>) {
         let client = AnonymousClientConnection::from_general(self.clone(), self.id).await;
         client.start();
+    }
+
+    pub async fn attach_registered_client(
+        self: Arc<Self>,
+        user_id: u64,
+    ) -> Option<Arc<ClientConnection>> {
+        let client = ClientConnection::from_general(self.clone(), user_id).await;
+        let rho = self.find_user_rho(user_id as i64).await;
+        *self.rho_connection.write().await = rho.clone();
+        let Some(rho) = rho else {
+            return None;
+        };
+        rho.bind_user_id(user_id as i64).await;
+        rho.add_client_connection(client.clone()).await;
+        let iota_id = rho.get_iota_id().await as i64;
+        if let Err(error) = self.notify_user_connected(user_id as i64, iota_id).await {
+            log_err!(
+                user_id as i64,
+                PrintType::Client,
+                "Registered client activation notification failed: {}",
+                error
+            );
+        }
+        Some(client)
     }
 
     async fn migrate_phi(self: &Arc<Self>) {

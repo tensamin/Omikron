@@ -267,7 +267,10 @@ pub async fn start(
                 return;
             };
 
-            let anonymous_permit = if conn.connection_kind() == ConnectionKind::AnonymousClient {
+            let anonymous_permit = if matches!(
+                conn.connection_kind(),
+                ConnectionKind::AnonymousClient | ConnectionKind::RegisteringClient
+            ) {
                 match state
                     .rho_connection_limits
                     .anonymous
@@ -288,7 +291,10 @@ pub async fn start(
                 None
             };
 
-            let anonymous_ip_permit = if conn.connection_kind() == ConnectionKind::AnonymousClient {
+            let anonymous_ip_permit = if matches!(
+                conn.connection_kind(),
+                ConnectionKind::AnonymousClient | ConnectionKind::RegisteringClient
+            ) {
                 let Some(peer_ip) = peer_ip else {
                     log_err!(
                         0,

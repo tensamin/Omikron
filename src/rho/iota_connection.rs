@@ -63,6 +63,27 @@ pub(crate) fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, 
     Some((user_id, 0, contact_ids))
 }
 
+fn is_iota_omega_management_operation(value: &CommunicationValue) -> bool {
+    matches!(
+        value.get_comm_type_enum(),
+        Some(
+            CommunicationType::GetUserData
+                | CommunicationType::GetIotaData
+                | CommunicationType::DeleteIota
+                | CommunicationType::AttachUserBegin
+                | CommunicationType::AttachUserComplete
+                | CommunicationType::ReleaseUserFromIota
+                | CommunicationType::DeleteUserCredentialBegin
+                | CommunicationType::DeleteUserCredentialComplete
+                | CommunicationType::EraseHostedUserDataAck
+                | CommunicationType::AcknowledgeIotaUserProvision
+                | CommunicationType::CreateUserInvitation
+                | CommunicationType::ListUserInvitations
+                | CommunicationType::RevokeUserInvitation
+        )
+    )
+}
+
 #[allow(dead_code)]
 pub struct IotaConnection {
     pub state: Arc<AppState>,
@@ -551,17 +572,7 @@ impl IotaConnection {
             return;
         }
 
-        if cv.is_type(CommunicationType::GetUserData)
-            || cv.is_type(CommunicationType::GetIotaData)
-            || cv.is_type(CommunicationType::DeleteIota)
-            || cv.is_type(CommunicationType::AttachUserBegin)
-            || cv.is_type(CommunicationType::AttachUserComplete)
-            || cv.is_type(CommunicationType::ReleaseUserFromIota)
-            || cv.is_type(CommunicationType::DeleteUserCredentialBegin)
-            || cv.is_type(CommunicationType::DeleteUserCredentialComplete)
-            || cv.is_type(CommunicationType::EraseHostedUserDataAck)
-            || cv.is_type(CommunicationType::AcknowledgeIotaUserProvision)
-        {
+        if is_iota_omega_management_operation(&cv) {
             let sender = self.get_iota_id().await;
 
             self.handle_omega_forward(cv.with_sender(sender as u64))
@@ -981,7 +992,7 @@ impl std::fmt::Debug for IotaConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::contact_snapshot;
+    use super::{contact_snapshot, is_iota_omega_management_operation};
     use crate::util::data_type_id;
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 
@@ -1002,14 +1013,14 @@ mod tests {
         ])))
         .unwrap();
 
-        assert_eq!(parsed, (7, 11, vec![20, 21]));
+        assert_eq!(parsed, (7, 0, vec![20, 21]));
     }
 
     #[test]
     fn contact_snapshot_accepts_empty_contact_sets() {
         assert_eq!(
             contact_snapshot(&snapshot(DataValue::Array(Vec::new()))),
-            Some((7, 11, Vec::new()))
+            Some((7, 0, Vec::new()))
         );
     }
 
@@ -1021,5 +1032,18 @@ mod tests {
             )]))),
             None
         );
+    }
+
+    #[test]
+    fn authenticated_iota_forwards_all_invitation_management_operations() {
+        for operation in [
+            CommunicationType::CreateUserInvitation,
+            CommunicationType::ListUserInvitations,
+            CommunicationType::RevokeUserInvitation,
+        ] {
+            assert!(is_iota_omega_management_operation(
+                &CommunicationValue::new(operation)
+            ));
+        }
     }
 }

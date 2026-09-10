@@ -65,6 +65,19 @@ fn authenticated_peer_control_request(cv: &CommunicationValue, user_id: u64) -> 
     cv.clone().with_sender(user_id)
 }
 
+fn is_client_omega_operation(value: &CommunicationValue) -> bool {
+    matches!(
+        value.get_comm_type_enum(),
+        Some(
+            CommunicationType::ChangeUserData
+                | CommunicationType::GetNotifications
+                | CommunicationType::GetUserData
+                | CommunicationType::GetIotaData
+                | CommunicationType::DeleteUser
+        )
+    )
+}
+
 fn call_error_type(error: &CallServiceError) -> CommunicationType {
     match error {
         CallServiceError::NotFound => CommunicationType::ErrorNotFound,
@@ -541,7 +554,9 @@ impl ClientConnection {
                 let can_request = {
                     let mut state = self.client_state_sync.lock().await;
                     if matches!(state.phase, ClientStateSyncPhase::Idle) {
-                        state.phase = ClientStateSyncPhase::Requesting { device_id: String::new() };
+                        state.phase = ClientStateSyncPhase::Requesting {
+                            device_id: String::new(),
+                        };
                         state.buffered_events.clear();
                         state.overflowed = false;
                         true
@@ -595,7 +610,10 @@ impl ClientConnection {
                             }
                         };
                         self.client_state_sync.lock().await.phase =
-                            ClientStateSyncPhase::AwaitingAck { device_id: String::new(), version: 0 };
+                            ClientStateSyncPhase::AwaitingAck {
+                                device_id: String::new(),
+                                version: 0,
+                            };
                         self.clone().send_message(&response).await;
                     }
                     Ok(_) => {
@@ -716,12 +734,7 @@ impl ClientConnection {
                 return;
             }
 
-            if cv.is_type(CommunicationType::ChangeUserData)
-                || cv.is_type(CommunicationType::GetNotifications)
-                || cv.is_type(CommunicationType::GetUserData)
-                || cv.is_type(CommunicationType::GetIotaData)
-                || cv.is_type(CommunicationType::DeleteUser)
-            {
+            if is_client_omega_operation(&cv) {
                 if cv.is_type(CommunicationType::ChangeUserData)
                     && cv.get_data(DataType::OnlineStatus).is_some()
                 {
@@ -1466,7 +1479,10 @@ impl ClientConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{authenticated_peer_control_request, merge_initial_presence_snapshot};
+    use super::{
+        authenticated_peer_control_request, is_client_omega_operation,
+        merge_initial_presence_snapshot,
+    };
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 
     #[test]
@@ -1487,8 +1503,21 @@ mod tests {
     }
 
     #[test]
+    fn normal_clients_cannot_manage_invitations() {
+        for operation in [
+            CommunicationType::CreateUserInvitation,
+            CommunicationType::ListUserInvitations,
+            CommunicationType::RevokeUserInvitation,
+        ] {
+            assert!(!is_client_omega_operation(&CommunicationValue::new(
+                operation
+            )));
+        }
+    }
+
+    #[test]
     fn initial_state_composition_preserves_iota_state_and_marks_missing_presence_incomplete() {
-        let iota_state = CommunicationValue::new(CommunicationType::ClientStateSync)
+        let iota_state = CommunicationValue::new(CommunicationType::AccountStateSnapshot)
             .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(12));
         let presence = CommunicationValue::new(CommunicationType::GetStates)
             .add_typed_default(
@@ -1502,7 +1531,7 @@ mod tests {
 
         let result = merge_initial_presence_snapshot(iota_state, presence);
 
-        assert!(result.is_type(CommunicationType::ClientStateSync));
+        assert!(result.is_type(CommunicationType::AccountStateSnapshot));
         assert_eq!(
             result
                 .get_data(DataType::VersionNumber)
