@@ -1110,15 +1110,21 @@ impl ClientConnection {
             }
         };
 
+        let creator_value = cv.get_data(DataType::CallSecret);
+        let creator =
+            creator_value.and_then(crate::calls::call_group::CallSecretEnvelope::from_data_value);
+        log::debug!(
+            "CallToken call_id={call_id} user_id={user_id} owner_omikron_id={} exists_locally={} creator_secret_present={} creator_secret_parsed={}",
+            self.state.call_manager.owner_omikron_id,
+            self.state.call_manager.get_call(call_id).await.is_some(),
+            creator_value.is_some(),
+            creator.is_some(),
+        );
+
         match self
             .state
             .call_manager
-            .get_or_create_token(
-                user_id,
-                call_id,
-                cv.get_data(DataType::CallSecret)
-                    .and_then(crate::calls::call_group::CallSecretEnvelope::from_data_value),
-            )
+            .get_or_create_token(user_id, call_id, creator)
             .await
         {
             Ok(token) => {

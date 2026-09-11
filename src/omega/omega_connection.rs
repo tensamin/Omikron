@@ -82,13 +82,21 @@ fn client_changed_target(value: &CommunicationValue) -> Option<(i64, i64)> {
     Some((receiver, session_id))
 }
 
+fn signed_positive_iota_id(value: &CommunicationValue) -> Option<i64> {
+    value
+        .get_data(DataType::IotaId)
+        .as_signed_number()
+        .and_then(|id| i64::try_from(id).ok())
+        .filter(|id| *id > 0)
+}
+
 fn iota_user_snapshot(value: &CommunicationValue) -> Option<(i64, Vec<i64>)> {
     if !value.is_type(CommunicationType::IotaUserData) {
         return None;
     }
     let iota_id = value
         .get_data(DataType::IotaId)
-        .as_number()
+        .as_signed_number()
         .and_then(|id| i64::try_from(id).ok())
         .filter(|id| *id > 0)?;
     let Some(DataValue::Array(values)) = value.get_data(DataType::UserIds) else {
@@ -789,10 +797,7 @@ impl OmegaConnection {
                             }
 
                             if cv.is_type(CommunicationType::EraseHostedUserData) {
-                                let Some(iota_id) = cv
-                                    .get_data(DataType::IotaId)
-                                    .as_number()
-                                    .and_then(|id| i64::try_from(id).ok())
+                                let Some(iota_id) = signed_positive_iota_id(&cv)
                                 else {
                                     log_err!(0, PrintType::Omega, "Discarded hosted-data erasure without IotaId");
                                     continue;
@@ -805,11 +810,7 @@ impl OmegaConnection {
                                 continue;
                             }
                             if cv.is_type(CommunicationType::ProvisionIotaUser) {
-                                let Some(iota_id) = cv
-                                    .get_data(DataType::IotaId)
-                                    .as_signed_number()
-                                    .and_then(|id| i64::try_from(id).ok())
-                                    .filter(|id| *id > 0)
+                                let Some(iota_id) = signed_positive_iota_id(&cv)
                                 else {
                                     log_err!(
                                         0,
@@ -1659,7 +1660,7 @@ mod tests {
     use super::{
         ConnectionOutcome, MAX_RECONNECT_DELAY, PeerCapabilities, RECONNECT_DELAY,
         client_changed_target, iota_user_snapshot, parse_omega_capability_response,
-        reconnect_base_after_outcome, reconnect_delay_with_jitter,
+        reconnect_base_after_outcome, reconnect_delay_with_jitter, signed_positive_iota_id,
     };
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 
@@ -1722,6 +1723,17 @@ mod tests {
                 DataValue::Array(vec![DataValue::Str("not-a-user".into())]),
             );
         assert_eq!(iota_user_snapshot(&malformed_user), None);
+    }
+
+    #[test]
+    fn erasure_route_reads_omega_signed_iota_id() {
+        let frame = CommunicationValue::new(CommunicationType::EraseHostedUserData)
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(8));
+        assert_eq!(signed_positive_iota_id(&frame), Some(8));
+
+        let unsigned = CommunicationValue::new(CommunicationType::EraseHostedUserData)
+            .add_typed_default(DataType::IotaId, DataValue::UnsignedNumber(8));
+        assert_eq!(signed_positive_iota_id(&unsigned), None);
     }
 
     #[test]

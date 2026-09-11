@@ -773,6 +773,10 @@ impl IotaConnection {
                     DataValue::Str(call.call_id.to_string()),
                 );
                 base_call_map.insert(
+                    data_type_id(DataType::OmikronId, &tm),
+                    DataValue::SignedNumber((call.owner_omikron_id as i64).into()),
+                );
+                base_call_map.insert(
                     data_type_id(DataType::CallMembers, &tm),
                     DataValue::Array(member_ids),
                 );

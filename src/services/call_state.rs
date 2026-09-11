@@ -35,6 +35,10 @@ impl CallStateAggregator {
                 DataValue::Str(call.call_id.to_string()),
             );
             call_map.insert(
+                data_type_id(DataType::OmikronId, &tm),
+                DataValue::SignedNumber((call.owner_omikron_id as i64).into()),
+            );
+            call_map.insert(
                 data_type_id(DataType::CallMembers, &tm),
                 DataValue::Array(
                     state
@@ -121,7 +125,7 @@ mod tests {
         let manager = Arc::new(CallManager::default());
         let group = Arc::new(CallGroup::new_with_service(
             call_id,
-            0,
+            42,
             1,
             CallSecretEnvelope {
                 secret_id: "s".into(),
@@ -152,6 +156,7 @@ mod tests {
         let tm = TypeMap::latest();
         let user_id_type = data_type_id(DataType::UserId, &tm);
         let calls_type = data_type_id(DataType::Calls, &tm);
+        let omikron_id_type = data_type_id(DataType::OmikronId, &tm);
         let mut contact = BTreeMap::new();
         contact.insert(user_id_type, DataValue::SignedNumber(2.into()));
 
@@ -160,6 +165,13 @@ mod tests {
             .await;
 
         assert_eq!(global_calls.len(), 1);
+        let Some(call) = global_calls[0].as_map() else {
+            panic!("expected call map");
+        };
+        assert!(matches!(
+            call.get(&omikron_id_type),
+            Some(DataValue::SignedNumber(id)) if *id == 42
+        ));
         let Some(contact) = contacts[0].as_map() else {
             panic!("expected contact map");
         };

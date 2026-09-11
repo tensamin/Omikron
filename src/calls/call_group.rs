@@ -58,7 +58,7 @@ impl CallSecretEnvelope {
                 .to_string(),
             version_number: v
                 .get_field(data_type_id(DataType::VersionNumber, &t))?
-                .as_signed_number()
+                .as_number()
                 .and_then(|n| i64::try_from(n).ok())?,
             encrypted_secret: v
                 .get_field(data_type_id(DataType::EncryptedSecret, &t))?
@@ -277,5 +277,40 @@ impl CallGroup {
     }
     pub async fn mark_ending(&self) {
         self.state.write().await.ending = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_creator_secret_with_unsigned_version_number() {
+        let type_map = TypeMap::latest();
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            data_type_id(DataType::SecretId, &type_map),
+            DataValue::Str("call:test:main".into()),
+        );
+        fields.insert(
+            data_type_id(DataType::VersionNumber, &type_map),
+            DataValue::UnsignedNumber(1),
+        );
+        fields.insert(
+            data_type_id(DataType::EncryptedSecret, &type_map),
+            DataValue::Bytes(vec![1]),
+        );
+        fields.insert(
+            data_type_id(DataType::KemCiphertext, &type_map),
+            DataValue::Bytes(vec![2]),
+        );
+        fields.insert(
+            data_type_id(DataType::WrappingScheme, &type_map),
+            DataValue::Str("test".into()),
+        );
+
+        let parsed = CallSecretEnvelope::from_data_value(&DataValue::container_from_map(&fields));
+
+        assert_eq!(parsed.map(|secret| secret.version_number), Some(1));
     }
 }
