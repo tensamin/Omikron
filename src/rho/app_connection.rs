@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 pub struct AppConnection {
     pub state: Arc<AppState>,
+    _mtp_connection: Option<Arc<mtp::webserver::WebMTPConnection>>,
     pub user_id: u64,
     pub app_identifier: String,
     pub app_session: Uuid,
@@ -25,12 +26,14 @@ pub struct AppConnection {
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     is_open: Arc<RwLock<bool>>,
+    message_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppConnection {
     pub async fn from_general(general: Arc<GeneralConnection>, user_id: u64) -> Arc<Self> {
         Arc::new(Self {
             state: general.state.clone(),
+            _mtp_connection: Some(general.mtp_connection.clone()),
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: general.rho_connection.clone(),
             is_open: Arc::new(RwLock::new(true)),
@@ -40,6 +43,7 @@ impl AppConnection {
             app_identifier: general.app_identifier.read().await.clone().unwrap(),
             app_session: general.app_session.read().await.clone().unwrap(),
             client_version: general.client_version.read().await.clone(),
+            message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
         })
     }
     pub fn start(self: Arc<Self>) {
@@ -88,7 +92,11 @@ impl AppConnection {
 
     /// Handle incoming message from app
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(permit) = self.message_slots.clone().acquire_owned().await else {
+            return;
+        };
         tokio::spawn(async move {
+            let _permit = permit;
             let message_id = match cv.require_id() {
                 Ok(message_id) => message_id,
                 Err(error) => {
@@ -229,18 +237,15 @@ impl AppConnection {
         });
     }
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
-        let app_for_closure = self.clone();
-        tokio::spawn(async move {
-            let response_cv = self
-                .state
-                .omega
-                .clone()
-                .await_response(&cv.with_sender(self.user_id), Some(Duration::from_secs(20)))
-                .await;
-            if let Ok(response_cv) = response_cv {
-                app_for_closure.send_message(&response_cv).await;
-            }
-        });
+        let response_cv = self
+            .state
+            .omega
+            .clone()
+            .await_response(&cv.with_sender(self.user_id), Some(Duration::from_secs(20)))
+            .await;
+        if let Ok(response_cv) = response_cv {
+            self.send_message(&response_cv).await;
+        }
     }
 
     /// Send error response
@@ -275,6 +280,7 @@ impl Clone for AppConnection {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
+            _mtp_connection: self._mtp_connection.clone(),
             sender: Arc::clone(&self.sender),
             receiver: Arc::clone(&self.receiver),
             user_id: self.user_id,
@@ -284,6 +290,7 @@ impl Clone for AppConnection {
             pub_key: Arc::clone(&self.pub_key),
             rho_connection: Arc::clone(&self.rho_connection),
             is_open: Arc::clone(&self.is_open),
+            message_slots: Arc::clone(&self.message_slots),
         }
     }
 }

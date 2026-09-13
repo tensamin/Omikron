@@ -7,7 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STD;
 use crate::{
     app_state::AppState,
     log, log_err,
-    omega::omega_connection::OmegaConnection,
+    omega::{AuthIdentity, AuthIdentityKind, omega_connection::OmegaConnection},
     rho::connection::{ConnectionKind, GeneralConnection, OptionalDataValueCompat},
     util::{file_util::load_file_vec, logger::PrintType},
 };
@@ -23,6 +23,7 @@ fn with_cors(response: HttpResponse) -> HttpResponse {
         .header("access-control-allow-origin", "*")
         .header("access-control-allow-methods", "GET, POST, OPTIONS")
         .header("access-control-allow-headers", "*")
+        .header("access-control-allow-private-network", "true")
 }
 
 fn web_config(max_connections: usize) -> Result<WebServerConfig, mtp::webserver::RouterError> {
@@ -73,10 +74,11 @@ pub async fn get_by_connector_id(
     client_id: u64,
     description: Option<String>,
 ) -> Option<PublicKeyBundle> {
-    let request = public_key_lookup_request(omega.omikron_id(), client_id, description.as_deref())?;
+    let identity = authentication_identity(client_id, description.as_deref())?;
+    let request = public_key_lookup_request(omega.omikron_id(), identity);
 
     if !omega.is_ready().await {
-        return omega.cached_authenticated_key(client_id);
+        return omega.cached_authenticated_key(identity);
     }
 
     let response = match omega
@@ -92,35 +94,54 @@ pub async fn get_by_connector_id(
                 description,
                 e
             );
-            return omega.cached_authenticated_key(client_id);
+            return omega.cached_authenticated_key(identity);
         }
     };
+
+    if response.is_type(CommunicationType::ErrorNotFound) {
+        omega.invalidate_authenticated_key(identity);
+        return None;
+    }
 
     let bytes = BASE64_STD
         .decode(response.get_data(DataType::PublicKey).as_str()?)
         .ok()?;
     let public_key = PublicKeyBundle::from_bytes(&bytes).ok()?;
-    omega.cache_authenticated_key(client_id, public_key.clone());
+    omega.cache_authenticated_key(identity, public_key.clone());
     Some(public_key)
 }
 
-fn public_key_lookup_request(
-    omikron_id: u64,
-    client_id: u64,
-    description: Option<&str>,
-) -> Option<CommunicationValue> {
-    Some(match description {
-        Some("iota") => {
-            println!("Iota connection request for client_id: {}", client_id);
+fn authentication_identity(client_id: u64, description: Option<&str>) -> Option<AuthIdentity> {
+    let kind = match description {
+        Some("client") => AuthIdentityKind::Client,
+        Some("iota") => AuthIdentityKind::Iota,
+        _ => return None,
+    };
+
+    Some(AuthIdentity {
+        kind,
+        id: client_id,
+    })
+}
+
+fn public_key_lookup_request(omikron_id: u64, identity: AuthIdentity) -> CommunicationValue {
+    match identity.kind {
+        AuthIdentityKind::Iota => {
+            println!("Iota connection request for client_id: {}", identity.id);
             CommunicationValue::new(CommunicationType::GetIotaData)
                 .with_sender(omikron_id)
-                .add_typed_default(DataType::IotaId, DataValue::SignedNumber(client_id as i128))
+                .add_typed_default(
+                    DataType::IotaId,
+                    DataValue::SignedNumber(identity.id as i128),
+                )
         }
-        Some("client") => CommunicationValue::new(CommunicationType::GetUserData)
+        AuthIdentityKind::Client => CommunicationValue::new(CommunicationType::GetUserData)
             .with_sender(omikron_id)
-            .add_typed_default(DataType::UserId, DataValue::SignedNumber(client_id as i128)),
-        _ => return None,
-    })
+            .add_typed_default(
+                DataType::UserId,
+                DataValue::SignedNumber(identity.id as i128),
+            ),
+    }
 }
 
 /* Only Iota registration goes through mtp's Register flow; users are registered out of band. */
@@ -335,7 +356,10 @@ pub async fn start(
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpResponse, public_key_lookup_request, rho_policy, web_config, with_cors};
+    use super::{
+        AuthIdentity, AuthIdentityKind, HttpResponse, authentication_identity,
+        public_key_lookup_request, rho_policy, web_config, with_cors,
+    };
     use mtp::codec::{CommunicationType, DataType, DataValue};
     use std::time::Duration;
 
@@ -354,11 +378,21 @@ mod tests {
             "GET, POST, OPTIONS"
         );
         assert_eq!(response.headers["access-control-allow-headers"], "*");
+        assert_eq!(
+            response.headers["access-control-allow-private-network"],
+            "true"
+        );
     }
 
     #[test]
     fn public_key_lookup_identifies_the_omikron() {
-        let request = public_key_lookup_request(17, 42, Some("client")).unwrap();
+        let request = public_key_lookup_request(
+            17,
+            AuthIdentity {
+                kind: AuthIdentityKind::Client,
+                id: 42,
+            },
+        );
 
         assert!(request.is_type(CommunicationType::GetUserData));
         assert_eq!(request.sender(), Some(17));
@@ -366,6 +400,15 @@ mod tests {
             request.get_data(DataType::UserId),
             Some(&DataValue::SignedNumber(42))
         );
+    }
+
+    #[test]
+    fn authentication_identity_separates_clients_and_iotas_with_the_same_id() {
+        assert_ne!(
+            authentication_identity(42, Some("client")),
+            authentication_identity(42, Some("iota"))
+        );
+        assert_eq!(authentication_identity(42, Some("anonymous")), None);
     }
 
     #[test]

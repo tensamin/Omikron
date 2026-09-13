@@ -63,6 +63,16 @@ pub(crate) fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, 
     Some((user_id, 0, contact_ids))
 }
 
+fn registration_request(value: &CommunicationValue, iota_id: u64) -> CommunicationValue {
+    value
+        .clone()
+        .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()))
+        .add_typed_default(
+            DataType::RegisterId,
+            DataValue::Str(uuid::Uuid::new_v4().to_string()),
+        )
+}
+
 fn is_iota_omega_management_operation(value: &CommunicationValue) -> bool {
     matches!(
         value.get_comm_type_enum(),
@@ -87,6 +97,7 @@ fn is_iota_omega_management_operation(value: &CommunicationValue) -> bool {
 #[allow(dead_code)]
 pub struct IotaConnection {
     pub state: Arc<AppState>,
+    _mtp_connection: Option<Arc<mtp::webserver::WebMTPConnection>>,
     pub iota_id: u64,
     pub client_version: String,
     pub sender: Arc<MtpSender>,
@@ -103,6 +114,7 @@ impl IotaConnection {
     pub async fn from_general(general: Arc<GeneralConnection>, iota_id: u64) -> Arc<Self> {
         Arc::new(Self {
             state: general.state.clone(),
+            _mtp_connection: Some(general.mtp_connection.clone()),
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: general.rho_connection.clone(),
             user_ids: Arc::new(RwLock::new(Vec::new())),
@@ -120,9 +132,14 @@ impl IotaConnection {
             loop {
                 match self_clone.receiver.receive().await {
                     Ok(cv) => {
-                        let iota_for_closure = self_clone.clone();
+                        let Ok(permit) = self_clone.message_slots.clone().acquire_owned().await
+                        else {
+                            break;
+                        };
+                        let connection = self_clone.clone();
                         tokio::spawn(async move {
-                            iota_for_closure.handle_message(cv).await;
+                            let _permit = permit;
+                            connection.handle_message_inner(cv).await;
                         });
                     }
                     Err(error) => {
@@ -284,12 +301,7 @@ impl IotaConnection {
             .map_err(|error| error.to_string())
     }
 
-    /// Handle incoming message from Iota
-    pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
-        let Ok(permit) = self.message_slots.clone().acquire_owned().await else {
-            return;
-        };
-        let _permit = permit;
+    async fn handle_message_inner(self: Arc<Self>, cv: CommunicationValue) {
         let message_id = match cv.require_id() {
             Ok(message_id) => message_id,
             Err(error) => {
@@ -611,11 +623,14 @@ impl IotaConnection {
     }
 
     #[allow(dead_code)]
-    async fn close(&self) {
+    pub(crate) async fn close(&self) {
         let _ = self.sender.close();
     }
 
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
         let iota_for_closure = self.clone();
         let response_cv = self
             .state
@@ -623,8 +638,22 @@ impl IotaConnection {
             .clone()
             .await_response(&cv.with_sender(self.iota_id), Some(Duration::from_secs(20)))
             .await;
-        if let Ok(response_cv) = response_cv {
-            iota_for_closure.send_message(&response_cv).await;
+        match response_cv {
+            Ok(response_cv) => iota_for_closure.send_message(&response_cv).await,
+            Err(error) => {
+                log_err!(
+                    self.iota_id as i64,
+                    PrintType::Omega,
+                    "Iota management forwarding failed: {}",
+                    error
+                );
+                self.send_error_response(
+                    message_id,
+                    CommunicationType::ErrorInternal,
+                    Some(&format!("Omega forwarding failed: {error}")),
+                )
+                .await;
+            }
         }
     }
 
@@ -633,10 +662,7 @@ impl IotaConnection {
             return;
         };
         let iota_for_closure = self.clone();
-        let request = cv.clone().add_typed_default(
-            DataType::IotaId,
-            DataValue::SignedNumber(self.iota_id.into()),
-        );
+        let request = registration_request(&cv, self.iota_id);
         let mut response_cv = self
             .state
             .omega
@@ -996,7 +1022,7 @@ impl std::fmt::Debug for IotaConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{contact_snapshot, is_iota_omega_management_operation};
+    use super::{contact_snapshot, is_iota_omega_management_operation, registration_request};
     use crate::util::data_type_id;
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 
@@ -1049,5 +1075,21 @@ mod tests {
                 &CommunicationValue::new(operation)
             ));
         }
+    }
+
+    #[test]
+    fn registration_retry_keeps_operation_token_when_transport_id_changes() {
+        let request = registration_request(
+            &CommunicationValue::new(CommunicationType::GetRegister).with_id(42),
+            7,
+        );
+        let first = request.clone().with_id(1001);
+        let second = request.with_id(1002);
+
+        assert_ne!(first.id(), second.id());
+        assert_eq!(
+            first.get_data(DataType::RegisterId),
+            second.get_data(DataType::RegisterId)
+        );
     }
 }

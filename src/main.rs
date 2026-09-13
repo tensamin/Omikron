@@ -38,7 +38,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Error loading Provider".into());
     }
     dotenv().ok();
-    startup();
 
     let config = match Config::from_environment() {
         Ok(config) => config,
@@ -46,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("Invalid configuration: {error}").into());
         }
     };
+    startup(config.logger_queue_capacity);
 
     let keyring = match load_or_create_keyring(KEYRING_PATH, PUBLIC_KEY_PATH) {
         Ok(keyring) => keyring,
@@ -79,14 +79,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     omega.clone().start().await;
     start_task_cleanup_loop(omega.clone());
-    tokio::select! {
-        _ = omega.await_ready() => {}
-        result = tokio::signal::ctrl_c() => {
-            result.map_err(|error| format!("Unable to wait for shutdown signal: {error}"))?;
-            omega.stop().await;
-            return Ok(());
-        }
-    }
     let livekit = std::sync::Arc::new(LiveKitService::new(config.livekit.clone()));
     let call_manager = std::sync::Arc::new(CallManager::new_with_owner(
         livekit.clone(),

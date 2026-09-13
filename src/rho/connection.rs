@@ -85,8 +85,10 @@ impl OptionalDataValueCompat for Option<&DataValue> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameValidationError, OptionalDataValueCompat, RequiredMtpFields};
-    use mtp::codec::{CommunicationType, CommunicationValue, DataType};
+    use super::{ConnectionKind, FrameValidationError, RequiredMtpFields, connection_kind};
+    use mtp::codec::{CommunicationType, CommunicationValue};
+    use mtp::crypto::{Ed25519Signer, SignatureScheme, auth::register_proof_payload};
+    use mtp::host::AuthState;
 
     #[test]
     fn required_fields_preserve_missing_field_errors() {
@@ -117,6 +119,53 @@ mod tests {
         assert_eq!(frame.require_sender(), Ok(0));
         assert_eq!(frame.require_receiver(), Ok(0));
     }
+
+    #[test]
+    fn anonymous_roles_require_unauthenticated_mtp_state() {
+        assert_eq!(
+            connection_kind(Some("anonymous"), &AuthState::Unauthenticated),
+            Some(ConnectionKind::AnonymousClient)
+        );
+        assert_eq!(
+            connection_kind(Some("registering-client"), &AuthState::Unauthenticated),
+            Some(ConnectionKind::RegisteringClient)
+        );
+        assert_eq!(
+            connection_kind(Some("anonymous"), &AuthState::Authenticated),
+            None
+        );
+        assert_eq!(
+            connection_kind(Some("registering-client"), &AuthState::Authenticated),
+            None
+        );
+    }
+
+    #[test]
+    fn iota_registration_proof_cannot_authenticate_as_client() {
+        let (signer, _, _) = Ed25519Signer::generate();
+        let signature = signer
+            .sign(&register_proof_payload(
+                "0.3",
+                Some("iota"),
+                b"public-key",
+                1,
+                2,
+            ))
+            .unwrap();
+
+        assert!(
+            signer
+                .verify(
+                    &register_proof_payload("0.3", Some("client"), b"public-key", 1, 2,),
+                    &signature,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            connection_kind(Some("iota"), &AuthState::Authenticated),
+            Some(ConnectionKind::Iota)
+        );
+    }
 }
 
 /*
@@ -137,10 +186,23 @@ pub enum ConnectionKind {
     Phi,
 }
 
+fn connection_kind(description: Option<&str>, auth_state: &AuthState) -> Option<ConnectionKind> {
+    match (description, auth_state) {
+        (Some("iota"), AuthState::Authenticated) => Some(ConnectionKind::Iota),
+        (Some("client"), AuthState::Authenticated) => Some(ConnectionKind::Client),
+        (Some("anonymous"), AuthState::Unauthenticated) => Some(ConnectionKind::AnonymousClient),
+        (Some("registering-client"), AuthState::Unauthenticated) => {
+            Some(ConnectionKind::RegisteringClient)
+        }
+        _ => None,
+    }
+}
+
 pub struct GeneralConnection {
     pub state: Arc<AppState>,
     pub sender: Arc<MtpSender>,
     pub receiver: Arc<MtpReceiver>,
+    pub(crate) mtp_connection: Arc<WebMTPConnection>,
 
     connection_kind: ConnectionKind,
     id: u64,
@@ -163,23 +225,20 @@ impl GeneralConnection {
      * of being handed off to a connection handler.
      */
     pub fn new(conn: WebMTPConnection, state: Arc<AppState>) -> Option<Arc<Self>> {
-        let kind = match (conn.description.as_deref(), &conn.auth_state) {
-            (Some("iota"), AuthState::Authenticated) => ConnectionKind::Iota,
-            (Some("client"), AuthState::Authenticated) => ConnectionKind::Client,
-            (Some("anonymous"), _) => ConnectionKind::AnonymousClient,
-            (Some("registering-client"), _) => ConnectionKind::RegisteringClient,
-            _ => return None,
-        };
+        let kind = connection_kind(conn.description.as_deref(), &conn.auth_state)?;
 
         let id = if kind == ConnectionKind::RegisteringClient {
             (rand::random::<u64>() & ((1_u64 << 48) - 1)).max(1)
         } else {
             conn.client_id
         };
+        let client_version = conn.version.to_string();
+        let conn = Arc::new(conn);
         Some(Arc::new(Self {
             state,
-            sender: Arc::new(conn.sender),
-            receiver: Arc::new(conn.receiver),
+            sender: Arc::new(conn.sender.clone()),
+            receiver: Arc::new(conn.receiver.clone()),
+            mtp_connection: conn,
             connection_kind: kind,
             id,
             rho_connection: Arc::new(RwLock::new(None)),
@@ -187,11 +246,11 @@ impl GeneralConnection {
                 ConnectionKind::Client | ConnectionKind::RegisteringClient => {
                     ((Uuid::new_v4().as_u128() as u64) & ((1_u64 << 53) - 1)).max(1)
                 }
-                _ => conn.client_id,
+                _ => id,
             })),
             app_identifier: Arc::new(RwLock::new(None)),
             app_session: Arc::new(RwLock::new(None)),
-            client_version: Arc::new(RwLock::new(conn.version.to_string())),
+            client_version: Arc::new(RwLock::new(client_version)),
         }))
     }
 
@@ -220,10 +279,7 @@ impl GeneralConnection {
     async fn migrate(self: &Arc<Self>) -> bool {
         match self.connection_kind {
             ConnectionKind::Client => self.migrate_client().await,
-            ConnectionKind::Iota => {
-                self.migrate_iota().await;
-                true
-            }
+            ConnectionKind::Iota => self.migrate_iota().await,
             ConnectionKind::AnonymousClient => {
                 self.migrate_anonymous_client().await;
                 true
@@ -342,16 +398,24 @@ impl GeneralConnection {
         Some(rho)
     }
 
-    async fn migrate_iota(self: &Arc<Self>) {
+    async fn migrate_iota(self: &Arc<Self>) -> bool {
         let id = self.id;
         log_in!(id as i64, PrintType::Iota, "Iota {} connected", id);
 
+        let user_ids = match self.state.omega.iota_connected(id as i64).await {
+            Ok(user_ids) => user_ids,
+            Err(error) => {
+                log_err!(
+                    id as i64,
+                    PrintType::Iota,
+                    "Omega rejected Iota activation: {}",
+                    error
+                );
+                return false;
+            }
+        };
         let iota = IotaConnection::from_general(self.clone(), id).await;
         let previous = self.state.rho.get_by_iota(id as i64).await;
-        let user_ids = match previous.as_ref() {
-            Some(previous) => previous.get_user_ids().await,
-            None => Vec::new(),
-        };
         let rho = Arc::new(RhoConnection::new(iota.clone(), user_ids).await);
         iota.set_rho_connection(rho.clone()).await;
         if let Some(previous) = previous {
@@ -362,53 +426,7 @@ impl GeneralConnection {
         }
         self.state.rho.add(rho.clone()).await;
         iota.start();
-
-        /*
-         * Omega can accept the transport connection before its route index is
-         * synchronized. Keep the Rho available for client lookups, then
-         * retry lifecycle synchronization until the authoritative user
-         * snapshot has been received. Stop when this Rho is no longer current
-         * so a disconnected Iota cannot recreate stale routes.
-         */
-        let state = self.state.clone();
-        let rho = rho.clone();
-        tokio::spawn(async move {
-            let mut retry_delay = Duration::from_millis(250);
-            loop {
-                if !state.rho.is_current(id as i64, &rho).await {
-                    return;
-                }
-
-                if !state.omega.is_ready().await {
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(5));
-                    continue;
-                }
-
-                match state.omega.clone().iota_connected(id as i64).await {
-                    Ok(()) => {
-                        log_in!(
-                            id as i64,
-                            PrintType::Iota,
-                            "Iota {} synchronized with Omega",
-                            id
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        log_err!(
-                            id as i64,
-                            PrintType::Iota,
-                            "Iota synchronization failed, retrying: {}",
-                            error
-                        );
-                    }
-                }
-
-                tokio::time::sleep(retry_delay).await;
-                retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(5));
-            }
-        });
+        true
     }
 
     async fn migrate_anonymous_client(self: &Arc<Self>) {

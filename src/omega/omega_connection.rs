@@ -1,6 +1,6 @@
 use super::capabilities::PeerCapabilities;
 use crate::{
-    config::Config,
+    config::{Config, TransportConfig},
     log_cv_in, log_cv_out, log_err, log_in, log_out,
     rho::connection::{OptionalDataValueCompat, RequiredMtpFields},
     rho::relay_router,
@@ -17,9 +17,16 @@ use mtp::{
 };
 use mtp_native::ConnectionHandle;
 use rand::RngExt;
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::{
-    sync::{Mutex, RwLock, mpsc, oneshot, watch},
+    sync::{Mutex, RwLock, oneshot, watch},
     task::JoinHandle,
     time::{Instant, sleep},
 };
@@ -38,11 +45,46 @@ const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_REQUESTS: usize = 128;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+// ponytail: 24-hour offline auth ceiling; make configurable when deployments need a shorter policy.
+const MAX_OFFLINE_AUTH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-fn authenticated_key_path(client_id: u64) -> std::path::PathBuf {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuthIdentityKind {
+    Client,
+    Iota,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthIdentity {
+    pub kind: AuthIdentityKind,
+    pub id: u64,
+}
+
+fn authenticated_key_path(identity: AuthIdentity) -> std::path::PathBuf {
+    let kind = match identity.kind {
+        AuthIdentityKind::Client => "client",
+        AuthIdentityKind::Iota => "iota",
+    };
+
     crate::WORKING_DIR
-        .join("iota-public-keys")
-        .join(format!("{client_id}.mpkb"))
+        .join("authenticated-public-keys")
+        .join(kind)
+        .join(format!("{}.mpkb", identity.id))
+}
+
+fn authenticated_key_timestamp_path(identity: AuthIdentity) -> std::path::PathBuf {
+    authenticated_key_path(identity).with_extension("mpkb.cached-at")
+}
+
+#[derive(Clone)]
+struct CachedAuthenticatedKey {
+    public_key: mtp::crypto::PublicKeyBundle,
+    cached_at: SystemTime,
+}
+
+fn cached_at_is_fresh(now: SystemTime, cached_at: SystemTime) -> bool {
+    now.duration_since(cached_at)
+        .is_ok_and(|age| age <= MAX_OFFLINE_AUTH_AGE)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,10 +132,30 @@ fn signed_positive_iota_id(value: &CommunicationValue) -> Option<i64> {
         .filter(|id| *id > 0)
 }
 
+fn deleted_user_id(value: &CommunicationValue) -> Option<i64> {
+    value
+        .is_type(CommunicationType::DeleteUser)
+        .then(|| value.get_data(DataType::UserId).as_signed_number())
+        .flatten()
+        .and_then(|id| i64::try_from(id).ok())
+        .filter(|id| *id > 0)
+}
+
 fn iota_user_snapshot(value: &CommunicationValue) -> Option<(i64, Vec<i64>)> {
     if !value.is_type(CommunicationType::IotaUserData) {
         return None;
     }
+    iota_snapshot_data(value)
+}
+
+fn iota_activation_snapshot(value: &CommunicationValue) -> Option<(i64, Vec<i64>)> {
+    if !value.is_type(CommunicationType::Success) {
+        return None;
+    }
+    iota_snapshot_data(value)
+}
+
+fn iota_snapshot_data(value: &CommunicationValue) -> Option<(i64, Vec<i64>)> {
     let iota_id = value
         .get_data(DataType::IotaId)
         .as_signed_number()
@@ -132,8 +194,33 @@ fn parse_omega_capability_response(value: &CommunicationValue) -> Result<PeerCap
 // ============================================================================
 
 pub struct WaitingTask {
-    pub task: Box<dyn Fn(Arc<OmegaConnection>, CommunicationValue) -> bool + Send + Sync>,
+    pub original_id: u32,
+    pub sender: oneshot::Sender<CommunicationValue>,
     pub inserted_at: Instant,
+}
+
+fn allocate_omega_request_id(
+    next_request_id: &AtomicU32,
+    waiting_tasks: &DashMap<u32, WaitingTask>,
+) -> u32 {
+    loop {
+        let candidate = next_request_id.fetch_add(1, Ordering::Relaxed);
+        if candidate != 0 && !waiting_tasks.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+fn complete_waiting_task(
+    waiting_tasks: &DashMap<u32, WaitingTask>,
+    omega_id: u32,
+    response: CommunicationValue,
+) -> bool {
+    let Some((_, task)) = waiting_tasks.remove(&omega_id) else {
+        return false;
+    };
+    let _ = task.sender.send(response.with_id(task.original_id));
+    true
 }
 
 struct CircuitBreaker {
@@ -225,16 +312,19 @@ pub struct OmegaConnection {
     omikron_id: u64,
     sync_timeout: Duration,
     sync_retries: u32,
+    transport_config: TransportConfig,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     // Track if we should reconnect on close
     reconnect_on_close: Arc<RwLock<bool>>,
     request_slots: tokio::sync::Semaphore,
     circuit_breaker: Mutex<CircuitBreaker>,
+    sync_lock: Mutex<()>,
     keyring: mtp::crypto::Keyring,
     rho: Arc<RhoManager>,
-    authenticated_key_cache: DashMap<u64, mtp::crypto::PublicKeyBundle>,
+    authenticated_key_cache: DashMap<AuthIdentity, CachedAuthenticatedKey>,
     waiting_tasks: DashMap<u32, WaitingTask>,
+    next_request_id: AtomicU32,
     session_presence: DashMap<(i64, i64), SessionPresenceState>,
     presence_delivery_locks: DashMap<(i64, i64), Arc<Mutex<()>>>,
     initial_presence_barriers: DashMap<(i64, i64), Arc<Mutex<InitialPresenceBarrier>>>,
@@ -278,6 +368,23 @@ fn normalize_presence_user_ids(mut user_ids: Vec<i64>) -> Result<Vec<i64>, Strin
     Ok(user_ids)
 }
 
+fn omega_transport_policy(config: &TransportConfig) -> Policy {
+    Policy::default()
+        .with_send_mode(SendMode::SingleStreamPerMessage)
+        .with_max_message_size(config.max_message_size)
+        .with_handshake_max_message_size(config.handshake_max_message_size)
+        .with_timeouts(
+            Duration::from_millis(5_000),
+            Duration::from_millis(5_000),
+            Duration::from_millis(30_000),
+        )
+        .with_keep_alive(Some(Duration::from_secs(6)))
+        .with_max_idle_timeout(Some(Duration::from_secs(30)))
+        .with_receiver_queue_capacity(1000)
+        .with_max_concurrent_stream_tasks(64)
+        .with_persistent_stream_retries(5, Duration::from_secs(5))
+}
+
 #[derive(Default)]
 struct InitialPresenceBarrier {
     queued: VecDeque<CommunicationValue>,
@@ -306,6 +413,7 @@ impl OmegaConnection {
             omikron_id: config.omikron_id,
             sync_timeout: config.omega_sync_timeout,
             sync_retries: config.omega_sync_retries,
+            transport_config: config.omega_transport.clone(),
             connection_id: Uuid::new_v4(),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             reconnect_on_close: Arc::new(RwLock::new(true)),
@@ -314,10 +422,12 @@ impl OmegaConnection {
                 consecutive_failures: 0,
                 open_until: None,
             }),
+            sync_lock: Mutex::new(()),
             keyring,
             rho,
             authenticated_key_cache: DashMap::new(),
             waiting_tasks: DashMap::new(),
+            next_request_id: AtomicU32::new(1),
             session_presence: DashMap::new(),
             presence_delivery_locks: DashMap::new(),
             initial_presence_barriers: DashMap::new(),
@@ -448,20 +558,7 @@ impl OmegaConnection {
         let client_config = ClientConfig::new(format!("https://{}:{}", self.host, self.port))
             .with_client_id(self.omikron_id)
             .with_description(PeerCapabilities::current().identification_description())
-            .with_policy(
-                Policy::default()
-                    .with_send_mode(SendMode::SingleStreamPerMessage)
-                    .with_timeouts(
-                        Duration::from_millis(5_000),
-                        Duration::from_millis(5_000),
-                        Duration::from_millis(30_000),
-                    )
-                    .with_keep_alive(Some(Duration::from_secs(6)))
-                    .with_max_idle_timeout(Some(Duration::from_secs(30)))
-                    .with_receiver_queue_capacity(1000)
-                    .with_max_concurrent_stream_tasks(64)
-                    .with_persistent_stream_retries(5, Duration::from_secs(5)),
-            )
+            .with_policy(omega_transport_policy(&self.transport_config))
             .with_ping_interval(PING_INTERVAL);
 
         let host_public_key = load_public_key_bundle("./omega.mpkb")
@@ -544,6 +641,7 @@ impl OmegaConnection {
         }
         *self.sender.write().await = None;
         *self.state.write().await = ConnectionState::Disconnected;
+        self.waiting_tasks.clear();
 
         match result {
             Ok(()) if reached_healthy_state => Ok(ConnectionOutcome::HealthySessionEnded),
@@ -553,6 +651,7 @@ impl OmegaConnection {
     }
 
     async fn sync_client_iota_status(&self) -> bool {
+        let _sync_guard = self.sync_lock.lock().await;
         *self.state.write().await = ConnectionState::SynchronizingRoutes;
         let mut connected_iota_ids: Vec<DataValue> = Vec::new();
         let mut connected_sessions: Vec<DataValue> = Vec::new();
@@ -679,6 +778,7 @@ impl OmegaConnection {
             error
         );
         *self.state.write().await = ConnectionState::Disconnected;
+        self.waiting_tasks.clear();
         if let Some(sender) = self.sender.read().await.as_ref() {
             sender.close().await;
         }
@@ -709,6 +809,28 @@ impl OmegaConnection {
                                     let result = parse_omega_capability_response(&cv);
                                     let _ = tx.send(result);
                                 }
+                                continue;
+                            }
+
+                            if let Some(user_id) = deleted_user_id(&cv) {
+                                self.rho.invalidate_user(user_id).await;
+                                self.invalidate_authenticated_key(AuthIdentity {
+                                    kind: AuthIdentityKind::Client,
+                                    id: user_id as u64,
+                                });
+                                continue;
+                            }
+
+                            if cv.is_type(CommunicationType::DeleteIota)
+                                && let Some(iota_id) = signed_positive_iota_id(&cv)
+                            {
+                                if let Some(rho) = self.rho.get_by_iota(iota_id).await {
+                                    rho.close_deleted_iota_connection().await;
+                                }
+                                self.invalidate_authenticated_key(AuthIdentity {
+                                    kind: AuthIdentityKind::Iota,
+                                    id: iota_id as u64,
+                                });
                                 continue;
                             }
 
@@ -790,10 +912,8 @@ impl OmegaConnection {
                                     continue;
                                 }
                             };
-                            if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
-                                if (task.task)(self.clone(), cv.clone()) {
-                                    continue;
-                                }
+                            if complete_waiting_task(&self.waiting_tasks, msg_id, cv.clone()) {
+                                continue;
                             }
 
                             if cv.is_type(CommunicationType::EraseHostedUserData) {
@@ -968,59 +1088,47 @@ impl OmegaConnection {
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
-        let msg_id = cv
+        let original_id = cv
             .require_id()
             .map_err(|error| format!("request is missing correlation id: {error}"))?;
         self.await_connection(timeout_duration).await?;
 
-        let (tx, mut rx) = mpsc::channel(1);
+        let omega_id = allocate_omega_request_id(&self.next_request_id, &self.waiting_tasks);
+        let outbound = cv.clone().with_id(omega_id);
+        let (tx, rx) = oneshot::channel();
 
         self.waiting_tasks.insert(
-            msg_id,
+            omega_id,
             WaitingTask {
-                task: Box::new(move |_, response_cv| {
-                    log_in!(
-                        0,
-                        PrintType::Omega,
-                        "Matched Omega response (request_id={}, response_id={:?}, type={})",
-                        msg_id,
-                        response_cv.id(),
-                        response_cv
-                            .get_comm_type_enum()
-                            .map(|kind| kind.to_string())
-                            .unwrap_or_else(|| response_cv.get_type().to_string())
-                    );
-                    let inner_tx = tx.clone();
-                    tokio::spawn(async move {
-                        let _ = inner_tx.send(response_cv).await;
-                    });
-                    true
-                }),
+                original_id,
+                sender: tx,
                 inserted_at: Instant::now(),
             },
         );
 
-        if let Err(error) = self.try_send_message(cv).await {
-            self.waiting_tasks.remove(&msg_id);
+        if let Err(error) = self.try_send_message(&outbound).await {
+            self.waiting_tasks.remove(&omega_id);
             return Err(format!("failed to send request: {error}"));
         }
         log_out!(
             0,
             PrintType::Omega,
-            "Sent Omega request (request_id={}, type={})",
-            msg_id,
-            cv.get_comm_type_enum()
+            "Sent Omega request (request_id={}, original_id={}, type={})",
+            omega_id,
+            original_id,
+            outbound
+                .get_comm_type_enum()
                 .map(|kind| kind.to_string())
-                .unwrap_or_else(|| cv.get_type().to_string())
+                .unwrap_or_else(|| outbound.get_type().to_string())
         );
 
         let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
 
-        match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Some(response_cv)) => Ok(response_cv),
-            Ok(_) => Err("Channel closed".to_string()),
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(response_cv)) => Ok(response_cv),
+            Ok(Err(_)) => Err("Channel closed".to_string()),
             Err(_) => {
-                self.waiting_tasks.remove(&msg_id);
+                self.waiting_tasks.remove(&omega_id);
                 Err("Request timed out".to_string())
             }
         }
@@ -1039,36 +1147,48 @@ impl OmegaConnection {
         self.state.read().await.is_ready()
     }
 
-    pub async fn await_ready(&self) {
-        while !self.is_ready().await {
-            sleep(Duration::from_millis(100)).await;
+    pub fn cached_authenticated_key(
+        &self,
+        identity: AuthIdentity,
+    ) -> Option<mtp::crypto::PublicKeyBundle> {
+        if let Some(key) = self.authenticated_key_cache.get(&identity) {
+            if cached_at_is_fresh(SystemTime::now(), key.cached_at) {
+                return Some(key.public_key.clone());
+            }
         }
-    }
+        self.authenticated_key_cache.remove(&identity);
 
-    pub fn cached_authenticated_key(&self, client_id: u64) -> Option<mtp::crypto::PublicKeyBundle> {
-        if let Some(key) = self
-            .authenticated_key_cache
-            .get(&client_id)
-            .map(|key| key.clone())
-        {
-            return Some(key);
+        let cached_at = std::fs::read_to_string(authenticated_key_timestamp_path(identity))
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))?;
+        if !cached_at_is_fresh(SystemTime::now(), cached_at) {
+            self.invalidate_authenticated_key(identity);
+            return None;
         }
-
-        let key = load_public_key_bundle(&authenticated_key_path(client_id)).ok()?;
-        self.authenticated_key_cache.insert(client_id, key.clone());
+        let key = load_public_key_bundle(&authenticated_key_path(identity)).ok()?;
+        self.authenticated_key_cache.insert(
+            identity,
+            CachedAuthenticatedKey {
+                public_key: key.clone(),
+                cached_at,
+            },
+        );
         Some(key)
     }
 
     pub fn cache_authenticated_key(
         &self,
-        client_id: u64,
+        identity: AuthIdentity,
         public_key: mtp::crypto::PublicKeyBundle,
     ) {
-        let path = authenticated_key_path(client_id);
+        let path = authenticated_key_path(identity);
         if let Some(parent) = path.parent() {
             if let Err(error) = std::fs::create_dir_all(parent) {
                 log_err!(
-                    client_id as i64,
+                    identity.id as i64,
                     PrintType::General,
                     "Create authenticated key cache directory failed: {}",
                     error
@@ -1078,14 +1198,64 @@ impl OmegaConnection {
         }
         if let Err(error) = save_public_key_bundle(&public_key, &path) {
             log_err!(
-                client_id as i64,
+                identity.id as i64,
                 PrintType::General,
                 "Persist authenticated key cache failed: {}",
                 error
             );
             return;
         }
-        self.authenticated_key_cache.insert(client_id, public_key);
+        let cached_at = SystemTime::now();
+        let timestamp = match cached_at.duration_since(UNIX_EPOCH) {
+            Ok(timestamp) => timestamp.as_secs().to_string(),
+            Err(error) => {
+                log_err!(
+                    identity.id as i64,
+                    PrintType::General,
+                    "Create authenticated key cache timestamp failed: {}",
+                    error
+                );
+                self.invalidate_authenticated_key(identity);
+                return;
+            }
+        };
+        if let Err(error) = std::fs::write(authenticated_key_timestamp_path(identity), timestamp) {
+            log_err!(
+                identity.id as i64,
+                PrintType::General,
+                "Persist authenticated key cache timestamp failed: {}",
+                error
+            );
+            self.invalidate_authenticated_key(identity);
+            return;
+        }
+        self.authenticated_key_cache.insert(
+            identity,
+            CachedAuthenticatedKey {
+                public_key,
+                cached_at,
+            },
+        );
+    }
+
+    pub fn invalidate_authenticated_key(&self, identity: AuthIdentity) {
+        self.authenticated_key_cache.remove(&identity);
+        for path in [
+            authenticated_key_path(identity),
+            authenticated_key_timestamp_path(identity),
+        ] {
+            if let Err(error) = std::fs::remove_file(&path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                log_err!(
+                    identity.id as i64,
+                    PrintType::General,
+                    "Remove authenticated key cache {} failed: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -1168,11 +1338,22 @@ impl OmegaConnection {
         result
     }
 
-    pub async fn iota_connected(&self, iota_id: i64) -> Result<(), String> {
+    pub async fn iota_connected(&self, iota_id: i64) -> Result<Vec<i64>, String> {
         let request = CommunicationValue::new(CommunicationType::IotaConnected)
             .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota_id.into()));
         let request_id = request.require_id().map_err(|error| error.to_string())?;
-        let result = self.lifecycle_request(&request).await;
+        if !self.is_ready().await {
+            return Err("Omega is not synchronized".to_string());
+        }
+        let result = self
+            .await_response(&request, Some(Duration::from_secs(20)))
+            .await
+            .and_then(|response| {
+                iota_activation_snapshot(&response)
+                    .filter(|(response_iota_id, _)| *response_iota_id == iota_id)
+                    .map(|(_, user_ids)| user_ids)
+                    .ok_or_else(|| format!("Omega rejected {}", response.get_type()))
+            });
         if let Err(error) = &result {
             self.log_lifecycle_failure("IotaConnected", iota_id, None, request_id, error);
             self.sync_client_iota_status().await;
@@ -1658,11 +1839,155 @@ impl OmegaConnection {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectionOutcome, MAX_RECONNECT_DELAY, PeerCapabilities, RECONNECT_DELAY,
-        client_changed_target, iota_user_snapshot, parse_omega_capability_response,
-        reconnect_base_after_outcome, reconnect_delay_with_jitter, signed_positive_iota_id,
+        AuthIdentity, AuthIdentityKind, CachedAuthenticatedKey, ConnectionOutcome,
+        MAX_OFFLINE_AUTH_AGE, MAX_RECONNECT_DELAY, PeerCapabilities, RECONNECT_DELAY, WaitingTask,
+        allocate_omega_request_id, authenticated_key_path, cached_at_is_fresh,
+        client_changed_target, complete_waiting_task, iota_activation_snapshot, iota_user_snapshot,
+        omega_transport_policy, parse_omega_capability_response, reconnect_base_after_outcome,
+        reconnect_delay_with_jitter, signed_positive_iota_id,
     };
+    use crate::config::TransportConfig;
+    use dashmap::DashMap;
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+    use mtp::crypto::Keyring;
+    use std::{
+        sync::atomic::{AtomicU32, Ordering},
+        time::{Duration, SystemTime},
+    };
+    use tokio::{sync::oneshot, time::Instant};
+
+    #[test]
+    fn omega_transport_policy_uses_configured_message_limits() {
+        let policy = omega_transport_policy(&TransportConfig {
+            max_message_size: 123,
+            handshake_max_message_size: 45,
+        });
+
+        assert_eq!(policy.max_message_size, 123);
+        assert_eq!(policy.handshake_max_message_size, 45);
+    }
+
+    #[tokio::test]
+    async fn transport_ids_keep_matching_local_request_ids_separate() {
+        let waiting_tasks = DashMap::new();
+        let next_request_id = AtomicU32::new(0);
+        let (first_tx, first_rx) = oneshot::channel();
+        let first_omega_id = allocate_omega_request_id(&next_request_id, &waiting_tasks);
+        waiting_tasks.insert(
+            first_omega_id,
+            WaitingTask {
+                original_id: 42,
+                sender: first_tx,
+                inserted_at: Instant::now(),
+            },
+        );
+        next_request_id.store(first_omega_id, Ordering::Relaxed);
+        let (second_tx, second_rx) = oneshot::channel();
+        let second_omega_id = allocate_omega_request_id(&next_request_id, &waiting_tasks);
+        waiting_tasks.insert(
+            second_omega_id,
+            WaitingTask {
+                original_id: 42,
+                sender: second_tx,
+                inserted_at: Instant::now(),
+            },
+        );
+
+        assert_ne!(first_omega_id, second_omega_id);
+        assert!(complete_waiting_task(
+            &waiting_tasks,
+            second_omega_id,
+            CommunicationValue::new(CommunicationType::Success).with_id(second_omega_id),
+        ));
+        assert!(complete_waiting_task(
+            &waiting_tasks,
+            first_omega_id,
+            CommunicationValue::new(CommunicationType::ErrorInternal).with_id(first_omega_id),
+        ));
+
+        let Ok(first) = first_rx.await else {
+            panic!("first response channel closed");
+        };
+        let Ok(second) = second_rx.await else {
+            panic!("second response channel closed");
+        };
+        assert_eq!(first.id(), Some(42));
+        assert!(first.is_type(CommunicationType::ErrorInternal));
+        assert_eq!(second.id(), Some(42));
+        assert!(second.is_type(CommunicationType::Success));
+    }
+
+    #[test]
+    fn authenticated_key_cache_separates_clients_and_iotas_with_the_same_id() {
+        let cache = DashMap::<AuthIdentity, CachedAuthenticatedKey>::new();
+        let client = AuthIdentity {
+            kind: AuthIdentityKind::Client,
+            id: 42,
+        };
+        let iota = AuthIdentity {
+            kind: AuthIdentityKind::Iota,
+            id: 42,
+        };
+        let client_key = Keyring::generate().public_key_bundle();
+        let iota_key = Keyring::generate().public_key_bundle();
+
+        cache.insert(
+            client,
+            CachedAuthenticatedKey {
+                public_key: client_key.clone(),
+                cached_at: SystemTime::now(),
+            },
+        );
+        cache.insert(
+            iota,
+            CachedAuthenticatedKey {
+                public_key: iota_key.clone(),
+                cached_at: SystemTime::now(),
+            },
+        );
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache
+                .get(&client)
+                .unwrap()
+                .public_key
+                .try_as_bytes()
+                .unwrap(),
+            client_key.try_as_bytes().unwrap()
+        );
+        assert_eq!(
+            cache.get(&iota).unwrap().public_key.try_as_bytes().unwrap(),
+            iota_key.try_as_bytes().unwrap()
+        );
+    }
+
+    #[test]
+    fn authenticated_key_cache_rejects_expired_and_future_timestamps() {
+        let now = SystemTime::now();
+        assert!(cached_at_is_fresh(now, now));
+        assert!(!cached_at_is_fresh(
+            now,
+            now - MAX_OFFLINE_AUTH_AGE - Duration::from_secs(1)
+        ));
+        assert!(!cached_at_is_fresh(now, now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn authenticated_key_paths_use_separate_namespaces() {
+        let client_path = authenticated_key_path(AuthIdentity {
+            kind: AuthIdentityKind::Client,
+            id: 42,
+        });
+        let iota_path = authenticated_key_path(AuthIdentity {
+            kind: AuthIdentityKind::Iota,
+            id: 42,
+        });
+
+        assert_ne!(client_path, iota_path);
+        assert!(client_path.ends_with("authenticated-public-keys/client/42.mpkb"));
+        assert!(iota_path.ends_with("authenticated-public-keys/iota/42.mpkb"));
+    }
 
     fn notification() -> CommunicationValue {
         CommunicationValue::new(CommunicationType::ClientChanged)
@@ -1711,6 +2036,14 @@ mod tests {
                 ]),
             );
         assert_eq!(iota_user_snapshot(&snapshot), Some((8, vec![19, 20])));
+
+        let activation = CommunicationValue::new(CommunicationType::Success)
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(8))
+            .add_typed_default(
+                DataType::UserIds,
+                DataValue::Array(vec![DataValue::SignedNumber(20)]),
+            );
+        assert_eq!(iota_activation_snapshot(&activation), Some((8, vec![20])));
 
         let missing_iota = CommunicationValue::new(CommunicationType::IotaUserData)
             .add_typed_default(DataType::UserIds, DataValue::Array(Vec::new()));

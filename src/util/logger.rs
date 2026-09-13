@@ -1,15 +1,24 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    sync::{OnceLock, mpsc},
+    path::{Path, PathBuf},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError, TrySendError},
+    },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use ansi_term::Color;
 use mtp::codec::{CommunicationType, CommunicationValue, DataTypeId, DataValue, TypeMap, Version};
 
-static LOGGER: OnceLock<mpsc::Sender<LogMessage>> = OnceLock::new();
+static LOGGER: OnceLock<mpsc::SyncSender<LogMessage>> = OnceLock::new();
+static DROPPED_LOGS: AtomicU64 = AtomicU64::new(0);
+const DROPPED_LOG_REPORT_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_LOG_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const RETAINED_LOG_FILES: usize = 8;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy)]
@@ -32,40 +41,140 @@ struct LogMessage {
     message: String,
 }
 
-pub fn startup() {
-    let (tx, rx) = mpsc::channel::<LogMessage>();
+pub fn startup(queue_capacity: usize) {
+    let (tx, rx) = mpsc::sync_channel::<LogMessage>(queue_capacity);
     LOGGER.set(tx).expect("Logger already initialized");
 
     thread::spawn(move || {
         let log_dir = crate::WORKING_DIR.join("logs");
         fs::create_dir_all(&log_dir).expect("Failed to create log directory");
+        prune_logs(&log_dir);
 
         let start_ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let path = log_dir.join(format!("log_{}.txt", start_ts));
+        let mut sequence = 0;
+        let path = log_path(&log_dir, start_ts, sequence);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .expect("Failed to open log file");
 
-        for msg in rx {
-            let ts = fixed_box(&msg.timestamp_ms.to_string(), 13);
-            let sender = match msg.sender {
-                Some(id) => fixed_box(&id.to_string(), 19),
-                _ => fixed_box("", 19),
-            };
+        let mut last_drop_report = Instant::now();
+        loop {
+            match rx.recv_timeout(DROPPED_LOG_REPORT_INTERVAL) {
+                Ok(msg) => write_message(&mut file, msg),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    report_dropped_logs(&mut file);
+                    break;
+                }
+            }
 
-            let line = format!("{} {} {} {}", ts, sender, msg.prefix, msg.message);
-
-            println!("{}", colorize(msg.kind, msg.is_error).paint(&line));
-
-            let _ = writeln!(file, "{}", line);
+            if last_drop_report.elapsed() >= DROPPED_LOG_REPORT_INTERVAL {
+                report_dropped_logs(&mut file);
+                last_drop_report = Instant::now();
+            }
+            rotate_log_if_needed(&mut file, &log_dir, start_ts, &mut sequence);
         }
     });
+}
+
+fn log_path(log_dir: &Path, start_ts: u64, sequence: u32) -> PathBuf {
+    log_dir.join(format!("log_{start_ts}_{sequence}.txt"))
+}
+
+fn rotate_log_if_needed(
+    file: &mut std::fs::File,
+    log_dir: &Path,
+    start_ts: u64,
+    sequence: &mut u32,
+) {
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() >= MAX_LOG_FILE_BYTES)
+    {
+        return;
+    }
+    let next_sequence = sequence.saturating_add(1);
+    match OpenOptions::new().create(true).append(true).open(log_path(
+        log_dir,
+        start_ts,
+        next_sequence,
+    )) {
+        Ok(next_file) => {
+            *file = next_file;
+            *sequence = next_sequence;
+            prune_logs(log_dir);
+        }
+        Err(error) => eprintln!("Failed to rotate Omikron log file: {error}"),
+    }
+}
+
+fn prune_logs(log_dir: &Path) {
+    let Ok(entries) = fs::read_dir(log_dir) else {
+        return;
+    };
+    let mut logs = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("log_") && name.ends_with(".txt"))
+        })
+        .collect::<Vec<_>>();
+    logs.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    let remove_count = logs.len().saturating_sub(RETAINED_LOG_FILES);
+    for entry in logs.into_iter().take(remove_count) {
+        if let Err(error) = fs::remove_file(entry.path()) {
+            eprintln!("Failed to remove old Omikron log file: {error}");
+        }
+    }
+}
+
+fn write_message(file: &mut std::fs::File, msg: LogMessage) {
+    let ts = fixed_box(&msg.timestamp_ms.to_string(), 13);
+    let sender = match msg.sender {
+        Some(id) => fixed_box(&id.to_string(), 19),
+        _ => fixed_box("", 19),
+    };
+    let line = format!("{} {} {} {}", ts, sender, msg.prefix, msg.message);
+
+    println!("{}", colorize(msg.kind, msg.is_error).paint(&line));
+    if let Err(error) = writeln!(file, "{}", line) {
+        eprintln!("Failed to write Omikron log file: {error}");
+    }
+}
+
+fn report_dropped_logs(file: &mut std::fs::File) {
+    let dropped = DROPPED_LOGS.swap(0, Ordering::Relaxed);
+    if dropped > 0 {
+        write_message(
+            file,
+            LogMessage {
+                timestamp_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                sender: None,
+                prefix: ">>",
+                kind: PrintType::General,
+                is_error: true,
+                message: format!(
+                    "Dropped {dropped} log messages because the logger queue was full"
+                ),
+            },
+        );
+    }
 }
 
 fn colorize(kind: PrintType, is_error: bool) -> Color {
@@ -104,17 +213,26 @@ pub fn log_internal(
     let sender = if sender == 0 { None } else { Some(sender) };
 
     if let Some(tx) = LOGGER.get() {
-        let _ = tx.send(LogMessage {
+        let message = LogMessage {
             timestamp_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_millis(),
             sender,
             prefix,
             kind,
             is_error,
             message,
-        });
+        };
+        match tx.try_send(message) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                DROPPED_LOGS.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                eprintln!("Omikron logger thread has stopped");
+            }
+        }
     }
 }
 #[macro_export]

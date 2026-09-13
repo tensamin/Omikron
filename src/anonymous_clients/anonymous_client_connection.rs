@@ -17,6 +17,7 @@ use crate::{log_cv_in, log_cv_out, log_out};
 
 pub struct AnonymousClientConnection {
     pub state: Arc<AppState>,
+    _mtp_connection: Option<Arc<mtp::webserver::WebMTPConnection>>,
     user_id: u64,
 
     pub sender: Arc<MtpSender>,
@@ -34,6 +35,7 @@ impl AnonymousClientConnection {
         let username = generate_username(user_id);
         Arc::new(Self {
             state: general.state.clone(),
+            _mtp_connection: Some(general.mtp_connection.clone()),
             user_id: user_id,
 
             interested_users: Arc::new(RwLock::new(Vec::new())),
@@ -637,6 +639,7 @@ impl Clone for AnonymousClientConnection {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
+            _mtp_connection: self._mtp_connection.clone(),
             sender: Arc::clone(&self.sender),
             receiver: Arc::clone(&self.receiver),
             user_id: self.user_id,

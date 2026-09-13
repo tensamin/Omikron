@@ -2,7 +2,7 @@ use crate::anonymous_clients::anonymous_manager;
 use crate::app_state::AppState;
 use crate::calls::{call_group::call_invite_secret_from_cv, call_manager::CallServiceError};
 use crate::data::user::UserStatus;
-use crate::omega::omega_connection::InitialPresenceError;
+use crate::omega::omega_connection::{AuthIdentity, AuthIdentityKind, InitialPresenceError};
 use crate::rho::connection::{
     GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
 };
@@ -11,6 +11,7 @@ use crate::rho::rho_connection::RhoConnection;
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue};
+use mtp::crypto::PublicKeyBundle;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -116,6 +117,7 @@ fn merge_initial_presence_snapshot(
 
 pub struct ClientConnection {
     pub state: Arc<AppState>,
+    _mtp_connection: Option<Arc<mtp::webserver::WebMTPConnection>>,
     pub user_id: u64,
     pub session_id: u64,
     pub client_version: String,
@@ -202,6 +204,7 @@ impl ClientConnection {
     pub async fn from_general(general: Arc<GeneralConnection>, user_id: u64) -> Arc<Self> {
         Arc::new(Self {
             state: general.state.clone(),
+            _mtp_connection: Some(general.mtp_connection.clone()),
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: general.rho_connection.clone(),
             is_open: Arc::new(RwLock::new(true)),
@@ -735,48 +738,6 @@ impl ClientConnection {
             }
 
             if is_client_omega_operation(&cv) {
-                if cv.is_type(CommunicationType::ChangeUserData)
-                    && cv.get_data(DataType::OnlineStatus).is_some()
-                {
-                    let mut profile_request = cv.clone();
-                    let preference = profile_request
-                        .remove_data(DataType::OnlineStatus)
-                        .unwrap_or(DataValue::Null);
-                    let state_request = CommunicationValue::new(CommunicationType::ClientChanged)
-                        .with_id(message_id)
-                        .add_typed_default(DataType::UserState, preference);
-                    let state_response = match self.request_set_user_state(state_request).await {
-                        Ok(response) => response,
-                        Err(error_type) => {
-                            self.send_error_response(message_id, error_type).await;
-                            return;
-                        }
-                    };
-                    if !state_response.is_type(CommunicationType::Success) {
-                        self.send_message(&state_response).await;
-                        return;
-                    }
-
-                    if profile_request.data_len() == 0 {
-                        self.send_message(&state_response).await;
-                        return;
-                    }
-
-                    match self
-                        .await_omega_response(profile_request.with_sender(self.user_id))
-                        .await
-                    {
-                        Ok(response) if response.is_type(CommunicationType::Success) => {
-                            self.send_message(&response).await;
-                        }
-                        Ok(response) => self.send_message(&response).await,
-                        Err(_) => {
-                            self.send_error_response(message_id, CommunicationType::ErrorInternal)
-                                .await;
-                        }
-                    }
-                    return;
-                }
                 let sender = self.get_user_id().await;
                 self.handle_omega_forward(cv.with_sender(sender as u64))
                     .await;
@@ -885,8 +846,32 @@ impl ClientConnection {
         let Ok(request_id) = cv.require_id() else {
             return;
         };
+        let delete_user = cv.is_type(CommunicationType::DeleteUser);
+        let updated_key = if cv.is_type(CommunicationType::ChangeUserData) {
+            match cv.get_data(DataType::PublicKey) {
+                Some(DataValue::Str(key)) => PublicKeyBundle::from_base64(key).ok(),
+                _ => None,
+            }
+        } else {
+            None
+        };
         match self.await_omega_response(cv).await {
-            Ok(response_cv) => self.send_message(&response_cv).await,
+            Ok(response_cv) => {
+                let success = response_cv.is_type(CommunicationType::Success);
+                if success && let Some(public_key) = updated_key {
+                    self.state.omega.cache_authenticated_key(
+                        AuthIdentity {
+                            kind: AuthIdentityKind::Client,
+                            id: self.user_id,
+                        },
+                        public_key,
+                    );
+                }
+                self.clone().send_message(&response_cv).await;
+                if success && delete_user {
+                    self.close().await;
+                }
+            }
             Err(_) => {
                 self.send_error_response(request_id, CommunicationType::ErrorInternal)
                     .await;
@@ -923,22 +908,22 @@ impl ClientConnection {
         let Some(_rho) = self.get_rho_connection().await else {
             return Err(CommunicationType::ErrorNoIota);
         };
-        let request = CommunicationValue::new(CommunicationType::ClientChanged)
+        let request = CommunicationValue::new(CommunicationType::ChangeUserData)
             .with_id(message_id)
             .with_sender(self.user_id)
-            .add_typed_default(
-                DataType::UserId,
-                DataValue::SignedNumber(self.user_id as i128),
-            )
-            .add_typed_default(DataType::UserState, DataValue::Str(state.to_string()));
-        self.state
+            .add_typed_default(DataType::OnlineStatus, DataValue::Str(state.to_string()));
+        let response = self
+            .state
             .omega
-            .send_message_result(&request)
+            .await_response(&request, Some(Duration::from_secs(20)))
             .await
             .map_err(|_| CommunicationType::ErrorInternal)?;
-        return Ok(CommunicationValue::new(CommunicationType::Success)
-            .with_id(message_id)
-            .add_typed_default(DataType::UserState, DataValue::Str(state.to_string())));
+        if response.is_type(CommunicationType::Success) {
+            return Ok(
+                response.add_typed_default(DataType::UserState, DataValue::Str(state.to_string()))
+            );
+        }
+        Ok(response)
     }
 
     async fn handle_set_user_state(self: Arc<Self>, cv: CommunicationValue) {
@@ -1560,6 +1545,7 @@ impl Clone for ClientConnection {
     fn clone(&self) -> Self {
         Self {
             state: self.state.clone(),
+            _mtp_connection: self._mtp_connection.clone(),
             sender: Arc::clone(&self.sender),
             receiver: Arc::clone(&self.receiver),
             user_id: self.user_id,

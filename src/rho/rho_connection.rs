@@ -48,6 +48,16 @@ fn must_follow_initial_state(cv: &CommunicationValue) -> bool {
     )
 }
 
+fn local_delivery_result(attempted: usize, sent: usize) -> Result<usize, String> {
+    if attempted == 0 {
+        Err("client offline".to_string())
+    } else if sent == 0 {
+        Err("all local client sends failed".to_string())
+    } else {
+        Ok(sent)
+    }
+}
+
 impl RhoConnection {
     /// Create a new RhoConnection
     pub async fn new(iota_connection: Arc<IotaConnection>, user_ids: Vec<i64>) -> Self {
@@ -127,6 +137,15 @@ impl RhoConnection {
         }
         self.client_connections
             .retain(|(id, _), _| *id != user_id as u64);
+    }
+
+    pub async fn close_user_clients(&self, user_id: i64) {
+        let clients = self.get_client_connections_for_user(user_id).await;
+        self.client_connections
+            .retain(|(id, _), _| *id != user_id as u64);
+        for client in clients {
+            client.close().await;
+        }
     }
 
     #[allow(unused)]
@@ -281,6 +300,24 @@ impl RhoConnection {
         }
     }
 
+    pub async fn close_deleted_iota_connection(&self) {
+        let iota_id = self.get_iota_id().await as i64;
+        if self
+            .iota_connection
+            .state
+            .rho
+            .remove_if_current(iota_id, self)
+            .await
+            .is_none()
+        {
+            return;
+        }
+        for connection in self.get_client_connections().await {
+            connection.close().await;
+        }
+        self.iota_connection.close().await;
+    }
+
     /// Send message from Iota to specific client
     pub async fn message_to_client(&self, cv: CommunicationValue) {
         let connections = self.get_client_connections().await;
@@ -313,32 +350,27 @@ impl RhoConnection {
         self.iota_connection.send_message(&cv).await;
     }
 
-    pub async fn has_local_client(&self, user_id: u64) -> bool {
-        self.client_connections
-            .iter()
-            .any(|entry| entry.key().0 == user_id)
-    }
-
     pub async fn send_to_local_user(
         &self,
         user_id: u64,
         cv: &CommunicationValue,
     ) -> Result<usize, String> {
         let connections = self.get_client_connections_for_user(user_id as i64).await;
-        if connections.is_empty() {
-            return Err("client offline".to_string());
-        }
+        let attempted = connections.len();
         let mut sent = 0;
         for connection in connections {
-            if connection.send_relay(cv).await.is_ok() {
-                sent += 1;
+            match connection.send_relay(cv).await {
+                Ok(()) => sent += 1,
+                Err(error) => log_err!(
+                    user_id as i64,
+                    crate::util::logger::PrintType::Client,
+                    "Relay send failed for session {}: {}",
+                    connection.session_id,
+                    error
+                ),
             }
         }
-        if sent == 0 {
-            Err("all local client sends failed".to_string())
-        } else {
-            Ok(sent)
-        }
+        local_delivery_result(attempted, sent)
     }
 
     pub async fn send_relay_to_client(&self, cv: &CommunicationValue) -> Result<(), String> {
@@ -350,20 +382,7 @@ impl RhoConnection {
                 RouteTarget::Iota(_) => None,
             })
             .ok_or_else(|| "client offline".to_string())?;
-        let connections = self
-            .get_client_connections_for_user(receiver_id as i64)
-            .await;
-        if connections.is_empty() {
-            return Err("client offline".to_string());
-        }
-
-        let mut send_error = None;
-        for connection in connections {
-            if let Err(error) = connection.send_relay(cv).await {
-                send_error = Some(error);
-            }
-        }
-        send_error.map_or(Ok(()), Err)
+        self.send_to_local_user(receiver_id, cv).await.map(|_| ())
     }
 
     #[allow(dead_code)]
@@ -413,7 +432,7 @@ impl RhoConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::message_targets_client;
+    use super::{local_delivery_result, message_targets_client};
     use mtp::codec::{CommunicationType, CommunicationValue, DataType};
 
     #[test]
@@ -425,5 +444,12 @@ mod tests {
         assert!(message_targets_client(&event, 7, 2));
         assert!(!message_targets_client(&event, 8, 1));
         assert!(event.get_data(DataType::SessionId).is_none());
+    }
+
+    #[test]
+    fn one_successful_session_makes_local_delivery_successful() {
+        assert_eq!(local_delivery_result(2, 1), Ok(1));
+        assert!(local_delivery_result(2, 0).is_err());
+        assert!(local_delivery_result(0, 0).is_err());
     }
 }

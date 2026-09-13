@@ -97,6 +97,18 @@ impl RhoManager {
         }
     }
 
+    pub async fn invalidate_user(&self, user_id: i64) {
+        self.users.remove(&user_id);
+        let connections = self
+            .connections
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        for rho in connections {
+            rho.close_user_clients(user_id).await;
+        }
+    }
+
     pub async fn remove_if_current(
         &self,
         iota_id: i64,
@@ -127,12 +139,6 @@ impl RhoManager {
         self.connections
             .get(&iota_id)
             .map(|entry| entry.value().clone())
-    }
-
-    pub async fn is_current(&self, iota_id: i64, expected: &Arc<RhoConnection>) -> bool {
-        self.connections
-            .get(&iota_id)
-            .is_some_and(|entry| Arc::ptr_eq(entry.value(), expected))
     }
 
     pub async fn connection_count(&self) -> usize {

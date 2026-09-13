@@ -8,9 +8,12 @@ const DEFAULT_OMEGA_HOST: &str = "tensamin.net";
 const DEFAULT_OMEGA_PORT: u16 = 9187;
 const DEFAULT_OMEGA_SYNC_TIMEOUT_SECONDS: u64 = 20;
 const DEFAULT_OMEGA_SYNC_RETRIES: u32 = 3;
+const DEFAULT_OMEGA_TRANSPORT_MAX_MESSAGE_SIZE: u64 = 16 * 1024 * 1024;
+const DEFAULT_OMEGA_TRANSPORT_HANDSHAKE_MAX_MESSAGE_SIZE: u64 = 64 * 1024;
 const DEFAULT_RHO_MAX_CONNECTIONS: usize = 256;
 const DEFAULT_RHO_MAX_ANONYMOUS_CONNECTIONS: usize = 128;
 const DEFAULT_RHO_MAX_ANONYMOUS_CONNECTIONS_PER_IP: usize = 16;
+const DEFAULT_LOGGER_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveKitConfig {
@@ -18,6 +21,12 @@ pub struct LiveKitConfig {
     pub client_url: String,
     pub api_key: String,
     pub api_secret: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransportConfig {
+    pub max_message_size: u64,
+    pub handshake_max_message_size: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,17 +41,22 @@ pub struct Config {
     /// Number of synchronization requests before the transport is closed and
     /// the normal reconnect loop starts.
     pub omega_sync_retries: u32,
+    pub omega_transport: TransportConfig,
     /// Maximum number of application sessions accepted by the Rho listener.
     pub rho_max_connections: usize,
     /// Maximum number of anonymous application sessions.
     pub rho_max_anonymous_connections: usize,
     /// Maximum number of anonymous sessions from one peer IP address.
     pub rho_max_anonymous_connections_per_ip: usize,
+    /// Maximum number of log entries waiting for the logger thread.
+    pub logger_queue_capacity: usize,
     pub livekit: Option<LiveKitConfig>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum ConfigError {
+    #[error("{name} is required")]
+    MissingValue { name: &'static str },
     #[error("{name} must be a valid {kind}")]
     InvalidValue {
         name: &'static str,
@@ -59,7 +73,11 @@ impl Config {
         let rho_port = parse_or_default("RHO_PORT", DEFAULT_RHO_PORT)?;
         let bind_address = parse_bind_address(env::var("BIND_ADDRESS").ok())?;
         let omega_port = parse_or_default("OMEGA_PORT", DEFAULT_OMEGA_PORT)?;
-        let omikron_id = parse_or_default("ID", 0_u64)?;
+        let omikron_id = require_positive(
+            "ID",
+            parse_required("ID", "positive integer")?,
+            "positive integer",
+        )?;
         // Each synchronization request is bounded by this timeout. After
         // omega_sync_retries attempts, Omikron closes the authenticated
         // transport so the normal reconnect loop can establish a clean state.
@@ -69,6 +87,16 @@ impl Config {
         )?);
         let omega_sync_retries =
             parse_or_default("OMEGA_SYNC_RETRIES", DEFAULT_OMEGA_SYNC_RETRIES)?.max(1);
+        let omega_transport = TransportConfig {
+            max_message_size: parse_positive_or_default(
+                "OMEGA_TRANSPORT_MAX_MESSAGE_SIZE",
+                DEFAULT_OMEGA_TRANSPORT_MAX_MESSAGE_SIZE,
+            )?,
+            handshake_max_message_size: parse_positive_or_default(
+                "OMEGA_TRANSPORT_HANDSHAKE_MAX_MESSAGE_SIZE",
+                DEFAULT_OMEGA_TRANSPORT_HANDSHAKE_MAX_MESSAGE_SIZE,
+            )?,
+        };
         let rho_max_connections =
             parse_positive_or_default("RHO_MAX_CONNECTIONS", DEFAULT_RHO_MAX_CONNECTIONS)?;
         let rho_max_anonymous_connections = parse_positive_or_default(
@@ -79,6 +107,8 @@ impl Config {
             "RHO_MAX_ANONYMOUS_CONNECTIONS_PER_IP",
             DEFAULT_RHO_MAX_ANONYMOUS_CONNECTIONS_PER_IP,
         )?;
+        let logger_queue_capacity =
+            parse_positive_or_default("LOGGER_QUEUE_CAPACITY", DEFAULT_LOGGER_QUEUE_CAPACITY)?;
         let omega_host = env::var("OMEGA_HOST")
             .unwrap_or_else(|_| DEFAULT_OMEGA_HOST.to_string())
             .trim()
@@ -99,9 +129,11 @@ impl Config {
             omikron_id,
             omega_sync_timeout,
             omega_sync_retries,
+            omega_transport,
             rho_max_connections,
             rho_max_anonymous_connections,
             rho_max_anonymous_connections_per_ip,
+            logger_queue_capacity,
             livekit: livekit_from_environment()?,
         })
     }
@@ -132,16 +164,37 @@ where
     }
 }
 
+fn parse_required<T>(name: &'static str, kind: &'static str) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr,
+{
+    let value = match env::var(name) {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => return Err(ConfigError::MissingValue { name }),
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::InvalidValue { name, kind });
+        }
+    };
+
+    value
+        .trim()
+        .parse()
+        .map_err(|_| ConfigError::InvalidValue { name, kind })
+}
+
 fn parse_positive_or_default<T>(name: &'static str, default: T) -> Result<T, ConfigError>
 where
     T: std::str::FromStr + PartialEq + Default,
 {
-    let value = parse_or_default(name, default)?;
+    require_positive(name, parse_or_default(name, default)?, "positive number")
+}
+
+fn require_positive<T>(name: &'static str, value: T, kind: &'static str) -> Result<T, ConfigError>
+where
+    T: PartialEq + Default,
+{
     if value == T::default() {
-        return Err(ConfigError::InvalidValue {
-            name,
-            kind: "positive number",
-        });
+        return Err(ConfigError::InvalidValue { name, kind });
     }
     Ok(value)
 }
@@ -230,6 +283,28 @@ mod tests {
             Err(ConfigError::InvalidValue {
                 name: "BIND_ADDRESS",
                 kind: "IP address",
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_zero_transport_limit() {
+        assert_eq!(
+            require_positive("OMEGA_TRANSPORT_MAX_MESSAGE_SIZE", 0_u64, "positive number",),
+            Err(ConfigError::InvalidValue {
+                name: "OMEGA_TRANSPORT_MAX_MESSAGE_SIZE",
+                kind: "positive number",
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_zero_omikron_id() {
+        assert_eq!(
+            require_positive("ID", 0_u64, "positive integer"),
+            Err(ConfigError::InvalidValue {
+                name: "ID",
+                kind: "positive integer",
             })
         );
     }

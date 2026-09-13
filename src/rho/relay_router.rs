@@ -259,9 +259,6 @@ async fn route_from_iota(
                 )
                 .await
                 .ok_or(RelayRouteError::ClientOffline)?;
-            if !target.has_local_client(user_id).await {
-                return Err(RelayRouteError::ClientOffline);
-            }
             target
                 .send_relay_to_client(&frame)
                 .await
