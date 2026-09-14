@@ -1,21 +1,16 @@
 use super::{client_connection::ClientConnection, iota_connection::IotaConnection};
 
 use super::relay_router::RouteTarget;
-use crate::{
-    log_err,
-    rho::{app_connection::AppConnection, connection::OptionalDataValueCompat},
-};
+use crate::{log_err, rho::connection::OptionalDataValueCompat};
 use dashmap::DashMap;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 pub struct RhoConnection {
     iota_connection: Arc<IotaConnection>,
     user_ids: Arc<RwLock<Vec<i64>>>,
     client_connections: DashMap<(u64, u64), Arc<ClientConnection>>,
-    app_connections: DashMap<(u64, String, Uuid), Arc<AppConnection>>,
 }
 
 fn message_targets_client(cv: &CommunicationValue, user_id: u64, session_id: u64) -> bool {
@@ -65,7 +60,6 @@ impl RhoConnection {
             iota_connection,
             user_ids: Arc::new(RwLock::new(user_ids.clone())),
             client_connections: DashMap::new(),
-            app_connections: DashMap::new(),
         };
 
         rho_connection
@@ -146,52 +140,6 @@ impl RhoConnection {
         for client in clients {
             client.close().await;
         }
-    }
-
-    #[allow(unused)]
-    pub async fn get_app_connections(
-        &self,
-        userid: Option<i64>,
-        app_identifier: Option<String>,
-        app_session: Option<Uuid>,
-    ) -> Vec<Arc<AppConnection>> {
-        self.app_connections
-            .iter()
-            .filter(|entry| {
-                let conn = entry.value();
-                if let Some(uid) = userid {
-                    if conn.user_id != uid as u64 {
-                        return false;
-                    }
-                }
-                if let Some(ref identifier) = app_identifier {
-                    if conn.app_identifier != *identifier {
-                        return false;
-                    }
-                }
-                if let Some(ref session) = app_session {
-                    if conn.app_session != *session {
-                        return false;
-                    }
-                }
-                true
-            })
-            .map(|entry| entry.value().clone())
-            .collect()
-    }
-
-    pub async fn add_app_connection(&self, connection: Arc<AppConnection>) {
-        let key = (
-            connection.user_id,
-            connection.app_identifier.clone(),
-            connection.app_session,
-        );
-        self.app_connections.insert(key, connection);
-    }
-
-    pub async fn close_app_connection(&self, connection: Arc<AppConnection>) {
-        self.app_connections
-            .retain(|_, c| c.app_session != connection.app_session);
     }
 
     /// Add a client connection

@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use std::{collections::VecDeque, str::FromStr};
 use tokio::sync::{Mutex, RwLock};
-use trust_dns_resolver::TokioAsyncResolver;
 use uuid::Uuid;
 
 static NEXT_POLICY_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
@@ -510,8 +509,32 @@ impl ClientConnection {
                 self.handle_end_call(cv).await;
                 return;
             }
-            if cv.is_type(CommunicationType::LoadTxtRecord) {
-                self.handle_load_txt_record(cv).await;
+            if matches!(
+                cv.get_comm_type_enum(),
+                Some(
+                    CommunicationType::TAuthAuthorize
+                        | CommunicationType::TAuthGrantList
+                        | CommunicationType::TAuthGrantRevoke
+                        | CommunicationType::TAuthGrantMetadataSet
+                )
+            ) {
+                let Some(rho) = self.get_rho_connection().await else {
+                    self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                        .await;
+                    return;
+                };
+                match rho
+                    .get_iota_connection()
+                    .clone()
+                    .await_response(&cv.with_sender(self.user_id), Some(Duration::from_secs(20)))
+                    .await
+                {
+                    Ok(response) => self.send_message(&response.with_id(message_id)).await,
+                    Err(_) => {
+                        self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                            .await
+                    }
+                }
                 return;
             }
             if cv.is_type(CommunicationType::GetUserData) {
@@ -1359,87 +1382,6 @@ impl ClientConnection {
                     .await
             }
         }
-    }
-
-    async fn handle_load_txt_record(self: Arc<Self>, cv: CommunicationValue) {
-        let Ok(message_id) = cv.require_id() else {
-            return;
-        };
-        if let Some(path) = cv.get_data(DataType::Path).as_str() {
-            let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
-                Ok(r) => r,
-                Err(_) => {
-                    let path_data = cv
-                        .get_data(DataType::Path)
-                        .cloned()
-                        .unwrap_or(DataValue::Null);
-                    let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                        .with_id(message_id)
-                        .add_typed_default(DataType::Path, path_data);
-                    self.send_message(&error_cv).await;
-                    return;
-                }
-            };
-
-            match resolver.txt_lookup(path).await {
-                Ok(txt_lookup) => {
-                    if let Some(txt_record) = txt_lookup.iter().next() {
-                        let record_bytes: Vec<u8> = txt_record
-                            .txt_data()
-                            .iter()
-                            .flat_map(|chunk| chunk.iter().copied())
-                            .collect();
-                        let record_text = match String::from_utf8(record_bytes) {
-                            Ok(text) => text,
-                            Err(_) => {
-                                self.send_error_response(
-                                    message_id,
-                                    CommunicationType::ErrorInvalidData,
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-
-                        let response = CommunicationValue::new(CommunicationType::LoadTxtRecord)
-                            .with_id(message_id)
-                            .add_typed_default(DataType::Content, DataValue::Str(record_text));
-                        self.send_message(&response).await;
-                        return;
-                    }
-
-                    let path_data = cv
-                        .get_data(DataType::Path)
-                        .cloned()
-                        .unwrap_or(DataValue::Null);
-                    let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                        .with_id(message_id)
-                        .add_typed_default(DataType::Path, path_data);
-                    self.send_message(&error_cv).await;
-                }
-                Err(_) => {
-                    let path_data = cv
-                        .get_data(DataType::Path)
-                        .cloned()
-                        .unwrap_or(DataValue::Null);
-                    let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-                        .with_id(message_id)
-                        .add_typed_default(DataType::Path, path_data);
-                    self.send_message(&error_cv).await;
-                }
-            }
-
-            return;
-        }
-
-        let path_data = cv
-            .get_data(DataType::Path)
-            .cloned()
-            .unwrap_or(DataValue::Null);
-        let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
-            .with_id(message_id)
-            .add_typed_default(DataType::Path, path_data);
-        self.send_message(&error_cv).await;
     }
 
     /// Send error response

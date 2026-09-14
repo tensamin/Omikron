@@ -1,7 +1,6 @@
 use std::{sync::Arc, time::Duration};
 use strum_macros::Display;
 use tokio::sync::RwLock;
-use uuid::Uuid;
 
 use crate::{
     anonymous_clients::anonymous_client_connection::AnonymousClientConnection,
@@ -18,6 +17,7 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use mtp::host::AuthState;
 use mtp::webserver::{WebMTPConnection, WebMtpReceiver, WebMtpSender};
 use thiserror::Error;
+use uuid::Uuid;
 
 pub type MtpSender = WebMtpSender;
 pub type MtpReceiver = WebMtpReceiver;
@@ -171,7 +171,7 @@ mod tests {
 /*
  * How a connection identified itself during the mtp handshake driven by
  * `server.rs` ("iota" / "client" authenticated logins, "anonymous"
- * unauthenticated). `Phi` (third-party apps) predates that handshake and is
+ * unauthenticated). TAuth apps authenticate each scoped request after transport setup.
  * not reachable through it, since mtp's host only recognizes its own
  * `Identification`/`Register` hello frames; it is kept only so
  * `app_connection.rs` still compiles.
@@ -183,7 +183,7 @@ pub enum ConnectionKind {
     Iota,
     AnonymousClient,
     RegisteringClient,
-    Phi,
+    TAuth,
 }
 
 fn connection_kind(description: Option<&str>, auth_state: &AuthState) -> Option<ConnectionKind> {
@@ -194,6 +194,7 @@ fn connection_kind(description: Option<&str>, auth_state: &AuthState) -> Option<
         (Some("registering-client"), AuthState::Unauthenticated) => {
             Some(ConnectionKind::RegisteringClient)
         }
+        (Some("tauth"), AuthState::Unauthenticated) => Some(ConnectionKind::TAuth),
         _ => None,
     }
 }
@@ -209,8 +210,6 @@ pub struct GeneralConnection {
 
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     pub session_id: Arc<RwLock<u64>>,
-    pub app_identifier: Arc<RwLock<Option<String>>>,
-    pub app_session: Arc<RwLock<Option<Uuid>>>,
     pub client_version: Arc<RwLock<String>>,
 }
 
@@ -248,8 +247,6 @@ impl GeneralConnection {
                 }
                 _ => id,
             })),
-            app_identifier: Arc::new(RwLock::new(None)),
-            app_session: Arc::new(RwLock::new(None)),
             client_version: Arc::new(RwLock::new(client_version)),
         }))
     }
@@ -290,7 +287,7 @@ impl GeneralConnection {
                     .await;
                 true
             }
-            ConnectionKind::Phi => {
+            ConnectionKind::TAuth => {
                 self.migrate_phi().await;
                 true
             }
@@ -459,14 +456,7 @@ impl GeneralConnection {
     }
 
     async fn migrate_phi(self: &Arc<Self>) {
-        let user_id = self.id as i64;
-        let rho = self.find_user_rho(user_id).await;
-        *self.rho_connection.write().await = rho.clone();
         let app_conn = AppConnection::from_general(self.clone(), self.id).await;
-        if let Some(rho_conn) = rho {
-            rho_conn.bind_user_id(user_id).await;
-            rho_conn.add_app_connection(app_conn.clone()).await;
-        }
         app_conn.start();
     }
 }
