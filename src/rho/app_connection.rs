@@ -76,13 +76,15 @@ impl AppConnection {
             }
             let locator_value = value.get_data(DataType::Locator);
             let Some(locator_json) = locator_value.as_str() else {
-                self.send_error(message_id, "missing signed user route").await;
+                self.send_error(message_id, "missing signed user route")
+                    .await;
                 return;
             };
             let locator = match serde_json::from_str::<TAuthLocator>(locator_json) {
                 Ok(locator) if locator.target_iota_id > 0 => locator,
                 _ => {
-                    self.send_error(message_id, "invalid signed user route").await;
+                    self.send_error(message_id, "invalid signed user route")
+                        .await;
                     return;
                 }
             };
@@ -110,7 +112,8 @@ impl AppConnection {
                         "TAuth forwarding failed: {}",
                         error
                     );
-                    self.send_error(message_id, "target Iota request failed").await;
+                    self.send_error(message_id, "target Iota request failed")
+                        .await;
                 }
             }
         });

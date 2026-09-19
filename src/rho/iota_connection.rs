@@ -397,6 +397,7 @@ impl IotaConnection {
 
         if cv.is_type(CommunicationType::SyncedSettingChanged)
             || cv.is_type(CommunicationType::UserBlobChanged)
+            || cv.is_type(CommunicationType::UserAssetChanged)
             || cv.is_type(CommunicationType::BlockedUsersChanged)
             || cv.is_type(CommunicationType::ReceiptPolicyChanged)
             || cv.is_type(CommunicationType::MessageStoragePolicyChanged)
@@ -916,7 +917,6 @@ impl IotaConnection {
         if let Some(rho_conn) = self.get_rho_connection().await {
             let updated_cv = cv.with_sender(self.get_iota_id().await);
             rho_conn.message_to_client(updated_cv).await;
-        } else {
         }
     }
 

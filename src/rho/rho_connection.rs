@@ -34,6 +34,7 @@ fn must_follow_initial_state(cv: &CommunicationValue) -> bool {
                 | CommunicationType::ClientChanged
                 | CommunicationType::SyncedSettingChanged
                 | CommunicationType::UserBlobChanged
+                | CommunicationType::UserAssetChanged
                 | CommunicationType::BlockedUsersChanged
                 | CommunicationType::ReceiptPolicyChanged
                 | CommunicationType::MessageStoragePolicyChanged
