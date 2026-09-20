@@ -110,25 +110,25 @@
               };
 
               certFile = lib.mkOption {
-                type = lib.types.nullOr lib.types.path;
+                type = lib.types.nullOr lib.types.str;
                 default = null;
                 description = "Path to the SSL certificate file (cert.pem). Required if acmeCertDir is not set.";
               };
 
               keyFile = lib.mkOption {
-                type = lib.types.nullOr lib.types.path;
+                type = lib.types.nullOr lib.types.str;
                 default = null;
                 description = "Path to the SSL private key file (key.pem). Required if acmeCertDir is not set.";
               };
 
               acmeCertDir = lib.mkOption {
-                type = lib.types.nullOr lib.types.path;
+                type = lib.types.nullOr lib.types.str;
                 default = null;
                 description = "Directory containing ACME certificates (fullchain.pem and key.pem). When set, the service will automatically convert the EC key to PKCS8 and copy both files into the dataDir/certs directory on startup.";
               };
 
               environmentFiles = lib.mkOption {
-                type = lib.types.listOf lib.types.path;
+                type = lib.types.listOf lib.types.str;
                 default = [ ];
                 description = "Environment files to load for the Omikron service.";
               };
@@ -161,6 +161,28 @@
                 type = lib.types.port;
                 default = 9187;
                 description = "Port of the upstream Omega server.";
+              };
+
+              id = lib.mkOption {
+                type = lib.types.ints.positive;
+                description = "Omikron ID assigned by Omega.";
+              };
+
+              omegaTrustFile = lib.mkOption {
+                type = lib.types.str;
+                description = "Runtime path to Omega's trusted public key bundle.";
+              };
+
+              identityFile = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Runtime path to an existing Omikron private keyring, or null to generate one.";
+              };
+
+              publicIdentityFile = lib.mkOption {
+                type = lib.types.nullOr lib.types.str;
+                default = null;
+                description = "Runtime path to Omikron's matching public key bundle.";
               };
 
               package = lib.mkOption {
@@ -198,6 +220,7 @@
                   BIND_ADDRESS = cfg.bindAddress;
                   OMEGA_HOST = cfg.omegaHost;
                   OMEGA_PORT = toString cfg.omegaPort;
+                  ID = toString cfg.id;
                 };
 
                 serviceConfig = {
@@ -220,19 +243,28 @@
                       + pkgs.writeShellScript "omikron-setup-certs" (
                         if cfg.acmeCertDir != null then
                           ''
-                            mkdir -p ${cfg.dataDir}/certs
-                            cp ${cfg.acmeCertDir}/fullchain.pem ${cfg.dataDir}/certs/cert.pem
+                            install -d -m 0700 -o omikron -g omikron ${cfg.dataDir}/certs
+                            install -m 0644 -o omikron -g omikron ${cfg.acmeCertDir}/fullchain.pem ${cfg.dataDir}/certs/cert.pem
                             ${pkgs.openssl}/bin/openssl pkcs8 -topk8 -nocrypt \
                               -in ${cfg.acmeCertDir}/key.pem \
                               -out ${cfg.dataDir}/certs/key.pem
-                            chown -R omikron:omikron ${cfg.dataDir}
                           ''
                         else
                           ''
-                            mkdir -p ${cfg.dataDir}/certs
-                            ln -sf ${cfg.certFile} ${cfg.dataDir}/certs/cert.pem
-                            ln -sf ${cfg.keyFile} ${cfg.dataDir}/certs/key.pem
-                            chown -R omikron:omikron ${cfg.dataDir}
+                            install -d -m 0700 -o omikron -g omikron ${cfg.dataDir}/certs
+                            install -m 0644 -o omikron -g omikron ${cfg.certFile} ${cfg.dataDir}/certs/cert.pem
+                            install -m 0600 -o omikron -g omikron ${cfg.keyFile} ${cfg.dataDir}/certs/key.pem
+                          ''
+                          + ''
+                            chown omikron:omikron ${cfg.dataDir}/certs/key.pem
+                            chmod 0600 ${cfg.dataDir}/certs/key.pem
+                            install -m 0644 -o omikron -g omikron ${cfg.omegaTrustFile} ${cfg.dataDir}/omega.mpkb
+                            ${lib.optionalString (cfg.identityFile != null) ''
+                              install -m 0600 -o omikron -g omikron ${cfg.identityFile} ${cfg.dataDir}/omikron.mk
+                            ''}
+                            ${lib.optionalString (cfg.publicIdentityFile != null) ''
+                              install -m 0644 -o omikron -g omikron ${cfg.publicIdentityFile} ${cfg.dataDir}/omikron.mpkb
+                            ''}
                           ''
                       )
                     )
