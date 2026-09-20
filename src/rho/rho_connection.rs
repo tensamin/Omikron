@@ -1,4 +1,7 @@
-use super::{client_connection::ClientConnection, iota_connection::IotaConnection};
+use super::{
+    client_connection::{ClientConnection, DeviceClass, SessionActivity},
+    iota_connection::IotaConnection,
+};
 
 use super::relay_router::RouteTarget;
 use crate::{log_err, rho::connection::OptionalDataValueCompat};
@@ -28,6 +31,7 @@ fn must_follow_initial_state(cv: &CommunicationValue) -> bool {
         cv.get_comm_type_enum(),
         Some(
             CommunicationType::MessageLive
+                | CommunicationType::MessageState
                 | CommunicationType::MessageEditLive
                 | CommunicationType::MessageReactionLive
                 | CommunicationType::MessageDeleteLive
@@ -42,6 +46,23 @@ fn must_follow_initial_state(cv: &CommunicationValue) -> bool {
                 | CommunicationType::ChatSecretForward
         )
     )
+}
+
+fn should_suppress_notification(
+    session_id: u64,
+    activity: &SessionActivity,
+    sessions: &[(u64, SessionActivity)],
+) -> bool {
+    activity.reported
+        && activity.device_class == DeviceClass::Mobile
+        && !activity.foreground
+        && sessions.iter().any(|(other_session_id, other)| {
+            *other_session_id != session_id
+                && other.reported
+                && other.foreground
+                && other.notification_capable
+                && matches!(other.device_class, DeviceClass::Desktop | DeviceClass::Web)
+        })
 }
 
 fn local_delivery_result(attempted: usize, sent: usize) -> Result<usize, String> {
@@ -279,17 +300,50 @@ impl RhoConnection {
             return;
         }
 
-        for connection in connections.iter() {
-            if !message_targets_client(&cv, connection.user_id, connection.session_id) {
-                continue;
+        let target_connections: Vec<_> = connections
+            .into_iter()
+            .filter(|connection| {
+                message_targets_client(&cv, connection.user_id, connection.session_id)
+            })
+            .collect();
+        let activities = if cv.is_type(CommunicationType::MessageLive) {
+            let mut activities = Vec::with_capacity(target_connections.len());
+            for connection in &target_connections {
+                activities.push((connection.session_id, connection.session_activity().await));
             }
-            if must_follow_initial_state(&cv) {
+            activities
+        } else {
+            Vec::new()
+        };
+
+        for connection in target_connections {
+            let activity = activities
+                .iter()
+                .find(|(session_id, _)| *session_id == connection.session_id)
+                .map(|(_, activity)| activity);
+            let client_cv = if let Some(activity) = activity {
+                if activity.reported {
+                    cv.clone().add_typed_default(
+                        DataType::SuppressNotification,
+                        DataValue::Bool(should_suppress_notification(
+                            connection.session_id,
+                            activity,
+                            &activities,
+                        )),
+                    )
+                } else {
+                    cv.clone()
+                }
+            } else {
+                cv.clone()
+            };
+            if must_follow_initial_state(&client_cv) {
                 let _ = connection
                     .clone()
-                    .send_or_buffer_post_initial_state(cv.clone())
+                    .send_or_buffer_post_initial_state(client_cv)
                     .await;
             } else {
-                connection.clone().send_message(&cv).await;
+                connection.clone().send_message(&client_cv).await;
             }
         }
     }
@@ -381,7 +435,11 @@ impl RhoConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{local_delivery_result, message_targets_client};
+    use super::super::client_connection::{DeviceClass, SessionActivity};
+    use super::{
+        local_delivery_result, message_targets_client, must_follow_initial_state,
+        should_suppress_notification,
+    };
     use mtp::codec::{CommunicationType, CommunicationValue, DataType};
 
     #[test]
@@ -400,5 +458,56 @@ mod tests {
         assert_eq!(local_delivery_result(2, 1), Ok(1));
         assert!(local_delivery_result(2, 0).is_err());
         assert!(local_delivery_result(0, 0).is_err());
+    }
+
+    #[test]
+    fn message_state_is_buffered_with_other_message_mutations() {
+        assert!(must_follow_initial_state(&CommunicationValue::new(
+            CommunicationType::MessageState
+        )));
+    }
+
+    #[test]
+    fn mobile_notification_suppression_requires_reported_foreground_desktop_or_web() {
+        let mobile = SessionActivity {
+            reported: true,
+            device_class: DeviceClass::Mobile,
+            foreground: false,
+            notification_capable: true,
+        };
+        let desktop = SessionActivity {
+            reported: true,
+            device_class: DeviceClass::Desktop,
+            foreground: true,
+            notification_capable: true,
+        };
+
+        assert!(should_suppress_notification(
+            2,
+            &mobile,
+            &[(1, desktop.clone()), (2, mobile.clone())]
+        ));
+        assert!(!should_suppress_notification(
+            2,
+            &mobile,
+            &[
+                (
+                    1,
+                    SessionActivity {
+                        foreground: false,
+                        ..desktop.clone()
+                    }
+                ),
+                (2, mobile.clone())
+            ]
+        ));
+        assert!(!should_suppress_notification(
+            2,
+            &SessionActivity {
+                foreground: true,
+                ..mobile.clone()
+            },
+            &[(1, desktop), (2, mobile)]
+        ));
     }
 }

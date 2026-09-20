@@ -375,6 +375,7 @@ impl IotaConnection {
                 cv.get_comm_type_enum(),
                 Some(
                     CommunicationType::MessageLive
+                        | CommunicationType::MessageState
                         | CommunicationType::MessageEditLive
                         | CommunicationType::MessageReactionLive
                         | CommunicationType::MessageDeleteLive

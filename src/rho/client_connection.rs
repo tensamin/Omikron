@@ -55,6 +55,32 @@ enum AckCommitStart {
     Overflowed,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceClass {
+    Desktop,
+    Mobile,
+    Web,
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionActivity {
+    pub reported: bool,
+    pub device_class: DeviceClass,
+    pub foreground: bool,
+    pub notification_capable: bool,
+}
+
+impl Default for SessionActivity {
+    fn default() -> Self {
+        Self {
+            reported: false,
+            device_class: DeviceClass::Web,
+            foreground: false,
+            notification_capable: false,
+        }
+    }
+}
+
 fn next_policy_request_id() -> u32 {
     NEXT_POLICY_REQUEST_ID
         .fetch_add(1, Ordering::Relaxed)
@@ -128,6 +154,7 @@ pub struct ClientConnection {
     is_open: Arc<RwLock<bool>>,
     message_slots: Arc<tokio::sync::Semaphore>,
     client_state_sync: Arc<Mutex<ClientStateSyncState>>,
+    session_activity: Arc<RwLock<SessionActivity>>,
 }
 
 impl ClientConnection {
@@ -214,7 +241,12 @@ impl ClientConnection {
             client_version: general.client_version.read().await.clone(),
             message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
             client_state_sync: Arc::new(Mutex::new(ClientStateSyncState::default())),
+            session_activity: Arc::new(RwLock::new(SessionActivity::default())),
         })
+    }
+
+    pub async fn session_activity(&self) -> SessionActivity {
+        self.session_activity.read().await.clone()
     }
     pub fn start(self: Arc<Self>) {
         let self_clone = self.clone();
@@ -429,6 +461,42 @@ impl ClientConnection {
             ) {
                 self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
                     .await;
+                return;
+            }
+
+            if cv.is_type(CommunicationType::SessionActivitySet) {
+                let device_class = match cv.get_data(DataType::DeviceClass).as_str() {
+                    Some("desktop") => DeviceClass::Desktop,
+                    Some("mobile") => DeviceClass::Mobile,
+                    Some("web") => DeviceClass::Web,
+                    _ => {
+                        self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                            .await;
+                        return;
+                    }
+                };
+                let Some(foreground) = cv.get_data(DataType::Foreground).as_bool() else {
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                };
+                let Some(notification_capable) =
+                    cv.get_data(DataType::NotificationCapable).as_bool()
+                else {
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                };
+                *self.session_activity.write().await = SessionActivity {
+                    reported: true,
+                    device_class,
+                    foreground,
+                    notification_capable,
+                };
+                self.send_message(
+                    &CommunicationValue::new(CommunicationType::Success).with_id(message_id),
+                )
+                .await;
                 return;
             }
 
@@ -1498,6 +1566,7 @@ impl Clone for ClientConnection {
             is_open: Arc::clone(&self.is_open),
             message_slots: Arc::clone(&self.message_slots),
             client_state_sync: Arc::clone(&self.client_state_sync),
+            session_activity: Arc::clone(&self.session_activity),
         }
     }
 }
