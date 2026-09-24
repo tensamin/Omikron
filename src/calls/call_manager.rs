@@ -33,6 +33,7 @@ pub enum CallServiceError {
 pub struct CallManager {
     pub(crate) groups: DashMap<Uuid, Arc<CallGroup>>,
     creation_locks: DashMap<Uuid, Arc<Mutex<()>>>,
+    admission_locks: DashMap<u64, Arc<Mutex<()>>>,
     pub livekit: Arc<LiveKitService>,
     pub owner_omikron_id: u64,
     limits: CallLimits,
@@ -53,6 +54,7 @@ impl CallManager {
         Self {
             groups: DashMap::new(),
             creation_locks: DashMap::new(),
+            admission_locks: DashMap::new(),
             livekit,
             owner_omikron_id: owner,
             limits,
@@ -95,24 +97,39 @@ impl CallManager {
             return self.token_existing(g, user).await;
         }
         let secret = creator.ok_or(CallServiceError::NotFound)?;
-        if self.get_call_groups(user).await.len() >= self.limits.max_calls_per_user {
-            return Err(CallServiceError::ResourceLimit);
-        }
-        let lock = self
-            .creation_locks
-            .entry(id)
+        let admission_lock = self
+            .admission_locks
+            .entry(user)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let result = {
-            let _guard = lock.lock().await;
+            let _admission_guard = admission_lock.lock().await;
             if let Some(group) = self.get_call(id).await {
                 self.token_existing(group, user).await
+            } else if self.get_call_groups(user).await.len() >= self.limits.max_calls_per_user {
+                Err(CallServiceError::ResourceLimit)
             } else {
-                self.create_call(user, id, secret).await
+                let lock = self
+                    .creation_locks
+                    .entry(id)
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone();
+                let result = {
+                    let _guard = lock.lock().await;
+                    if let Some(group) = self.get_call(id).await {
+                        self.token_existing(group, user).await
+                    } else {
+                        self.create_call(user, id, secret).await
+                    }
+                };
+                self.creation_locks.remove_if(&id, |_, current| {
+                    Arc::ptr_eq(current, &lock) && Arc::strong_count(current) == 2
+                });
+                result
             }
         };
-        self.creation_locks.remove_if(&id, |_, current| {
-            Arc::ptr_eq(current, &lock) && Arc::strong_count(current) == 2
+        self.admission_locks.remove_if(&user, |_, current| {
+            Arc::ptr_eq(current, &admission_lock) && Arc::strong_count(current) == 2
         });
         result
     }
@@ -194,10 +211,23 @@ impl CallManager {
         {
             return Err(CallServiceError::NotAuthorized);
         }
-        if self.get_call_groups(to).await.len() >= self.limits.max_calls_per_user {
-            return Err(CallServiceError::ResourceLimit);
-        }
-        g.invite(from, to, secret).await
+        let admission_lock = self
+            .admission_locks
+            .entry(to)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let result = {
+            let _guard = admission_lock.lock().await;
+            if self.get_call_groups(to).await.len() >= self.limits.max_calls_per_user {
+                Err(CallServiceError::ResourceLimit)
+            } else {
+                g.invite(from, to, secret).await
+            }
+        };
+        self.admission_locks.remove_if(&to, |_, current| {
+            Arc::ptr_eq(current, &admission_lock) && Arc::strong_count(current) == 2
+        });
+        result
     }
     pub async fn rollback_invite(&self, id: Uuid, user: u64) {
         if let Some(g) = self.get_call(id).await {
@@ -332,6 +362,49 @@ mod tests {
         let _ = manager.get_call_token(2, id).await;
         assert!(group.member(2).await.is_some());
     }
+    #[tokio::test]
+    async fn concurrent_invites_share_user_quota() {
+        let limits = CallLimits {
+            max_calls_per_user: 1,
+            ..CallLimits::default()
+        };
+        let manager = Arc::new(CallManager::new_with_limits(
+            Arc::new(LiveKitService::new(None)),
+            1,
+            limits.clone(),
+        ));
+        let mut ids = Vec::new();
+        for owner in [1, 2] {
+            let id = Uuid::new_v4();
+            manager.groups.insert(
+                id,
+                Arc::new(CallGroup::new_with_service(
+                    id,
+                    1,
+                    owner,
+                    secret(),
+                    manager.livekit.clone(),
+                    limits.clone(),
+                )),
+            );
+            ids.push((id, owner));
+        }
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for (id, owner) in ids {
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                manager.add_invite(id, owner, 42, secret()).await
+            }));
+        }
+        let first = tasks.remove(0).await.unwrap();
+        let second = tasks.remove(0).await.unwrap();
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(manager.admission_locks.is_empty());
+    }
+
     #[tokio::test]
     async fn self_invite_is_rejected() {
         let manager = CallManager::default();
