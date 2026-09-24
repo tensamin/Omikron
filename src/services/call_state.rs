@@ -135,6 +135,7 @@ mod tests {
                 wrapping_scheme: "s".into(),
             },
             Arc::new(crate::calls::call_util::LiveKitService::new(None)),
+            crate::config::CallLimits::default(),
         ));
         group
             .invite(

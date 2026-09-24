@@ -19,3 +19,11 @@ Rho connection budgets can be configured with:
 semaphore and to the MTP WebServer admission semaphore. This means the same
 budget limits transport handshakes and authenticated Rho sessions instead of
 only limiting connections after authentication.
+
+## Offline authentication
+
+Clients may authenticate with a previously verified Omega key for up to 24 hours by default. Set `CLIENT_OFFLINE_AUTH_MAX_AGE_SECONDS` to shorten that window. Iota offline authentication is disabled by default; set `IOTA_OFFLINE_AUTH_MAX_AGE_SECONDS` to a positive number only when the deployment needs it. Omega key responses must match the requested identity type and ID before Omikron caches them.
+
+## Call limits
+
+`CALL_MAX_MEMBERS` and `CALL_MAX_PENDING_INVITES` default to 64 per call. `CALL_MAX_CALLS_PER_USER` defaults to 16, and `CALL_INVITE_TTL_SECONDS` defaults to 3600. Configure limits for available LiveKit capacity. Expired invites cannot grant call tokens or expose call secrets.

@@ -30,6 +30,31 @@ pub struct TransportConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallLimits {
+    pub max_members_per_call: usize,
+    pub max_pending_invites_per_call: usize,
+    pub max_calls_per_user: usize,
+    pub invite_ttl: Duration,
+}
+
+impl Default for CallLimits {
+    fn default() -> Self {
+        Self {
+            max_members_per_call: 64,
+            max_pending_invites_per_call: 64,
+            max_calls_per_user: 16,
+            invite_ttl: Duration::from_secs(3600),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineAuthPolicy {
+    pub client_max_age: Duration,
+    pub iota_max_age: Option<Duration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
     pub rho_port: u16,
     pub bind_address: IpAddr,
@@ -42,6 +67,8 @@ pub struct Config {
     /// the normal reconnect loop starts.
     pub omega_sync_retries: u32,
     pub omega_transport: TransportConfig,
+    pub offline_auth: OfflineAuthPolicy,
+    pub call_limits: CallLimits,
     /// Maximum number of application sessions accepted by the Rho listener.
     pub rho_max_connections: usize,
     /// Maximum number of anonymous application sessions.
@@ -97,6 +124,24 @@ impl Config {
                 DEFAULT_OMEGA_TRANSPORT_HANDSHAKE_MAX_MESSAGE_SIZE,
             )?,
         };
+        let offline_auth = OfflineAuthPolicy {
+            client_max_age: Duration::from_secs(parse_positive_or_default(
+                "CLIENT_OFFLINE_AUTH_MAX_AGE_SECONDS",
+                24 * 60 * 60,
+            )?),
+            iota_max_age: env::var("IOTA_OFFLINE_AUTH_MAX_AGE_SECONDS")
+                .ok()
+                .map(|value| {
+                    value.parse::<u64>().ok().filter(|age| *age > 0).ok_or(
+                        ConfigError::InvalidValue {
+                            name: "IOTA_OFFLINE_AUTH_MAX_AGE_SECONDS",
+                            kind: "positive number of seconds",
+                        },
+                    )
+                })
+                .transpose()?
+                .map(Duration::from_secs),
+        };
         let rho_max_connections =
             parse_positive_or_default("RHO_MAX_CONNECTIONS", DEFAULT_RHO_MAX_CONNECTIONS)?;
         let rho_max_anonymous_connections = parse_positive_or_default(
@@ -130,6 +175,19 @@ impl Config {
             omega_sync_timeout,
             omega_sync_retries,
             omega_transport,
+            offline_auth,
+            call_limits: CallLimits {
+                max_members_per_call: parse_positive_or_default("CALL_MAX_MEMBERS", 64)?,
+                max_pending_invites_per_call: parse_positive_or_default(
+                    "CALL_MAX_PENDING_INVITES",
+                    64,
+                )?,
+                max_calls_per_user: parse_positive_or_default("CALL_MAX_CALLS_PER_USER", 16)?,
+                invite_ttl: Duration::from_secs(parse_positive_or_default(
+                    "CALL_INVITE_TTL_SECONDS",
+                    3600,
+                )?),
+            },
             rho_max_connections,
             rho_max_anonymous_connections,
             rho_max_anonymous_connections_per_ip,

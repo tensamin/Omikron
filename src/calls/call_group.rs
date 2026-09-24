@@ -1,12 +1,18 @@
 use crate::{
+    calls::call_manager::CallServiceError,
     calls::{call_util::LiveKitService, caller::Caller, error::CallError},
+    config::CallLimits,
     omega::omega_connection::OmegaConnection,
     rho::connection::OptionalDataValueCompat,
     util::data_type_id,
 };
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 use serde::Serialize;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -15,6 +21,7 @@ pub struct CallGroup {
     pub owner_omikron_id: u64,
     pub state: RwLock<CallGroupState>,
     livekit: Arc<LiveKitService>,
+    limits: CallLimits,
 }
 pub struct CallGroupState {
     pub members: BTreeMap<u64, CallMember>,
@@ -34,6 +41,7 @@ pub struct CallMember {
 pub struct PendingCallInvite {
     pub inviter_id: u64,
     pub secret: CallSecretEnvelope,
+    pub created_at: Instant,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum CallRole {
@@ -114,6 +122,7 @@ impl CallGroup {
         creator: u64,
         secret: CallSecretEnvelope,
         livekit: Arc<LiveKitService>,
+        limits: CallLimits,
     ) -> Self {
         let mut members = BTreeMap::new();
         members.insert(
@@ -136,6 +145,7 @@ impl CallGroup {
                 ending: false,
             }),
             livekit,
+            limits,
         }
     }
     pub async fn member(&self, id: u64) -> Option<CallMember> {
@@ -143,7 +153,10 @@ impl CallGroup {
     }
     pub async fn is_related(&self, id: u64) -> bool {
         let s = self.state.read().await;
-        s.members.contains_key(&id) || s.pending_invites.contains_key(&id)
+        s.members.contains_key(&id)
+            || s.pending_invites
+                .get(&id)
+                .is_some_and(|invite| invite.created_at.elapsed() <= self.limits.invite_ttl)
     }
     pub async fn member_ids(&self) -> Vec<u64> {
         self.state.read().await.members.keys().copied().collect()
@@ -153,7 +166,12 @@ impl CallGroup {
         s.members
             .get(&id)
             .and_then(|m| m.secret.clone())
-            .or_else(|| s.pending_invites.get(&id).map(|i| i.secret.clone()))
+            .or_else(|| {
+                s.pending_invites
+                    .get(&id)
+                    .filter(|invite| invite.created_at.elapsed() <= self.limits.invite_ttl)
+                    .map(|i| i.secret.clone())
+            })
     }
     pub async fn get_caller(&self, id: u64) -> Option<Caller> {
         let m = self.member(id).await?;
@@ -172,16 +190,34 @@ impl CallGroup {
     pub async fn get_short_link(&self) -> Option<String> {
         self.state.read().await.short_link.clone()
     }
-    pub async fn invite(&self, from: u64, to: u64, secret: CallSecretEnvelope) -> Result<(), ()> {
-        let mut s = self.state.write().await;
-        if s.ending || !s.members.contains_key(&from) || from == to {
-            return Err(());
+    pub async fn invite(
+        &self,
+        from: u64,
+        to: u64,
+        secret: CallSecretEnvelope,
+    ) -> Result<(), CallServiceError> {
+        let mut state = self.state.write().await;
+        state
+            .pending_invites
+            .retain(|_, invite| invite.created_at.elapsed() <= self.limits.invite_ttl);
+        if state.ending
+            || !state.members.contains_key(&from)
+            || from == to
+            || state.members.contains_key(&to)
+        {
+            return Err(CallServiceError::InvalidRequest);
         }
-        s.pending_invites.insert(
+        if !state.pending_invites.contains_key(&to)
+            && state.pending_invites.len() >= self.limits.max_pending_invites_per_call
+        {
+            return Err(CallServiceError::ResourceLimit);
+        }
+        state.pending_invites.insert(
             to,
             PendingCallInvite {
                 inviter_id: from,
                 secret,
+                created_at: Instant::now(),
             },
         );
         Ok(())
@@ -189,9 +225,20 @@ impl CallGroup {
     pub async fn rollback_invite(&self, id: u64) {
         self.state.write().await.pending_invites.remove(&id);
     }
-    pub async fn accept_invite(&self, id: u64) -> Option<CallMember> {
+    pub async fn accept_invite(&self, id: u64) -> Result<CallMember, CallServiceError> {
         let mut s = self.state.write().await;
-        let i = s.pending_invites.remove(&id)?;
+        s.pending_invites
+            .retain(|_, invite| invite.created_at.elapsed() <= self.limits.invite_ttl);
+        if s.ending {
+            return Err(CallServiceError::InvalidRequest);
+        }
+        if s.members.len() >= self.limits.max_members_per_call {
+            return Err(CallServiceError::ResourceLimit);
+        }
+        let i = s
+            .pending_invites
+            .remove(&id)
+            .ok_or(CallServiceError::NotAuthorized)?;
         let m = CallMember {
             user_id: id,
             role: CallRole::Member,
@@ -199,7 +246,7 @@ impl CallGroup {
             secret: Some(i.secret),
         };
         s.members.insert(id, m.clone());
-        Some(m)
+        Ok(m)
     }
     pub async fn revoke(&self, id: u64) -> Option<CallMember> {
         self.state.write().await.members.remove(&id)
@@ -283,6 +330,44 @@ impl CallGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expired_invite_cannot_join_or_expose_secret() {
+        let secret = CallSecretEnvelope {
+            secret_id: "test".into(),
+            version_number: 1,
+            encrypted_secret: vec![1],
+            kem_ciphertext: vec![2],
+            wrapping_scheme: "test".into(),
+        };
+        let limits = CallLimits {
+            max_members_per_call: 2,
+            max_pending_invites_per_call: 1,
+            max_calls_per_user: 1,
+            invite_ttl: Duration::from_millis(1),
+        };
+        let group = CallGroup::new_with_service(
+            Uuid::new_v4(),
+            1,
+            1,
+            secret.clone(),
+            Arc::new(LiveKitService::new(None)),
+            limits,
+        );
+        group.invite(1, 2, secret.clone()).await.unwrap();
+        assert!(matches!(
+            group.invite(1, 3, secret.clone()).await,
+            Err(CallServiceError::ResourceLimit)
+        ));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(!group.is_related(2).await);
+        assert!(group.get_secret_for_user(2).await.is_none());
+        assert!(matches!(
+            group.accept_invite(2).await,
+            Err(CallServiceError::NotAuthorized)
+        ));
+        group.invite(1, 3, secret).await.unwrap();
+    }
 
     #[test]
     fn parses_creator_secret_with_unsigned_version_number() {

@@ -10,6 +10,34 @@ use mtp::files::{
     FileError, load_keyring_raw, load_public_key_bundle, save_keyring_raw, save_public_key_bundle,
 };
 
+#[cfg(unix)]
+fn verify_private_keyring(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "keyring must be a regular owner-only file owned by the service user",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_keyring(_: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "keyring permissions cannot be verified on this platform",
+    ))
+}
+
 pub const KEYRING_PATH: &str = "./omikron.mk";
 pub const PUBLIC_KEY_PATH: &str = "./omikron.mpkb";
 
@@ -22,6 +50,12 @@ pub fn load_or_create_keyring(
     let keyring_path = keyring_path.as_ref();
     let public_key_path = public_key_path.as_ref();
 
+    verify_private_keyring(keyring_path).map_err(|error| {
+        format!(
+            "unable to load existing Omikron identity from {}: {error}",
+            keyring_path.display()
+        )
+    })?;
     let keyring = match load_keyring_raw(keyring_path) {
         Ok(keyring) => keyring,
         Err(FileError::Io(error)) if error.kind() == ErrorKind::NotFound => {

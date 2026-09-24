@@ -24,6 +24,18 @@ impl RhoManager {
         self.users.get(&user_id).map(|entry| entry.value().clone())
     }
 
+    pub fn get_for_user_on_iota(
+        &self,
+        user_id: i64,
+        expected_iota_id: u64,
+    ) -> Option<Arc<RhoConnection>> {
+        let rho = self
+            .users
+            .get(&user_id)
+            .map(|entry| entry.value().clone())?;
+        (rho.iota_id() == expected_iota_id).then_some(rho)
+    }
+
     #[allow(dead_code)]
     pub async fn contains_iota(&self, iota_id: i64) -> bool {
         self.connections.contains_key(&iota_id)

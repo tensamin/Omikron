@@ -87,8 +87,12 @@ impl RhoConnection {
         rho_connection
     }
 
-    pub async fn get_iota_id(&self) -> u64 {
+    pub fn iota_id(&self) -> u64 {
         self.iota_connection.iota_id
+    }
+
+    pub async fn get_iota_id(&self) -> u64 {
+        self.iota_id()
     }
 
     pub async fn get_user_ids(&self) -> Vec<i64> {

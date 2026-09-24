@@ -2050,6 +2050,7 @@ dependencies = [
  "dashmap",
  "dotenv",
  "http",
+ "libc",
  "livekit-api",
  "livekit-protocol",
  "log",

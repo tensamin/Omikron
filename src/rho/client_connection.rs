@@ -5,6 +5,7 @@ use crate::data::user::UserStatus;
 use crate::omega::omega_connection::{AuthIdentity, AuthIdentityKind, InitialPresenceError};
 use crate::rho::connection::{
     GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
+    positive_data_i64,
 };
 use crate::rho::relay_router::{self, RelaySource};
 use crate::rho::rho_connection::RhoConnection;
@@ -112,6 +113,7 @@ fn call_error_type(error: &CallServiceError) -> CommunicationType {
         }
         CallServiceError::InvalidUser => CommunicationType::ErrorInvalidUserId,
         CallServiceError::InvalidRequest => CommunicationType::ErrorInvalidData,
+        CallServiceError::ResourceLimit => CommunicationType::ErrorInternal,
         CallServiceError::DeliveryFailed => CommunicationType::ErrorNotFound,
         CallServiceError::LiveKit(_) => CommunicationType::ErrorInternal,
     }
@@ -607,8 +609,13 @@ impl ClientConnection {
             }
             if cv.is_type(CommunicationType::GetUserData) {
                 if let Some(anonymous) = {
-                    if let Some(user_id) = cv.get_data(DataType::UserId).as_signed_number() {
-                        anonymous_manager::get_anonymous_user(user_id as u64).await
+                    if let Some(user_id) = cv
+                        .get_data(DataType::UserId)
+                        .as_signed_number()
+                        .and_then(|id| u64::try_from(id).ok())
+                        .filter(|id| *id > 0)
+                    {
+                        anonymous_manager::get_anonymous_user(user_id).await
                     } else if let Some(username) = cv.get_data(DataType::Username).as_str() {
                         anonymous_manager::get_anonymous_user_by_name(username.to_string()).await
                     } else {
@@ -1032,12 +1039,11 @@ impl ClientConnection {
         let Ok(message_id) = cv.require_id() else {
             return;
         };
-        let receiver_id: i128 = cv.get_data(DataType::ReceiverId).as_number().unwrap_or(0);
-        if receiver_id == 0 {
+        let Ok(receiver_id) = positive_data_i64(&cv, DataType::ReceiverId, "receiver_id") else {
             self.send_error_response(message_id, CommunicationType::ErrorNoUserId)
                 .await;
             return;
-        }
+        };
 
         let call_id = match cv.get_data(DataType::CallId) {
             Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
@@ -1065,7 +1071,7 @@ impl ClientConnection {
         };
         // Resolve the recipient before creating call state. Without the
         // recipient Iota, policy cannot be evaluated and delivery must fail.
-        let target_rho = match self.state.rho.get_for_user(receiver_id as i64).await {
+        let target_rho = match self.state.rho.get_for_user(receiver_id).await {
             Some(rho) => rho,
             None => {
                 self.send_error_response(message_id, CommunicationType::ErrorNoIota)
@@ -1080,7 +1086,10 @@ impl ClientConnection {
                 DataType::SenderId,
                 DataValue::SignedNumber(sender_id.into()),
             )
-            .add_typed_default(DataType::ReceiverId, DataValue::SignedNumber(receiver_id));
+            .add_typed_default(
+                DataType::ReceiverId,
+                DataValue::SignedNumber(receiver_id.into()),
+            );
         let policy_response = target_rho
             .get_iota_connection()
             .clone()
@@ -1108,7 +1117,12 @@ impl ClientConnection {
         let invited = self
             .state
             .call_manager
-            .add_invite(call_id, self.user_id, receiver_id as u64, secret.clone())
+            .add_invite(
+                call_id,
+                self.user_id,
+                receiver_id.unsigned_abs(),
+                secret.clone(),
+            )
             .await;
         if let Err(error) = invited {
             self.send_error_response(message_id, call_error_type(&error))
@@ -1119,7 +1133,7 @@ impl ClientConnection {
         if !self
             .state
             .call_manager
-            .should_forward_invite(self.user_id, receiver_id as u64)
+            .should_forward_invite(self.user_id, receiver_id.unsigned_abs())
         {
             let response = CommunicationValue::new(CommunicationType::Success).with_id(message_id);
             self.send_message(&response).await;
@@ -1128,7 +1142,7 @@ impl ClientConnection {
 
         // Create and send call distribution message
         let forward = CommunicationValue::new(CommunicationType::CallInvite)
-            .with_receiver(receiver_id as u64)
+            .with_receiver(receiver_id.unsigned_abs())
             .with_sender(sender_id as u64)
             .add_typed_default(DataType::CallSecret, secret.to_data_value())
             .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
@@ -1146,13 +1160,13 @@ impl ClientConnection {
             );
 
         if target_rho
-            .send_to_local_user(receiver_id as u64, &forward)
+            .send_to_local_user(receiver_id.unsigned_abs(), &forward)
             .await
             .is_err()
         {
             self.state
                 .call_manager
-                .rollback_invite(call_id, receiver_id as u64)
+                .rollback_invite(call_id, receiver_id.unsigned_abs())
                 .await;
             self.send_error_response(message_id, CommunicationType::ErrorNotFound)
                 .await;
@@ -1299,24 +1313,18 @@ impl ClientConnection {
                 .await;
             return;
         };
-        let user_id = cv
-            .get_data(DataType::UserId)
-            .as_signed_number()
-            .unwrap_or(0);
-        let untill = cv
-            .get_data(DataType::Untill)
-            .as_signed_number()
-            .unwrap_or(0);
-
-        if user_id <= 0 || untill <= 0 {
+        let (Ok(user_id), Ok(untill)) = (
+            positive_data_i64(&cv, DataType::UserId, "user_id"),
+            positive_data_i64(&cv, DataType::Untill, "untill"),
+        ) else {
             self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
                 .await;
             return;
-        }
+        };
         match self
             .state
             .call_manager
-            .timeout_user(call_id, self.user_id, user_id as u64, untill as i64)
+            .timeout_user(call_id, self.user_id, user_id.unsigned_abs(), untill)
             .await
         {
             Ok(()) => {
@@ -1341,20 +1349,15 @@ impl ClientConnection {
                 .await;
             return;
         };
-        let user_id = cv
-            .get_data(DataType::UserId)
-            .as_signed_number()
-            .unwrap_or(0);
-
-        if user_id <= 0 {
+        let Ok(user_id) = positive_data_i64(&cv, DataType::UserId, "user_id") else {
             self.send_error_response(message_id, CommunicationType::ErrorInvalidUserId)
                 .await;
             return;
-        }
+        };
         match self
             .state
             .call_manager
-            .disconnect_user(call_id, self.user_id, user_id as u64)
+            .disconnect_user(call_id, self.user_id, user_id.unsigned_abs())
             .await
         {
             Ok(()) => {

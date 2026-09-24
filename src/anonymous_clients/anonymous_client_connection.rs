@@ -10,6 +10,7 @@ use crate::app_state::AppState;
 use crate::calls::call_group::call_invite_secret_from_cv;
 use crate::rho::connection::{
     GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
+    positive_data_i64,
 };
 use crate::util::data_type_id;
 use crate::util::logger::PrintType;
@@ -297,8 +298,13 @@ impl AnonymousClientConnection {
 
             if cv.is_type(CommunicationType::GetUserData) {
                 if let Some(anonymous) = {
-                    if let Some(user_id) = cv.get_data(DataType::UserId).as_signed_number() {
-                        anonymous_manager::get_anonymous_user(user_id as u64).await
+                    if let Some(user_id) = cv
+                        .get_data(DataType::UserId)
+                        .as_signed_number()
+                        .and_then(|id| u64::try_from(id).ok())
+                        .filter(|id| *id > 0)
+                    {
+                        anonymous_manager::get_anonymous_user(user_id).await
                     } else if let Some(username) = cv.get_data(DataType::Username).as_str() {
                         anonymous_manager::get_anonymous_user_by_name(username.to_string()).await
                     } else {
@@ -362,12 +368,11 @@ impl AnonymousClientConnection {
         let Ok(message_id) = cv.require_id() else {
             return;
         };
-        let receiver_id: i64 = cv.get_data(DataType::ReceiverId).as_number().unwrap_or(0) as i64;
-        if receiver_id == 0 {
+        let Ok(receiver_id) = positive_data_i64(&cv, DataType::ReceiverId, "receiver_id") else {
             self.send_error_response(message_id, CommunicationType::ErrorNoUserId)
                 .await;
             return;
-        }
+        };
 
         let call_id = match cv.get_data(DataType::CallId) {
             Some(DataValue::Str(id_str)) => match Uuid::parse_str(id_str) {
@@ -396,7 +401,12 @@ impl AnonymousClientConnection {
         let invited = self
             .state
             .call_manager
-            .add_invite(call_id, self.user_id, receiver_id as u64, secret.clone())
+            .add_invite(
+                call_id,
+                self.user_id,
+                receiver_id.unsigned_abs(),
+                secret.clone(),
+            )
             .await;
         if invited.is_err() {
             self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
@@ -413,7 +423,7 @@ impl AnonymousClientConnection {
 
                 // User is offline - send push notification for call invite
                 let push_cv = CommunicationValue::new(CommunicationType::PushNotification)
-                    .with_receiver(receiver_id as u64)
+                    .with_receiver(receiver_id.unsigned_abs())
                     .add_typed_default(
                         DataType::SenderId,
                         DataValue::SignedNumber(sender_id.into()),
@@ -446,7 +456,7 @@ impl AnonymousClientConnection {
 
         // Create and send call distribution message
         let forward = CommunicationValue::new(CommunicationType::CallInvite)
-            .with_receiver(receiver_id as u64)
+            .with_receiver(receiver_id.unsigned_abs())
             .with_sender(sender_id)
             .add_typed_default(DataType::CallSecret, secret.to_data_value())
             .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
@@ -525,14 +535,14 @@ impl AnonymousClientConnection {
                 .await;
             return;
         };
-        let user_id = cv
-            .get_data(DataType::UserId)
-            .as_signed_number()
-            .unwrap_or(0);
-        let untill = cv
-            .get_data(DataType::Untill)
-            .as_signed_number()
-            .unwrap_or(0);
+        let (Ok(user_id), Ok(untill)) = (
+            positive_data_i64(&cv, DataType::UserId, "user_id"),
+            positive_data_i64(&cv, DataType::Untill, "untill"),
+        ) else {
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                .await;
+            return;
+        };
 
         let Some(call) = self.state.call_manager.get_call(call_id).await else {
             self.send_error_response(message_id, CommunicationType::ErrorNotFound)
@@ -545,8 +555,8 @@ impl AnonymousClientConnection {
             return;
         };
         if caller.has_admin() {
-            if let Some(target) = call.get_caller(user_id as u64).await {
-                target.set_timeout(untill as i64).await;
+            if let Some(target) = call.get_caller(user_id.unsigned_abs()).await {
+                target.set_timeout(untill).await;
             }
         }
     }
@@ -560,10 +570,11 @@ impl AnonymousClientConnection {
                 .await;
             return;
         };
-        let user_id = cv
-            .get_data(DataType::UserId)
-            .as_signed_number()
-            .unwrap_or(0);
+        let Ok(user_id) = positive_data_i64(&cv, DataType::UserId, "user_id") else {
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidUserId)
+                .await;
+            return;
+        };
 
         let Some(call) = self.state.call_manager.get_call(call_id).await else {
             self.send_error_response(message_id, CommunicationType::ErrorNotFound)
@@ -576,7 +587,7 @@ impl AnonymousClientConnection {
             return;
         };
         if caller.has_admin() {
-            call.remove_caller(user_id as u64).await;
+            call.remove_caller(user_id.unsigned_abs()).await;
         }
     }
 

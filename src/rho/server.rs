@@ -104,11 +104,33 @@ pub async fn get_by_connector_id(
     }
 
     let bytes = BASE64_STD
-        .decode(response.get_data(DataType::PublicKey).as_str()?)
+        .decode(authenticated_key_response(&response, identity)?)
         .ok()?;
     let public_key = PublicKeyBundle::from_bytes(&bytes).ok()?;
     omega.cache_authenticated_key(identity, public_key.clone());
     Some(public_key)
+}
+
+fn authenticated_key_response(
+    response: &CommunicationValue,
+    identity: AuthIdentity,
+) -> Option<&str> {
+    let (expected_type, expected_field) = match identity.kind {
+        AuthIdentityKind::Iota => (CommunicationType::GetIotaData, DataType::IotaId),
+        AuthIdentityKind::Client => (CommunicationType::GetUserData, DataType::UserId),
+    };
+    if !response.is_type(expected_type)
+        || response
+            .get_data(expected_field)
+            .as_number()
+            .and_then(|id| u64::try_from(id).ok())
+            != Some(identity.id)
+    {
+        return None;
+    }
+    response
+        .get_data(DataType::PublicKey)
+        .and_then(DataValue::as_str)
 }
 
 fn authentication_identity(client_id: u64, description: Option<&str>) -> Option<AuthIdentity> {
@@ -361,8 +383,8 @@ pub async fn start(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthIdentity, AuthIdentityKind, HttpResponse, authentication_identity,
-        public_key_lookup_request, rho_policy, web_config, with_cors,
+        AuthIdentity, AuthIdentityKind, HttpResponse, authenticated_key_response,
+        authentication_identity, public_key_lookup_request, rho_policy, web_config, with_cors,
     };
     use mtp::codec::{CommunicationType, DataType, DataValue};
     use std::time::Duration;
@@ -413,6 +435,42 @@ mod tests {
             authentication_identity(42, Some("iota"))
         );
         assert_eq!(authentication_identity(42, Some("anonymous")), None);
+    }
+
+    #[test]
+    fn authentication_caches_only_matching_omega_identity_responses() {
+        for kind in [AuthIdentityKind::Iota, AuthIdentityKind::Client] {
+            let identity = AuthIdentity { kind, id: 42 };
+            let (expected_type, expected_field, wrong_type) = match kind {
+                AuthIdentityKind::Iota => (
+                    CommunicationType::GetIotaData,
+                    DataType::IotaId,
+                    CommunicationType::GetUserData,
+                ),
+                AuthIdentityKind::Client => (
+                    CommunicationType::GetUserData,
+                    DataType::UserId,
+                    CommunicationType::GetIotaData,
+                ),
+            };
+            let frame = |ty, id| {
+                mtp::codec::CommunicationValue::new(ty)
+                    .add_typed_default(expected_field, DataValue::SignedNumber(id))
+                    .add_typed_default(DataType::PublicKey, DataValue::Str("key".into()))
+            };
+            assert_eq!(
+                authenticated_key_response(&frame(expected_type, 42), identity),
+                Some("key")
+            );
+            assert_eq!(
+                authenticated_key_response(&frame(wrong_type, 42), identity),
+                None
+            );
+            assert_eq!(
+                authenticated_key_response(&frame(expected_type, 43), identity),
+                None
+            );
+        }
     }
 
     #[test]

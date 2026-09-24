@@ -1,6 +1,6 @@
 use super::capabilities::PeerCapabilities;
 use crate::{
-    config::{Config, TransportConfig},
+    config::{Config, OfflineAuthPolicy, TransportConfig},
     log_cv_in, log_cv_out, log_err, log_in, log_out,
     rho::connection::{OptionalDataValueCompat, RequiredMtpFields},
     rho::relay_router,
@@ -45,8 +45,6 @@ const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_REQUESTS: usize = 128;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
-// ponytail: 24-hour offline auth ceiling; make configurable when deployments need a shorter policy.
-const MAX_OFFLINE_AUTH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AuthIdentityKind {
@@ -58,6 +56,21 @@ pub enum AuthIdentityKind {
 pub struct AuthIdentity {
     pub kind: AuthIdentityKind,
     pub id: u64,
+}
+
+#[cfg(unix)]
+fn authenticated_cache_file_trusted(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_file()
+            && metadata.mode() & 0o077 == 0
+            && metadata.uid() == unsafe { libc::geteuid() }
+    })
+}
+
+#[cfg(not(unix))]
+fn authenticated_cache_file_trusted(_: &std::path::Path) -> bool {
+    false
 }
 
 fn authenticated_key_path(identity: AuthIdentity) -> std::path::PathBuf {
@@ -82,9 +95,9 @@ struct CachedAuthenticatedKey {
     cached_at: SystemTime,
 }
 
-fn cached_at_is_fresh(now: SystemTime, cached_at: SystemTime) -> bool {
+fn cached_at_is_fresh(now: SystemTime, cached_at: SystemTime, max_age: Duration) -> bool {
     now.duration_since(cached_at)
-        .is_ok_and(|age| age <= MAX_OFFLINE_AUTH_AGE)
+        .is_ok_and(|age| age <= max_age)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +326,7 @@ pub struct OmegaConnection {
     sync_timeout: Duration,
     sync_retries: u32,
     transport_config: TransportConfig,
+    offline_auth: OfflineAuthPolicy,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
     // Track if we should reconnect on close
@@ -414,6 +428,7 @@ impl OmegaConnection {
             sync_timeout: config.omega_sync_timeout,
             sync_retries: config.omega_sync_retries,
             transport_config: config.omega_transport.clone(),
+            offline_auth: config.offline_auth.clone(),
             connection_id: Uuid::new_v4(),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
             reconnect_on_close: Arc::new(RwLock::new(true)),
@@ -1151,20 +1166,29 @@ impl OmegaConnection {
         &self,
         identity: AuthIdentity,
     ) -> Option<mtp::crypto::PublicKeyBundle> {
+        let max_age = match identity.kind {
+            AuthIdentityKind::Client => Some(self.offline_auth.client_max_age),
+            AuthIdentityKind::Iota => self.offline_auth.iota_max_age,
+        }?;
         if let Some(key) = self.authenticated_key_cache.get(&identity) {
-            if cached_at_is_fresh(SystemTime::now(), key.cached_at) {
+            if cached_at_is_fresh(SystemTime::now(), key.cached_at, max_age) {
                 return Some(key.public_key.clone());
             }
         }
         self.authenticated_key_cache.remove(&identity);
 
+        if !authenticated_cache_file_trusted(&authenticated_key_path(identity))
+            || !authenticated_cache_file_trusted(&authenticated_key_timestamp_path(identity))
+        {
+            return None;
+        }
         let cached_at = std::fs::read_to_string(authenticated_key_timestamp_path(identity))
             .ok()?
             .trim()
             .parse::<u64>()
             .ok()
             .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))?;
-        if !cached_at_is_fresh(SystemTime::now(), cached_at) {
+        if !cached_at_is_fresh(SystemTime::now(), cached_at, max_age) {
             self.invalidate_authenticated_key(identity);
             return None;
         }
@@ -1205,6 +1229,13 @@ impl OmegaConnection {
             );
             return;
         }
+        #[cfg(unix)]
+        if std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .is_err()
+        {
+            self.invalidate_authenticated_key(identity);
+            return;
+        }
         let cached_at = SystemTime::now();
         let timestamp = match cached_at.duration_since(UNIX_EPOCH) {
             Ok(timestamp) => timestamp.as_secs().to_string(),
@@ -1226,6 +1257,16 @@ impl OmegaConnection {
                 "Persist authenticated key cache timestamp failed: {}",
                 error
             );
+            self.invalidate_authenticated_key(identity);
+            return;
+        }
+        #[cfg(unix)]
+        if std::fs::set_permissions(
+            authenticated_key_timestamp_path(identity),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .is_err()
+        {
             self.invalidate_authenticated_key(identity);
             return;
         }
@@ -1840,7 +1881,7 @@ impl OmegaConnection {
 mod tests {
     use super::{
         AuthIdentity, AuthIdentityKind, CachedAuthenticatedKey, ConnectionOutcome,
-        MAX_OFFLINE_AUTH_AGE, MAX_RECONNECT_DELAY, PeerCapabilities, RECONNECT_DELAY, WaitingTask,
+        MAX_RECONNECT_DELAY, PeerCapabilities, RECONNECT_DELAY, WaitingTask,
         allocate_omega_request_id, authenticated_key_path, cached_at_is_fresh,
         client_changed_target, complete_waiting_task, iota_activation_snapshot, iota_user_snapshot,
         omega_transport_policy, parse_omega_capability_response, reconnect_base_after_outcome,
@@ -1965,12 +2006,18 @@ mod tests {
     #[test]
     fn authenticated_key_cache_rejects_expired_and_future_timestamps() {
         let now = SystemTime::now();
-        assert!(cached_at_is_fresh(now, now));
+        let max_age = Duration::from_secs(24 * 60 * 60);
+        assert!(cached_at_is_fresh(now, now, max_age));
         assert!(!cached_at_is_fresh(
             now,
-            now - MAX_OFFLINE_AUTH_AGE - Duration::from_secs(1)
+            now - max_age - Duration::from_secs(1),
+            max_age
         ));
-        assert!(!cached_at_is_fresh(now, now + Duration::from_secs(1)));
+        assert!(!cached_at_is_fresh(
+            now,
+            now + Duration::from_secs(1),
+            max_age
+        ));
     }
 
     #[test]

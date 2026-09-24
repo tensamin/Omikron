@@ -3,6 +3,7 @@ use crate::calls::{
     call_util::LiveKitService,
     error::CallError,
 };
+use crate::config::CallLimits;
 use dashmap::DashMap;
 use std::{
     sync::Arc,
@@ -22,6 +23,8 @@ pub enum CallServiceError {
     InvalidUser,
     #[error("invalid request")]
     InvalidRequest,
+    #[error("resource limit reached")]
+    ResourceLimit,
     #[error("delivery failed")]
     DeliveryFailed,
     #[error(transparent)]
@@ -32,6 +35,7 @@ pub struct CallManager {
     creation_locks: DashMap<Uuid, Arc<Mutex<()>>>,
     pub livekit: Arc<LiveKitService>,
     pub owner_omikron_id: u64,
+    limits: CallLimits,
 }
 impl Default for CallManager {
     fn default() -> Self {
@@ -43,11 +47,15 @@ impl CallManager {
         Self::new_with_owner(livekit, 0)
     }
     pub fn new_with_owner(livekit: Arc<LiveKitService>, owner: u64) -> Self {
+        Self::new_with_limits(livekit, owner, CallLimits::default())
+    }
+    pub fn new_with_limits(livekit: Arc<LiveKitService>, owner: u64, limits: CallLimits) -> Self {
         Self {
             groups: DashMap::new(),
             creation_locks: DashMap::new(),
             livekit,
             owner_omikron_id: owner,
+            limits,
         }
     }
     pub async fn get_call(&self, id: Uuid) -> Option<Arc<CallGroup>> {
@@ -87,28 +95,55 @@ impl CallManager {
             return self.token_existing(g, user).await;
         }
         let secret = creator.ok_or(CallServiceError::NotFound)?;
+        if self.get_call_groups(user).await.len() >= self.limits.max_calls_per_user {
+            return Err(CallServiceError::ResourceLimit);
+        }
         let lock = self
             .creation_locks
             .entry(id)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
-        let _guard = lock.lock().await;
-        if let Some(g) = self.get_call(id).await {
-            return self.token_existing(g, user).await;
-        }
+        let result = {
+            let _guard = lock.lock().await;
+            if let Some(group) = self.get_call(id).await {
+                self.token_existing(group, user).await
+            } else {
+                self.create_call(user, id, secret).await
+            }
+        };
+        self.creation_locks.remove_if(&id, |_, current| {
+            Arc::ptr_eq(current, &lock) && Arc::strong_count(current) == 2
+        });
+        result
+    }
+    async fn create_call(
+        &self,
+        user: u64,
+        id: Uuid,
+        secret: CallSecretEnvelope,
+    ) -> Result<String, CallServiceError> {
         self.livekit.create_room(id).await?;
-        let g = Arc::new(CallGroup::new_with_service(
+        let group = Arc::new(CallGroup::new_with_service(
             id,
             self.owner_omikron_id,
             user,
             secret,
             self.livekit.clone(),
+            self.limits.clone(),
         ));
-        g.update_metadata().await?;
-        self.groups.insert(id, g);
-        self.livekit
-            .create_token(user, id, true)
-            .map_err(Into::into)
+        if let Err(error) = group.update_metadata().await {
+            let _ = self.livekit.delete_room(id).await;
+            return Err(error.into());
+        }
+        let token = match self.livekit.create_token(user, id, true) {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = self.livekit.delete_room(id).await;
+                return Err(error.into());
+            }
+        };
+        self.groups.insert(id, group);
+        Ok(token)
     }
     async fn token_existing(
         &self,
@@ -125,9 +160,7 @@ impl CallManager {
                     return Err(CallServiceError::NotAuthorized);
                 }
                 let token = self.livekit.create_token(user, g.call_id, false)?;
-                g.accept_invite(user)
-                    .await
-                    .ok_or(CallServiceError::NotAuthorized)?;
+                g.accept_invite(user).await?;
                 return Ok(token);
             }
         };
@@ -161,9 +194,10 @@ impl CallManager {
         {
             return Err(CallServiceError::NotAuthorized);
         }
-        g.invite(from, to, secret)
-            .await
-            .map_err(|_| CallServiceError::InvalidRequest)
+        if self.get_call_groups(to).await.len() >= self.limits.max_calls_per_user {
+            return Err(CallServiceError::ResourceLimit);
+        }
+        g.invite(from, to, secret).await
     }
     pub async fn rollback_invite(&self, id: Uuid, user: u64) {
         if let Some(g) = self.get_call(id).await {
@@ -250,6 +284,20 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn failed_room_creation_does_not_retain_creation_lock() {
+        let manager = CallManager::default();
+        let id = Uuid::new_v4();
+        assert!(
+            manager
+                .get_or_create_token(1, id, Some(secret()))
+                .await
+                .is_err()
+        );
+        assert!(manager.creation_locks.is_empty());
+        assert!(manager.groups.is_empty());
+    }
+
+    #[tokio::test]
     async fn missing_call_without_creator_secret_is_not_found() {
         assert!(matches!(
             CallManager::default()
@@ -276,6 +324,7 @@ mod tests {
             1,
             secret(),
             manager.livekit.clone(),
+            CallLimits::default(),
         ));
         manager.groups.insert(id, group.clone());
         manager.add_invite(id, 1, 2, secret()).await.unwrap();
@@ -295,6 +344,7 @@ mod tests {
                 1,
                 secret(),
                 manager.livekit.clone(),
+                CallLimits::default(),
             )),
         );
         assert!(matches!(

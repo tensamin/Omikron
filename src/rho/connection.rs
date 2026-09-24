@@ -52,6 +52,32 @@ impl RequiredMtpFields for CommunicationValue {
     }
 }
 
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum ProtocolValueError {
+    #[error("missing {0}")]
+    Missing(&'static str),
+    #[error("invalid {0}")]
+    Invalid(&'static str),
+    #[error("{0} is outside the supported range")]
+    OutOfRange(&'static str),
+}
+
+pub fn positive_data_i64(
+    value: &CommunicationValue,
+    data_type: DataType,
+    field: &'static str,
+) -> Result<i64, ProtocolValueError> {
+    let raw = value
+        .get_data(data_type)
+        .as_number()
+        .ok_or(ProtocolValueError::Missing(field))?;
+    let id = i64::try_from(raw).map_err(|_| ProtocolValueError::OutOfRange(field))?;
+    if id <= 0 {
+        return Err(ProtocolValueError::Invalid(field));
+    }
+    Ok(id)
+}
+
 pub(crate) trait OptionalDataValueCompat {
     fn as_bool(&self) -> Option<bool>;
     fn as_number(&self) -> Option<i128>;
@@ -85,10 +111,48 @@ impl OptionalDataValueCompat for Option<&DataValue> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionKind, FrameValidationError, RequiredMtpFields, connection_kind};
-    use mtp::codec::{CommunicationType, CommunicationValue};
+    use super::{
+        ConnectionKind, FrameValidationError, ProtocolValueError, RequiredMtpFields,
+        connection_kind, positive_data_i64,
+    };
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
     use mtp::crypto::{Ed25519Signer, SignatureScheme, auth::register_proof_payload};
     use mtp::host::AuthState;
+
+    #[test]
+    fn receiver_id_rejects_missing_negative_zero_and_overflow() {
+        let frame = CommunicationValue::new(CommunicationType::CallInvite);
+        assert_eq!(
+            positive_data_i64(&frame, DataType::ReceiverId, "receiver_id"),
+            Err(ProtocolValueError::Missing("receiver_id"))
+        );
+        for value in [-1, 0] {
+            let frame = frame
+                .clone()
+                .add_typed_default(DataType::ReceiverId, DataValue::SignedNumber(value));
+            assert_eq!(
+                positive_data_i64(&frame, DataType::ReceiverId, "receiver_id"),
+                Err(ProtocolValueError::Invalid("receiver_id"))
+            );
+        }
+        for value in [i128::from(i64::MAX) + 1, i128::from(u64::MAX)] {
+            let frame = frame
+                .clone()
+                .add_typed_default(DataType::ReceiverId, DataValue::SignedNumber(value));
+            assert_eq!(
+                positive_data_i64(&frame, DataType::ReceiverId, "receiver_id"),
+                Err(ProtocolValueError::OutOfRange("receiver_id"))
+            );
+        }
+        let frame = frame.add_typed_default(
+            DataType::ReceiverId,
+            DataValue::SignedNumber(i128::from(i64::MAX)),
+        );
+        assert_eq!(
+            positive_data_i64(&frame, DataType::ReceiverId, "receiver_id"),
+            Ok(i64::MAX)
+        );
+    }
 
     #[test]
     fn required_fields_preserve_missing_field_errors() {

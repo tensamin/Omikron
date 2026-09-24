@@ -147,6 +147,8 @@ pub enum RelayRouteError {
     InvalidClientRoute { expected: u64, actual: u64 },
     #[error("relay destination Iota is not connected to this Omikron")]
     DestinationIotaNotLocal,
+    #[error("source Iota {source_iota_id} cannot deliver to user {user_id}")]
+    UnauthorizedUserRoute { source_iota_id: u64, user_id: u64 },
     #[error("relay destination client is offline")]
     ClientOffline,
     #[error("relay route resolves back to its source Iota")]
@@ -159,6 +161,7 @@ pub enum RelayRouteError {
 
 pub fn error_response_type(error: &RelayRouteError) -> CommunicationType {
     match error {
+        RelayRouteError::UnauthorizedUserRoute { .. } => CommunicationType::ErrorNotAuthenticated,
         RelayRouteError::DestinationIotaNotLocal | RelayRouteError::ClientOffline => {
             CommunicationType::ErrorNoIota
         }
@@ -260,13 +263,14 @@ async fn route_from_iota(
 ) -> Result<CommunicationValue, RelayRouteError> {
     match next_hop {
         RouteTarget::User(user_id) => {
+            let user_id_i64 =
+                i64::try_from(user_id).map_err(|_| RelayRouteError::InvalidRouteTarget(user_id))?;
             let target = rho
-                .get_for_user(
-                    i64::try_from(user_id)
-                        .map_err(|_| RelayRouteError::InvalidRouteTarget(user_id))?,
-                )
-                .await
-                .ok_or(RelayRouteError::ClientOffline)?;
+                .get_for_user_on_iota(user_id_i64, source_iota_id)
+                .ok_or(RelayRouteError::UnauthorizedUserRoute {
+                    source_iota_id,
+                    user_id,
+                })?;
             target
                 .send_relay_to_client(&frame)
                 .await
@@ -550,6 +554,20 @@ mod tests {
             Some("client_offline")
         );
         assert_eq!(response.get_data(DataType::UserId).as_number(), Some(42));
+    }
+
+    #[test]
+    fn unauthorized_user_route_does_not_expose_route_ownership() {
+        let response = relay_route_error_response(
+            4,
+            Some(RouteTarget::User(42)),
+            &RelayRouteError::UnauthorizedUserRoute {
+                source_iota_id: 100,
+                user_id: 42,
+            },
+        );
+        assert!(response.is_type(CommunicationType::ErrorNotAuthenticated));
+        assert!(response.get_data(DataType::UserId).as_number().is_none());
     }
 
     #[test]
