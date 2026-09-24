@@ -59,25 +59,35 @@ pub struct CallSecretEnvelope {
 impl CallSecretEnvelope {
     pub fn from_data_value(v: &DataValue) -> Option<Self> {
         let t = TypeMap::latest();
+        let secret_id = v
+            .get_field(data_type_id(DataType::SecretId, &t))?
+            .as_str()?;
+        let encrypted_secret = v
+            .get_field(data_type_id(DataType::EncryptedSecret, &t))?
+            .as_bytes()?;
+        let kem_ciphertext = v
+            .get_field(data_type_id(DataType::KemCiphertext, &t))?
+            .as_bytes()?;
+        let wrapping_scheme = v
+            .get_field(data_type_id(DataType::WrappingScheme, &t))?
+            .as_str()?;
+        if secret_id.is_empty()
+            || secret_id.len() > 256
+            || encrypted_secret.len() > 44 + 24 + 16
+            || kem_ciphertext.len() > mtp::crypto::HybridKem::ciphertext_len()
+            || wrapping_scheme.len() > "mtp-call-secret-kem-chacha20poly1305-hkdf-sha256-v1".len()
+        {
+            return None;
+        }
         Some(Self {
-            secret_id: v
-                .get_field(data_type_id(DataType::SecretId, &t))?
-                .as_str()?
-                .to_string(),
+            secret_id: secret_id.to_string(),
             version_number: v
                 .get_field(data_type_id(DataType::VersionNumber, &t))?
                 .as_number()
                 .and_then(|n| i64::try_from(n).ok())?,
-            encrypted_secret: v
-                .get_field(data_type_id(DataType::EncryptedSecret, &t))?
-                .as_bytes()?,
-            kem_ciphertext: v
-                .get_field(data_type_id(DataType::KemCiphertext, &t))?
-                .as_bytes()?,
-            wrapping_scheme: v
-                .get_field(data_type_id(DataType::WrappingScheme, &t))?
-                .as_str()?
-                .to_string(),
+            encrypted_secret,
+            kem_ciphertext,
+            wrapping_scheme: wrapping_scheme.to_string(),
         })
     }
     pub fn to_data_value(&self) -> DataValue {

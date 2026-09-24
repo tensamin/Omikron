@@ -75,6 +75,9 @@ pub async fn get_by_connector_id(
     description: Option<String>,
 ) -> Option<PublicKeyBundle> {
     let identity = authentication_identity(client_id, description.as_deref())?;
+    if omega.recently_missing_key(identity) {
+        return None;
+    }
     let request = public_key_lookup_request(omega.omikron_id(), identity);
 
     if !omega.is_ready().await {
@@ -100,6 +103,7 @@ pub async fn get_by_connector_id(
 
     if response.is_type(CommunicationType::ErrorNotFound) {
         omega.invalidate_authenticated_key(identity);
+        omega.cache_missing_key(identity);
         return None;
     }
 

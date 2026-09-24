@@ -337,6 +337,7 @@ pub struct OmegaConnection {
     keyring: mtp::crypto::Keyring,
     rho: Arc<RhoManager>,
     authenticated_key_cache: DashMap<AuthIdentity, CachedAuthenticatedKey>,
+    missing_key_cache: DashMap<AuthIdentity, Instant>,
     waiting_tasks: DashMap<u32, WaitingTask>,
     next_request_id: AtomicU32,
     session_presence: DashMap<(i64, i64), SessionPresenceState>,
@@ -441,6 +442,7 @@ impl OmegaConnection {
             keyring,
             rho,
             authenticated_key_cache: DashMap::new(),
+            missing_key_cache: DashMap::new(),
             waiting_tasks: DashMap::new(),
             next_request_id: AtomicU32::new(1),
             session_presence: DashMap::new(),
@@ -1162,6 +1164,29 @@ impl OmegaConnection {
         self.state.read().await.is_ready()
     }
 
+    pub fn recently_missing_key(&self, identity: AuthIdentity) -> bool {
+        if self
+            .missing_key_cache
+            .get(&identity)
+            .is_some_and(|timestamp| timestamp.elapsed() < Duration::from_secs(5))
+        {
+            return true;
+        }
+        self.missing_key_cache.remove(&identity);
+        false
+    }
+
+    pub fn cache_missing_key(&self, identity: AuthIdentity) {
+        if self.missing_key_cache.len() >= 1024 {
+            self.missing_key_cache
+                .retain(|_, timestamp| timestamp.elapsed() < Duration::from_secs(5));
+            if self.missing_key_cache.len() >= 1024 {
+                self.missing_key_cache.clear();
+            }
+        }
+        self.missing_key_cache.insert(identity, Instant::now());
+    }
+
     pub fn cached_authenticated_key(
         &self,
         identity: AuthIdentity,
@@ -1208,6 +1233,7 @@ impl OmegaConnection {
         identity: AuthIdentity,
         public_key: mtp::crypto::PublicKeyBundle,
     ) {
+        self.missing_key_cache.remove(&identity);
         let path = authenticated_key_path(identity);
         if let Some(parent) = path.parent() {
             if let Err(error) = std::fs::create_dir_all(parent) {

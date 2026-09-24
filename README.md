@@ -27,3 +27,5 @@ Clients may authenticate with a previously verified Omega key for up to 24 hours
 ## Call limits
 
 `CALL_MAX_MEMBERS` and `CALL_MAX_PENDING_INVITES` default to 64 per call. `CALL_MAX_CALLS_PER_USER` defaults to 16, and `CALL_INVITE_TTL_SECONDS` defaults to 3600. Configure limits for available LiveKit capacity. Expired invites cannot grant call tokens or expose call secrets.
+
+Unknown client and Iota IDs are negatively cached for five seconds, with at most 1024 entries. Call-secret envelopes admit at most 256 bytes of secret ID, 84 bytes of encrypted secret, and the MTP hybrid KEM ciphertext length.
