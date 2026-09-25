@@ -205,32 +205,76 @@ pub async fn route_relay(
     frame: CommunicationValue,
 ) -> Result<CommunicationValue, RelayRouteError> {
     let frame = ensure_relay_frame_id(frame);
+    let message_id = frame.id();
     let (next_hop, frame) = match source {
-        RelaySource::Client { iota_id } => prepare_client_frame(frame, iota_id)?,
-        RelaySource::Iota { .. } => prepare_frame(frame)?,
+        RelaySource::Client { iota_id } => prepare_client_frame(frame, iota_id),
+        RelaySource::Iota { .. } => prepare_frame(frame),
+    }
+    .map_err(|error| {
+        crate::log_event!(
+            0,
+            crate::util::logger::PrintType::Omikron,
+            crate::util::logger::LogLevel::Warn,
+            "relay.route_failed",
+            "message_id={:?} source={:?} target=None error={}",
+            message_id,
+            source,
+            error
+        );
+        error
+    })?;
+    if let Err(error) = validate_source_next_hop(source, next_hop) {
+        crate::log_event!(
+            0,
+            crate::util::logger::PrintType::Omikron,
+            crate::util::logger::LogLevel::Warn,
+            "relay.route_failed",
+            "message_id={:?} source={:?} target={:?} error={}",
+            message_id,
+            source,
+            next_hop,
+            error
+        );
+        return Err(error);
     };
-    validate_source_next_hop(source, next_hop)?;
 
-    match source {
-        RelaySource::Client { iota_id } => {
-            let rho = state
-                .rho
-                .get_by_iota(
-                    i64::try_from(iota_id)
-                        .map_err(|_| RelayRouteError::InvalidRouteTarget(iota_id))?,
-                )
-                .await
-                .ok_or(RelayRouteError::DestinationIotaNotLocal)?;
-            let response = rho
-                .await_relay_to_iota(&frame)
-                .await
-                .map_err(RelayRouteError::Send)?;
-            route_response(response)
-        }
-        RelaySource::Iota { iota_id } => {
-            route_from_iota(&state.rho, &state.omega, iota_id, next_hop, frame).await
+    let result = async {
+        match source {
+            RelaySource::Client { iota_id } => {
+                let rho = state
+                    .rho
+                    .get_by_iota(
+                        i64::try_from(iota_id)
+                            .map_err(|_| RelayRouteError::InvalidRouteTarget(iota_id))?,
+                    )
+                    .await
+                    .ok_or(RelayRouteError::DestinationIotaNotLocal)?;
+                let response = rho
+                    .await_relay_to_iota(&frame)
+                    .await
+                    .map_err(RelayRouteError::Send)?;
+                route_response(response)
+            }
+            RelaySource::Iota { iota_id } => {
+                route_from_iota(&state.rho, &state.omega, iota_id, next_hop, frame).await
+            }
         }
     }
+    .await;
+    if let Err(error) = &result {
+        crate::log_event!(
+            0,
+            crate::util::logger::PrintType::Omikron,
+            crate::util::logger::LogLevel::Warn,
+            "relay.route_failed",
+            "message_id={:?} source={:?} target={:?} error={}",
+            message_id,
+            source,
+            next_hop,
+            error
+        );
+    }
+    result
 }
 
 pub async fn route_from_omega(

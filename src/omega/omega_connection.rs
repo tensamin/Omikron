@@ -1015,7 +1015,15 @@ impl OmegaConnection {
         if let Some(sender) = sender_guard.as_ref() {
             // Check if closed before sending
             if sender.is_closed() {
-                log_err!(0, PrintType::Omega, "Cannot send: connection closed");
+                crate::log_event!(
+                    0,
+                    PrintType::Omega,
+                    crate::util::logger::LogLevel::Warn,
+                    "omega.send_failed",
+                    "message_id={:?} message_type={} reason=connection_closed",
+                    cv.id(),
+                    cv.get_type_name().unwrap_or("unknown")
+                );
                 drop(sender_guard);
                 // Trigger reconnection by closing the connection state
                 if let Some(sender) = self.sender.write().await.take() {
@@ -1028,11 +1036,28 @@ impl OmegaConnection {
             drop(sender_guard);
 
             if let Err(e) = sender_clone.send(cv).await {
-                log_err!(0, PrintType::Omega, "Send failed: {}", e);
+                crate::log_event!(
+                    0,
+                    PrintType::Omega,
+                    crate::util::logger::LogLevel::Error,
+                    "omega.send_failed",
+                    "message_id={:?} message_type={} error={}",
+                    cv.id(),
+                    cv.get_type_name().unwrap_or("unknown"),
+                    e
+                );
                 return Err(e.to_string());
             }
         } else {
-            log_err!(0, PrintType::Omega, "Cannot send: not connected");
+            crate::log_event!(
+                0,
+                PrintType::Omega,
+                crate::util::logger::LogLevel::Debug,
+                "omega.send_skipped",
+                "message_id={:?} message_type={} reason=not_connected",
+                cv.id(),
+                cv.get_type_name().unwrap_or("unknown")
+            );
             return Err("not connected".to_string());
         }
         Ok(())

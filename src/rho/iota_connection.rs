@@ -344,22 +344,6 @@ impl IotaConnection {
             {
                 Ok(response) => response.with_id(message_id),
                 Err(error) => {
-                    match route_target {
-                        Some(target) => log_err!(
-                            self.iota_id as i64,
-                            PrintType::Iota,
-                            "Relay routing failed for {}: {}",
-                            target,
-                            error
-                        ),
-                        None => log_err!(
-                            self.iota_id as i64,
-                            PrintType::Iota,
-                            "Relay routing failed for invalid route target {}: {}",
-                            wire_receiver,
-                            error
-                        ),
-                    }
                     relay_router::relay_route_error_response(message_id, route_target, &error)
                 }
             };

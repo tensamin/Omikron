@@ -427,24 +427,27 @@ impl ClientConnection {
                         )
                         .await
                     }
-                    None => Err(relay_router::RelayRouteError::DestinationIotaNotLocal),
+                    None => {
+                        crate::log_event!(
+                            0,
+                            PrintType::Omikron,
+                            crate::util::logger::LogLevel::Warn,
+                            "relay.route_failed",
+                            "message_id={} source=client user_id={} target_iota_id={} error=destination_iota_not_local",
+                            message_id,
+                            self.user_id,
+                            next_hop
+                        );
+                        Err(relay_router::RelayRouteError::DestinationIotaNotLocal)
+                    }
                 };
                 let response = match result {
                     Ok(response) => response.with_id(message_id),
-                    Err(error) => {
-                        log_err!(
-                            self.user_id as i64,
-                            PrintType::Client,
-                            "Relay routing failed for destination Iota {}: {}",
-                            next_hop,
-                            error
-                        );
-                        relay_router::relay_route_error_response(
-                            message_id,
-                            relay_router::RouteTarget::from_wire_id(next_hop),
-                            &error,
-                        )
-                    }
+                    Err(error) => relay_router::relay_route_error_response(
+                        message_id,
+                        relay_router::RouteTarget::from_wire_id(next_hop),
+                        &error,
+                    ),
                 };
                 self.send_message(&response).await;
                 return;
@@ -1203,8 +1206,12 @@ impl ClientConnection {
         let creator_value = cv.get_data(DataType::CallSecret);
         let creator =
             creator_value.and_then(crate::calls::call_group::CallSecretEnvelope::from_data_value);
-        log::debug!(
-            "CallToken call_id={call_id} user_id={user_id} owner_omikron_id={} exists_locally={} creator_secret_present={} creator_secret_parsed={}",
+        crate::log_event!(
+            0,
+            crate::util::logger::PrintType::Call,
+            crate::util::logger::LogLevel::Debug,
+            "call.token_requested",
+            "call_id={call_id} user_id={user_id} owner_omikron_id={} exists_locally={} creator_secret_present={} creator_secret_parsed={}",
             self.state.call_manager.owner_omikron_id,
             self.state.call_manager.get_call(call_id).await.is_some(),
             creator_value.is_some(),
@@ -1248,7 +1255,17 @@ impl ClientConnection {
                 }
             }
             Err(error) => {
-                log::warn!("Unable to create call token for {}: {}", call_id, error);
+                crate::log_event!(
+                    0,
+                    crate::util::logger::PrintType::Call,
+                    crate::util::logger::LogLevel::Warn,
+                    "call.token_failed",
+                    "message_id={} call_id={} user_id={} error={}",
+                    message_id,
+                    call_id,
+                    user_id,
+                    error
+                );
                 let mut error_cv = CommunicationValue::new(call_error_type(&error))
                     .with_id(message_id)
                     .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));

@@ -4,6 +4,8 @@ use crate::calls::{
     error::CallError,
 };
 use crate::config::CallLimits;
+use crate::log_event;
+use crate::util::logger::{LogLevel, PrintType};
 use dashmap::DashMap;
 use std::{
     sync::Arc,
@@ -160,6 +162,16 @@ impl CallManager {
             }
         };
         self.groups.insert(id, group);
+        log_event!(
+            0,
+            PrintType::Call,
+            LogLevel::Info,
+            "call.created",
+            "call_id={} creator_user_id={} owner_omikron_id={}",
+            id,
+            user,
+            self.owner_omikron_id
+        );
         Ok(token)
     }
     async fn token_existing(
@@ -227,6 +239,18 @@ impl CallManager {
         self.admission_locks.remove_if(&to, |_, current| {
             Arc::ptr_eq(current, &admission_lock) && Arc::strong_count(current) == 2
         });
+        if result.is_ok() {
+            log_event!(
+                0,
+                PrintType::Call,
+                LogLevel::Info,
+                "call.invited",
+                "call_id={} from_user_id={} to_user_id={}",
+                id,
+                from,
+                to
+            );
+        }
         result
     }
     pub async fn rollback_invite(&self, id: Uuid, user: u64) {
@@ -259,6 +283,17 @@ impl CallManager {
             .await
             .map_err(|_| CallServiceError::InvalidUser)?;
         self.livekit.remove_participant(id, target).await?;
+        log_event!(
+            0,
+            PrintType::Call,
+            LogLevel::Info,
+            "call.user_timed_out",
+            "call_id={} requester_user_id={} target_user_id={} until_ms={}",
+            id,
+            requester,
+            target,
+            until
+        );
         Ok(())
     }
     pub async fn disconnect_user(
@@ -280,6 +315,15 @@ impl CallManager {
             g.mark_ending().await;
             self.livekit.delete_room(id).await?;
             self.groups.remove(&id);
+            log_event!(
+                0,
+                PrintType::Call,
+                LogLevel::Info,
+                "call.ended",
+                "call_id={} requester_user_id={}",
+                id,
+                requester
+            );
             return Ok(());
         }
         g.revoke(target)
@@ -297,6 +341,15 @@ impl CallManager {
         g.mark_ending().await;
         self.livekit.delete_room(id).await?;
         self.groups.remove(&id);
+        log_event!(
+            0,
+            PrintType::Call,
+            LogLevel::Info,
+            "call.ended",
+            "call_id={} requester_user_id={}",
+            id,
+            requester
+        );
         Ok(())
     }
 }

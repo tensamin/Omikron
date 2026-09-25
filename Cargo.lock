@@ -2053,7 +2053,6 @@ dependencies = [
  "libc",
  "livekit-api",
  "livekit-protocol",
- "log",
  "mtp",
  "mtp-native",
  "once_cell",

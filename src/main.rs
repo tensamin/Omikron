@@ -45,7 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("Invalid configuration: {error}").into());
         }
     };
-    startup(config.logger_queue_capacity);
+    let _logger_guard = startup(config.logger_queue_capacity)
+        .map_err(|error| format!("Unable to initialize logger: {error}"))?;
 
     let keyring = match load_or_create_keyring(KEYRING_PATH, PUBLIC_KEY_PATH) {
         Ok(keyring) => keyring,

@@ -507,16 +507,36 @@ impl AnonymousClientConnection {
                         .add_typed_default(DataType::CallToken, DataValue::Str(token));
                     self.send_message(&response).await;
                 }
-                _ => {
-                    log::warn!(
-                        "Unable to create anonymous call token for {}: {}",
+                Ok(None) => {
+                    crate::log_event!(
+                        0,
+                        crate::util::logger::PrintType::Call,
+                        crate::util::logger::LogLevel::Info,
+                        "call.anonymous_join_denied",
+                        "message_id={} call_id={} user_id={} reason=disabled",
+                        message_id,
                         call_id,
-                        "anonymous joining is disabled"
+                        user_id
                     );
                     let error_cv = CommunicationValue::new(CommunicationType::ErrorNoCallId)
                         .with_id(message_id)
                         .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));
                     self.send_message(&error_cv).await;
+                }
+                Err(error) => {
+                    crate::log_event!(
+                        0,
+                        crate::util::logger::PrintType::Call,
+                        crate::util::logger::LogLevel::Warn,
+                        "call.anonymous_token_failed",
+                        "message_id={} call_id={} user_id={} error={}",
+                        message_id,
+                        call_id,
+                        user_id,
+                        error
+                    );
+                    self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                        .await;
                 }
             },
             None => {

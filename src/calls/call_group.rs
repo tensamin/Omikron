@@ -194,7 +194,16 @@ impl CallGroup {
     pub async fn remove_caller(&self, id: u64) {
         self.revoke(id).await;
         if let Err(error) = self.livekit.remove_participant(self.call_id, id).await {
-            log::warn!("unable to remove call participant: {error}");
+            crate::log_event!(
+                0,
+                crate::util::logger::PrintType::Call,
+                crate::util::logger::LogLevel::Warn,
+                "call.participant_remove_failed",
+                "call_id={} user_id={} error={}",
+                self.call_id,
+                id,
+                error
+            );
         }
     }
     pub async fn get_short_link(&self) -> Option<String> {

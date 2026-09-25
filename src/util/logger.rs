@@ -12,9 +12,9 @@ use std::{
 };
 
 use ansi_term::Color;
-use mtp::codec::{CommunicationType, CommunicationValue, DataTypeId, DataValue, TypeMap, Version};
+use mtp::codec::{CommunicationType, CommunicationValue, DataTypeId, DataValue, TypeMap};
 
-static LOGGER: OnceLock<mpsc::SyncSender<LogMessage>> = OnceLock::new();
+static LOGGER: OnceLock<mpsc::SyncSender<LoggerCommand>> = OnceLock::new();
 static DROPPED_LOGS: AtomicU64 = AtomicU64::new(0);
 const DROPPED_LOG_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_LOG_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -31,45 +31,108 @@ pub enum PrintType {
     Omega,
     General,
 }
+impl PrintType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::Client => "client",
+            Self::App => "app",
+            Self::Iota => "iota",
+            Self::Omikron => "omikron",
+            Self::Omega => "omega",
+            Self::General => "general",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+impl LogLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+enum LoggerCommand {
+    Write(LogMessage),
+    Shutdown,
+}
+
+pub struct LoggerGuard {
+    thread: Option<thread::JoinHandle<()>>,
+}
+impl Drop for LoggerGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = LOGGER.get() {
+            let _ = tx.send(LoggerCommand::Shutdown);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 struct LogMessage {
     timestamp_ms: u128,
     sender: Option<i64>,
     prefix: &'static str,
     kind: PrintType,
-    is_error: bool,
+    level: LogLevel,
+    event: &'static str,
     message: String,
 }
 
-pub fn startup(queue_capacity: usize) {
-    let (tx, rx) = mpsc::sync_channel::<LogMessage>(queue_capacity);
-    LOGGER.set(tx).expect("Logger already initialized");
-
-    thread::spawn(move || {
-        let log_dir = crate::WORKING_DIR.join("logs");
-        fs::create_dir_all(&log_dir).expect("Failed to create log directory");
-        prune_logs(&log_dir);
-
-        let start_ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
+pub fn startup(queue_capacity: usize) -> std::io::Result<LoggerGuard> {
+    let log_dir = crate::WORKING_DIR.join("logs");
+    fs::create_dir_all(&log_dir)?;
+    prune_logs(&log_dir);
+    let start_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(log_path(&log_dir, start_ts, 0))?;
+    let (tx, rx) = mpsc::sync_channel(queue_capacity.max(1));
+    LOGGER.set(tx).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "logger already initialized",
+        )
+    })?;
+    let thread = thread::spawn(move || {
+        let mut file = file;
         let mut sequence = 0;
-        let path = log_path(&log_dir, start_ts, sequence);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .expect("Failed to open log file");
-
         let mut last_drop_report = Instant::now();
         loop {
             match rx.recv_timeout(DROPPED_LOG_REPORT_INTERVAL) {
-                Ok(msg) => write_message(&mut file, msg),
+                Ok(LoggerCommand::Write(msg)) => write_message(&mut file, msg),
+                Ok(LoggerCommand::Shutdown) => {
+                    report_dropped_logs(&mut file);
+                    if let Err(error) = file.flush() {
+                        eprintln!("Failed to flush Omikron log file: {error}");
+                    }
+                    break;
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     report_dropped_logs(&mut file);
+                    let _ = file.flush();
                     break;
                 }
             }
@@ -81,6 +144,9 @@ pub fn startup(queue_capacity: usize) {
             rotate_log_if_needed(&mut file, &log_dir, start_ts, &mut sequence);
         }
     });
+    Ok(LoggerGuard {
+        thread: Some(thread),
+    })
 }
 
 fn log_path(log_dir: &Path, start_ts: u64, sequence: u32) -> PathBuf {
@@ -100,11 +166,14 @@ fn rotate_log_if_needed(
         return;
     }
     let next_sequence = sequence.saturating_add(1);
-    match OpenOptions::new().create(true).append(true).open(log_path(
-        log_dir,
-        start_ts,
-        next_sequence,
-    )) {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(log_path(log_dir, start_ts, next_sequence)) {
         Ok(next_file) => {
             *file = next_file;
             *sequence = next_sequence;
@@ -115,8 +184,15 @@ fn rotate_log_if_needed(
 }
 
 fn prune_logs(log_dir: &Path) {
-    let Ok(entries) = fs::read_dir(log_dir) else {
-        return;
+    let entries = match fs::read_dir(log_dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "Unable to enumerate log directory {}: {error}",
+                log_dir.display()
+            );
+            return;
+        }
     };
     let mut logs = entries
         .filter_map(|entry| entry.ok())
@@ -142,15 +218,31 @@ fn prune_logs(log_dir: &Path) {
 }
 
 fn write_message(file: &mut std::fs::File, msg: LogMessage) {
-    let ts = fixed_box(&msg.timestamp_ms.to_string(), 13);
-    let sender = match msg.sender {
-        Some(id) => fixed_box(&id.to_string(), 19),
-        _ => fixed_box("", 19),
+    let sender = msg
+        .sender
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "-".into());
+    let direction = match msg.prefix.trim() {
+        ">" => "in",
+        "<" => "out",
+        ">>" => "internal",
+        _ => "local",
     };
-    let line = format!("{} {} {} {}", ts, sender, msg.prefix, msg.message);
-
-    println!("{}", colorize(msg.kind, msg.is_error).paint(&line));
-    if let Err(error) = writeln!(file, "{}", line) {
+    let line = format!(
+        "{} level={} component={} direction={} sender={} event={} message={:?}",
+        msg.timestamp_ms,
+        msg.level.as_str(),
+        msg.kind.as_str(),
+        direction,
+        sender,
+        msg.event,
+        msg.message
+    );
+    println!(
+        "{}",
+        colorize(msg.kind, msg.level == LogLevel::Error).paint(&line)
+    );
+    if let Err(error) = writeln!(file, "{line}") {
         eprintln!("Failed to write Omikron log file: {error}");
     }
 }
@@ -168,10 +260,9 @@ fn report_dropped_logs(file: &mut std::fs::File) {
                 sender: None,
                 prefix: ">>",
                 kind: PrintType::General,
-                is_error: true,
-                message: format!(
-                    "Dropped {dropped} log messages because the logger queue was full"
-                ),
+                level: LogLevel::Error,
+                event: "logger.dropped",
+                message: format!("count={dropped}"),
             },
         );
     }
@@ -193,21 +284,33 @@ fn colorize(kind: PrintType, is_error: bool) -> Color {
     }
 }
 
-fn fixed_box(content: &str, width: usize) -> String {
-    let s: String = content.chars().take(width).collect();
-    let len = s.chars().count();
-    if len < width {
-        format!("[{}{}]", " ".repeat(width - len), s)
-    } else {
-        s
-    }
-}
-
 pub fn log_internal(
     sender: i64,
     kind: PrintType,
     prefix: &'static str,
     is_error: bool,
+    message: String,
+) {
+    log_event_internal(
+        sender,
+        kind,
+        prefix,
+        if is_error {
+            LogLevel::Error
+        } else {
+            LogLevel::Info
+        },
+        "message",
+        message,
+    );
+}
+
+pub fn log_event_internal(
+    sender: i64,
+    kind: PrintType,
+    prefix: &'static str,
+    level: LogLevel,
+    event: &'static str,
     message: String,
 ) {
     let sender = if sender == 0 { None } else { Some(sender) };
@@ -221,10 +324,11 @@ pub fn log_internal(
             sender,
             prefix,
             kind,
-            is_error,
+            level,
+            event,
             message,
         };
-        match tx.try_send(message) {
+        match tx.try_send(LoggerCommand::Write(message)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 DROPPED_LOGS.fetch_add(1, Ordering::Relaxed);
@@ -234,6 +338,12 @@ pub fn log_internal(
             }
         }
     }
+}
+#[macro_export]
+macro_rules! log_event {
+    ($sender:expr, $kind:expr, $level:expr, $event:expr, $($arg:tt)*) => {
+        $crate::util::logger::log_event_internal($sender, $kind, "", $level, $event, format!($($arg)*))
+    };
 }
 #[macro_export]
 macro_rules! log {
@@ -268,13 +378,18 @@ pub fn log_cv_internal(
 ) {
     let formatted = format_cv(cv);
 
-    log_internal(
+    log_event_internal(
         cv.sender()
             .and_then(|sender| i64::try_from(sender).ok())
             .unwrap_or(0),
         print_type.unwrap_or(PrintType::General),
         prefix,
-        false,
+        LogLevel::Debug,
+        if prefix.trim() == "<" {
+            "protocol.sent"
+        } else {
+            "protocol.received"
+        },
         formatted,
     );
 }
@@ -304,138 +419,123 @@ pub fn format_cv(cv: &CommunicationValue) -> String {
         return parts.join(": ");
     }
 
-    let data = cv.data().unwrap_or(&[]);
-
-    let formated_data = format_data_container(
-        data.iter().map(|(k, v)| (*k, v.clone())).collect(),
-        Version(3, 0),
-    );
-
-    parts.push(format!("{}", formated_data));
+    if let Some(data) = cv.data() {
+        let type_map = cv.type_map().cloned().unwrap_or_else(TypeMap::latest);
+        parts.push(format_data_container(data, &type_map));
+    }
 
     parts.join(": ")
 }
 
-fn format_data_container(data: Vec<(DataTypeId, DataValue)>, version: Version) -> String {
-    let parts: Vec<String> = data
-        .into_iter()
+fn format_data_container(data: &[(DataTypeId, DataValue)], type_map: &TypeMap) -> String {
+    data.iter()
         .map(|(key, value)| {
-            let key_str = key.to_string();
-
-            if is_secret_data_type(key) {
-                return format!("{}=<redacted>", key_str);
-            }
-
+            let name = type_map
+                .data_type_name(key.0)
+                .map(str::to_owned)
+                .unwrap_or_else(|| key.to_string());
             match value {
-                DataValue::Str(s) => format!("{}=\"{}\"", key_str, abbreviate_string(&s)),
-
+                DataValue::SignedNumber(value)
+                    if matches!(
+                        name.as_str(),
+                        "UserId"
+                            | "IotaId"
+                            | "OmikronId"
+                            | "InvitationId"
+                            | "RelayMessageId"
+                            | "VersionNumber"
+                            | "Offset"
+                            | "Amount"
+                    ) =>
+                {
+                    format!("{name}={value}")
+                }
+                DataValue::UnsignedNumber(value)
+                    if matches!(
+                        name.as_str(),
+                        "UserId"
+                            | "IotaId"
+                            | "OmikronId"
+                            | "InvitationId"
+                            | "RelayMessageId"
+                            | "VersionNumber"
+                            | "Offset"
+                            | "Amount"
+                    ) =>
+                {
+                    format!("{name}={value}")
+                }
                 DataValue::Container(inner) => {
-                    let inner_formatted = format_data_container(inner, version.clone());
-                    format!("{}={{ {} }}", key_str, inner_formatted)
+                    format!("{name}={{ {} }}", format_data_container(inner, type_map))
                 }
-
-                DataValue::Array(arr) => {
-                    let arr_formatted = format_array(arr, version.clone());
-                    format!("{}=[{}]", key_str, arr_formatted)
+                DataValue::Array(values) => format!("{name}=<array:{}>", values.len()),
+                DataValue::Str(_) => format!("{name}=<string>"),
+                DataValue::Bytes(_) => format!("{name}=<bytes>"),
+                DataValue::Bool(_) | DataValue::BoolTrue | DataValue::BoolFalse => {
+                    format!("{name}=<bool>")
                 }
-
-                DataValue::Bool(b) => format!("{}={}", key_str, b),
-
-                DataValue::BoolTrue => format!("{}=true", key_str),
-                DataValue::BoolFalse => format!("{}=false", key_str),
-
-                DataValue::SignedNumber(num) => format!("{}={}", key_str, num),
-                DataValue::UnsignedNumber(num) => format!("{}={}", key_str, num),
-                DataValue::Bytes(bytes) => format!("{}=<{} bytes>", key_str, bytes.len()),
-
-                _ => "".to_string(),
+                DataValue::SignedNumber(_) | DataValue::UnsignedNumber(_) => {
+                    format!("{name}=<number>")
+                }
+                _ => format!("{name}=<value>"),
             }
         })
-        .collect();
-
-    parts.join(", ")
-}
-
-fn is_secret_data_type(key: DataTypeId) -> bool {
-    matches!(
-        TypeMap::latest().data_type_name(key.0),
-        Some("InvitationToken" | "InvitationPassword" | "ResetToken" | "RegisterId" | "NewToken")
-    )
-}
-
-fn format_array(arr: Vec<DataValue>, version: Version) -> String {
-    let parts: Vec<String> = arr
-        .into_iter()
-        .map(|value| match value {
-            DataValue::Str(s) => format!("\"{}\"", abbreviate_string(&s)),
-
-            DataValue::Container(inner) => {
-                let inner_formatted = format_data_container(inner, version.clone());
-                format!("{{ {} }}", inner_formatted)
-            }
-
-            DataValue::Array(inner_arr) => {
-                let formatted = format_array(inner_arr, version.clone());
-                format!("[{}]", formatted)
-            }
-
-            DataValue::Bool(b) => b.to_string(),
-
-            DataValue::BoolTrue => "true".to_string(),
-            DataValue::BoolFalse => "false".to_string(),
-
-            DataValue::SignedNumber(num) => num.to_string(),
-            DataValue::UnsignedNumber(num) => num.to_string(),
-            DataValue::Bytes(bytes) => format!("<{} bytes>", bytes.len()),
-
-            _ => String::new(),
-        })
-        .collect();
-
-    parts.join(", ")
-}
-
-fn abbreviate_string(value: &str) -> String {
-    const EDGE_LENGTH: usize = 4;
-
-    let chars: Vec<char> = value.chars().collect();
-    if chars.len() <= EDGE_LENGTH * 2 {
-        return value.to_string();
-    }
-
-    let prefix: String = chars.iter().take(EDGE_LENGTH).collect();
-    let suffix: String = chars.iter().rev().take(EDGE_LENGTH).rev().collect();
-    format!("{prefix}...{suffix}")
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{abbreviate_string, format_cv};
-    use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
+    use super::{LogLevel, LogMessage, PrintType, format_cv, write_message};
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 
     #[test]
-    fn abbreviates_only_strings_longer_than_eight_characters() {
-        assert_eq!(abbreviate_string("12345678"), "12345678");
-        assert_eq!(abbreviate_string("123456789"), "1234...6789");
-        assert_eq!(abbreviate_string("YWJjZGVmZ2hpag=="), "YWJj...ag==");
+    fn protocol_values_are_metadata_only() {
+        let value = CommunicationValue::new(CommunicationType::Success)
+            .add_typed_default(
+                DataType::SessionToken,
+                DataValue::Str("session-secret-value".into()),
+            )
+            .add_typed_default(
+                DataType::CallToken,
+                DataValue::Str("livekit-secret-token".into()),
+            )
+            .add_typed_default(DataType::Username, DataValue::Str("alice".into()))
+            .add_typed_default(DataType::UserId, DataValue::SignedNumber(172));
+        let formatted = format_cv(&value);
+        for secret in ["session-secret-value", "livekit-secret-token", "alice"] {
+            assert!(!formatted.contains(secret));
+        }
+        assert!(formatted.contains("SessionToken=<string>"));
+        assert!(formatted.contains("UserId=172"));
+        assert!(
+            format_cv(&CommunicationValue::new(CommunicationType::Relay))
+                .contains("<opaque relay payload>")
+        );
     }
 
     #[test]
-    fn redacts_invitation_and_account_credentials() {
-        let reset_token = DataType::ResetToken.try_to_id(&TypeMap::latest()).unwrap();
-        let value = CommunicationValue::new(CommunicationType::RedeemUserInvitation)
-            .add_typed_default(DataType::InvitationToken, DataValue::Str("short123".into()))
-            .add_typed_default(
-                DataType::Invitations,
-                DataValue::Array(vec![DataValue::Container(vec![(
-                    reset_token,
-                    DataValue::Str("reset-secret".into()),
-                )])]),
-            );
-        let formatted = format_cv(&value);
-        assert!(!formatted.contains("short123"));
-        assert!(!formatted.contains("reset-secret"));
-        assert_eq!(formatted.matches("<redacted>").count(), 2);
+    fn persisted_message_has_level_component_and_one_line() {
+        let path = std::env::temp_dir().join(format!("omikron-logger-{}", uuid::Uuid::new_v4()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        write_message(
+            &mut file,
+            LogMessage {
+                timestamp_ms: 123,
+                sender: None,
+                prefix: "",
+                kind: PrintType::Call,
+                level: LogLevel::Warn,
+                event: "call.failed",
+                message: "first\nsecond".into(),
+            },
+        );
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains("level=WARN component=call"));
+        assert!(contents.contains("event=call.failed"));
+        assert!(contents.contains("first\\nsecond"));
     }
 }
 
