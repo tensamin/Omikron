@@ -43,7 +43,7 @@ impl Default for CallLimits {
             max_members_per_call: 64,
             max_pending_invites_per_call: 64,
             max_calls_per_user: 16,
-            invite_ttl: Duration::from_secs(3600),
+            invite_ttl: Duration::from_secs(3 * 24 * 60 * 60),
         }
     }
 }
@@ -185,7 +185,7 @@ impl Config {
                 max_calls_per_user: parse_positive_or_default("CALL_MAX_CALLS_PER_USER", 16)?,
                 invite_ttl: Duration::from_secs(parse_positive_or_default(
                     "CALL_INVITE_TTL_SECONDS",
-                    3600,
+                    3 * 24 * 60 * 60,
                 )?),
             },
             rho_max_connections,

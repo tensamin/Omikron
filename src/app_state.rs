@@ -97,8 +97,10 @@ impl AppState {
             config,
             keyring,
             omega,
-            rho,
-            call_state_aggregator: Arc::new(CallStateAggregator::new(call_manager.clone())),
+            rho: rho.clone(),
+            call_state_aggregator: Arc::new(
+                CallStateAggregator::new(call_manager.clone()).with_rho(rho.clone()),
+            ),
             call_manager,
             livekit,
             rho_connection_limits,

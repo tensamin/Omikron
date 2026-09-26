@@ -1,7 +1,8 @@
 use crate::calls::{
-    call_group::{CallGroup, CallRole, CallSecretEnvelope},
+    call_group::{CallGroup, CallRole},
     call_util::LiveKitService,
     error::CallError,
+    persistence::CallPersistence,
 };
 use crate::config::CallLimits;
 use crate::log_event;
@@ -34,11 +35,11 @@ pub enum CallServiceError {
 }
 pub struct CallManager {
     pub(crate) groups: DashMap<Uuid, Arc<CallGroup>>,
-    creation_locks: DashMap<Uuid, Arc<Mutex<()>>>,
     admission_locks: DashMap<u64, Arc<Mutex<()>>>,
     pub livekit: Arc<LiveKitService>,
     pub owner_omikron_id: u64,
     limits: CallLimits,
+    pub persistence: Option<Arc<CallPersistence>>,
 }
 impl Default for CallManager {
     fn default() -> Self {
@@ -55,12 +56,125 @@ impl CallManager {
     pub fn new_with_limits(livekit: Arc<LiveKitService>, owner: u64, limits: CallLimits) -> Self {
         Self {
             groups: DashMap::new(),
-            creation_locks: DashMap::new(),
             admission_locks: DashMap::new(),
             livekit,
             owner_omikron_id: owner,
             limits,
+            persistence: None,
         }
+    }
+    pub fn with_persistence(mut self, persistence: Arc<CallPersistence>) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+    pub async fn restore(&self) -> Result<(), CallServiceError> {
+        let Some(db) = &self.persistence else {
+            return Ok(());
+        };
+        let calls = db
+            .restore(Self::now_ms()?)
+            .map_err(|_| CallServiceError::DeliveryFailed)?;
+        for call in calls {
+            let Some(_creator) = call.members.first() else {
+                continue;
+            };
+            let mut group = CallGroup::new_with_service(
+                call.id,
+                self.owner_omikron_id,
+                call.owner,
+                self.livekit.clone(),
+                self.limits.clone(),
+            );
+            group.created_at_ms = call.created_at_ms;
+            {
+                let mut state = group.state.write().await;
+                state.members = call
+                    .members
+                    .into_iter()
+                    .map(|member| (member.user_id, member))
+                    .collect();
+                state.pending_invites = call.invites.into_iter().collect();
+                state.anonymous_joining = call.anonymous_joining;
+                state.short_link = call.short_link;
+            }
+            self.groups.insert(call.id, Arc::new(group));
+        }
+        Ok(())
+    }
+    pub async fn reserve(&self, user: u64) -> Result<Uuid, CallServiceError> {
+        let db = self
+            .persistence
+            .as_ref()
+            .ok_or(CallServiceError::DeliveryFailed)?;
+        if self.get_call_groups(user).await.len() >= self.limits.max_calls_per_user {
+            return Err(CallServiceError::ResourceLimit);
+        }
+        for _ in 0..10 {
+            let id = Uuid::new_v4();
+            if self.get_call(id).await.is_none()
+                && db
+                    .reserve(id, user, Self::now_ms()? + 30_000)
+                    .map_err(|_| CallServiceError::DeliveryFailed)?
+            {
+                return Ok(id);
+            }
+        }
+        Err(CallServiceError::ResourceLimit)
+    }
+    pub async fn reservation_created_at(
+        &self,
+        user: u64,
+        id: Uuid,
+    ) -> Result<i64, CallServiceError> {
+        let db = self
+            .persistence
+            .as_ref()
+            .ok_or(CallServiceError::DeliveryFailed)?;
+        db.reservation_created_at(id, user, Self::now_ms()?)
+            .map_err(|_| CallServiceError::DeliveryFailed)?
+            .ok_or(CallServiceError::NotFound)
+    }
+    pub async fn activate(
+        &self,
+        user: u64,
+        id: Uuid,
+        created_at: i64,
+    ) -> Result<String, CallServiceError> {
+        let db = self
+            .persistence
+            .as_ref()
+            .ok_or(CallServiceError::DeliveryFailed)?;
+        if db
+            .reservation_owner(id, Self::now_ms()?)
+            .map_err(|_| CallServiceError::DeliveryFailed)?
+            != Some(user)
+        {
+            return Err(CallServiceError::NotFound);
+        }
+        self.livekit.create_room(id).await?;
+        let mut group = CallGroup::new_with_service(
+            id,
+            self.owner_omikron_id,
+            user,
+            self.livekit.clone(),
+            self.limits.clone(),
+        );
+        group.created_at_ms = created_at;
+        let group = Arc::new(group);
+        if !db
+            .activate(&group, user)
+            .map_err(|_| CallServiceError::DeliveryFailed)?
+        {
+            let _ = self.livekit.delete_room(id).await;
+            return Err(CallServiceError::NotFound);
+        }
+        if let Err(error) = group.update_metadata().await {
+            let _ = self.livekit.delete_room(id).await;
+            let _ = db.remove(id);
+            return Err(error.into());
+        }
+        self.groups.insert(id, group);
+        self.get_call_token(user, id).await
     }
     pub async fn get_call(&self, id: Uuid) -> Option<Arc<CallGroup>> {
         self.groups.get(&id).map(|g| g.clone())
@@ -69,7 +183,7 @@ impl CallManager {
         let groups = self.groups.iter().map(|g| g.clone()).collect::<Vec<_>>();
         let mut result = Vec::new();
         for g in groups {
-            if g.is_related(user).await {
+            if g.created_at_ms + 259_200_000 > Self::timestamp() && g.is_related(user).await {
                 result.push(g)
             }
         }
@@ -86,93 +200,18 @@ impl CallManager {
                 i64::try_from(d.as_millis()).map_err(|_| CallServiceError::InvalidRequest)
             })
     }
+    pub fn timestamp() -> i64 {
+        Self::now_ms().unwrap_or_default()
+    }
     pub async fn get_call_token(&self, user: u64, id: Uuid) -> Result<String, CallServiceError> {
-        self.get_or_create_token(user, id, None).await
-    }
-    pub async fn get_or_create_token(
-        &self,
-        user: u64,
-        id: Uuid,
-        creator: Option<CallSecretEnvelope>,
-    ) -> Result<String, CallServiceError> {
-        if let Some(g) = self.get_call(id).await {
-            return self.token_existing(g, user).await;
+        let group = self.get_call(id).await.ok_or(CallServiceError::NotFound)?;
+        if group.created_at_ms + 259_200_000 <= Self::now_ms()? {
+            return Err(CallServiceError::NotFound);
         }
-        let secret = creator.ok_or(CallServiceError::NotFound)?;
-        let admission_lock = self
-            .admission_locks
-            .entry(user)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone();
-        let result = {
-            let _admission_guard = admission_lock.lock().await;
-            if let Some(group) = self.get_call(id).await {
-                self.token_existing(group, user).await
-            } else if self.get_call_groups(user).await.len() >= self.limits.max_calls_per_user {
-                Err(CallServiceError::ResourceLimit)
-            } else {
-                let lock = self
-                    .creation_locks
-                    .entry(id)
-                    .or_insert_with(|| Arc::new(Mutex::new(())))
-                    .clone();
-                let result = {
-                    let _guard = lock.lock().await;
-                    if let Some(group) = self.get_call(id).await {
-                        self.token_existing(group, user).await
-                    } else {
-                        self.create_call(user, id, secret).await
-                    }
-                };
-                self.creation_locks.remove_if(&id, |_, current| {
-                    Arc::ptr_eq(current, &lock) && Arc::strong_count(current) == 2
-                });
-                result
-            }
-        };
-        self.admission_locks.remove_if(&user, |_, current| {
-            Arc::ptr_eq(current, &admission_lock) && Arc::strong_count(current) == 2
-        });
-        result
-    }
-    async fn create_call(
-        &self,
-        user: u64,
-        id: Uuid,
-        secret: CallSecretEnvelope,
-    ) -> Result<String, CallServiceError> {
-        self.livekit.create_room(id).await?;
-        let group = Arc::new(CallGroup::new_with_service(
-            id,
-            self.owner_omikron_id,
-            user,
-            secret,
-            self.livekit.clone(),
-            self.limits.clone(),
-        ));
-        if let Err(error) = group.update_metadata().await {
-            let _ = self.livekit.delete_room(id).await;
-            return Err(error.into());
+        if !group.is_related(user).await {
+            return Err(CallServiceError::NotFound);
         }
-        let token = match self.livekit.create_token(user, id, true) {
-            Ok(token) => token,
-            Err(error) => {
-                let _ = self.livekit.delete_room(id).await;
-                return Err(error.into());
-            }
-        };
-        self.groups.insert(id, group);
-        log_event!(
-            0,
-            PrintType::Call,
-            LogLevel::Info,
-            "call.created",
-            "call_id={} creator_user_id={} owner_omikron_id={}",
-            id,
-            user,
-            self.owner_omikron_id
-        );
-        Ok(token)
+        self.token_existing(group, user).await
     }
     async fn token_existing(
         &self,
@@ -185,11 +224,32 @@ impl CallManager {
                 // A failed token request must not turn an invitation into
                 // authorization.  LiveKit token creation is pure/local, so
                 // perform it before atomically accepting the invite.
-                if !g.is_related(user).await {
-                    return Err(CallServiceError::NotAuthorized);
-                }
                 let token = self.livekit.create_token(user, g.call_id, false)?;
-                g.accept_invite(user).await?;
+                let mut state = g.state.write().await;
+                if state.ending || state.members.len() >= g.limits.max_members_per_call {
+                    return Err(CallServiceError::NotFound);
+                }
+                let Some(invite) = state.pending_invites.get(&user) else {
+                    return Err(CallServiceError::NotFound);
+                };
+                if invite.created_at_ms + g.limits.invite_ttl.as_millis() as i64 <= Self::now_ms()?
+                {
+                    return Err(CallServiceError::NotFound);
+                }
+                if let Some(db) = &self.persistence {
+                    db.accept(g.call_id, user)
+                        .map_err(|_| CallServiceError::DeliveryFailed)?;
+                }
+                state.pending_invites.remove(&user);
+                state.members.insert(
+                    user,
+                    crate::calls::call_group::CallMember {
+                        user_id: user,
+                        role: CallRole::Member,
+                        timeout_until_ms: None,
+                        participating: false,
+                    },
+                );
                 return Ok(token);
             }
         };
@@ -202,27 +262,8 @@ impl CallManager {
             .create_token(user, g.call_id, member.role == CallRole::Admin)
             .map_err(Into::into)
     }
-    pub async fn add_invite(
-        &self,
-        id: Uuid,
-        from: u64,
-        to: u64,
-        secret: CallSecretEnvelope,
-    ) -> Result<(), CallServiceError> {
-        let g = self.get_call(id).await.ok_or(CallServiceError::NotFound)?;
-        if from == to {
-            return Err(CallServiceError::InvalidRequest);
-        }
-        let caller = g
-            .member(from)
-            .await
-            .ok_or(CallServiceError::NotAuthorized)?;
-        if caller
-            .timeout_until_ms
-            .is_some_and(|until| Self::now_ms().map(|now| until > now).unwrap_or(true))
-        {
-            return Err(CallServiceError::NotAuthorized);
-        }
+    pub async fn add_invite(&self, id: Uuid, from: u64, to: u64) -> Result<(), CallServiceError> {
+        let g = self.check_invite(id, from, to).await?;
         let admission_lock = self
             .admission_locks
             .entry(to)
@@ -233,7 +274,9 @@ impl CallManager {
             if self.get_call_groups(to).await.len() >= self.limits.max_calls_per_user {
                 Err(CallServiceError::ResourceLimit)
             } else {
-                g.invite(from, to, secret).await
+                g.invite_with_storage(from, to, self.persistence.as_deref())
+                    .await?;
+                Ok(())
             }
         };
         self.admission_locks.remove_if(&to, |_, current| {
@@ -253,17 +296,52 @@ impl CallManager {
         }
         result
     }
-    pub async fn rollback_invite(&self, id: Uuid, user: u64) {
-        if let Some(g) = self.get_call(id).await {
-            g.rollback_invite(user).await
-        }
-    }
-    pub async fn call_data(&self, id: Uuid, user: u64) -> Result<Vec<u64>, CallServiceError> {
+    pub async fn check_invite(
+        &self,
+        id: Uuid,
+        from: u64,
+        to: u64,
+    ) -> Result<Arc<CallGroup>, CallServiceError> {
         let g = self.get_call(id).await.ok_or(CallServiceError::NotFound)?;
-        if !g.is_related(user).await {
-            return Err(CallServiceError::NotAuthorized);
+        if from == to || g.created_at_ms + 259_200_000 <= Self::now_ms()? {
+            return Err(CallServiceError::InvalidRequest);
         }
-        Ok(g.member_ids().await)
+        let state = g.state.read().await;
+        let caller = state
+            .members
+            .get(&from)
+            .ok_or(CallServiceError::NotAuthorized)?;
+        if state.ending
+            || caller
+                .timeout_until_ms
+                .is_some_and(|until| until > Self::timestamp())
+            || state.members.contains_key(&to)
+            || state.pending_invites.contains_key(&to)
+        {
+            return Err(CallServiceError::InvalidRequest);
+        }
+        if state.pending_invites.len() >= self.limits.max_pending_invites_per_call {
+            return Err(CallServiceError::ResourceLimit);
+        }
+        drop(state);
+        if self.get_call_groups(to).await.len() >= self.limits.max_calls_per_user {
+            return Err(CallServiceError::ResourceLimit);
+        }
+        Ok(g)
+    }
+    pub async fn call_data(
+        &self,
+        id: Uuid,
+        user: u64,
+    ) -> Result<(Vec<u64>, i64), CallServiceError> {
+        let g = self.get_call(id).await.ok_or(CallServiceError::NotFound)?;
+        if g.created_at_ms + 259_200_000 <= Self::now_ms()? {
+            return Err(CallServiceError::NotFound);
+        }
+        if !g.is_related(user).await {
+            return Err(CallServiceError::NotFound);
+        }
+        Ok((g.member_ids().await, g.created_at_ms))
     }
     pub async fn timeout_user(
         &self,
@@ -279,10 +357,22 @@ impl CallManager {
         if g.member(requester).await.map(|m| m.role == CallRole::Admin) != Some(true) {
             return Err(CallServiceError::NotAuthorized);
         }
-        g.timeout(target, until)
-            .await
-            .map_err(|_| CallServiceError::InvalidUser)?;
-        self.livekit.remove_participant(id, target).await?;
+        {
+            let mut state = g.state.write().await;
+            let member = state
+                .members
+                .get_mut(&target)
+                .ok_or(CallServiceError::InvalidUser)?;
+            if let Some(db) = &self.persistence {
+                db.set_timeout(id, target, until)
+                    .map_err(|_| CallServiceError::DeliveryFailed)?;
+            }
+            member.timeout_until_ms = Some(until);
+        }
+        match self.livekit.remove_participant(id, target).await {
+            Ok(()) | Err(CallError::RoomNotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
         log_event!(
             0,
             PrintType::Call,
@@ -295,6 +385,29 @@ impl CallManager {
             until
         );
         Ok(())
+    }
+    pub async fn set_anonymous_joining(
+        &self,
+        id: Uuid,
+        enabled: bool,
+        omega: &crate::omega::omega_connection::OmegaConnection,
+    ) -> Result<Option<String>, CallServiceError> {
+        let group = self.get_call(id).await.ok_or(CallServiceError::NotFound)?;
+        let (previous, link) = {
+            let state = group.state.read().await;
+            (state.anonymous_joining, state.short_link.clone())
+        };
+        let result = group.set_anonymous_joining(enabled, omega).await?;
+        if let Some(db) = &self.persistence {
+            if db
+                .set_anonymous(id, enabled, result.as_deref().or(link.as_deref()))
+                .is_err()
+            {
+                let _ = group.set_anonymous_joining(previous, omega).await;
+                return Err(CallServiceError::DeliveryFailed);
+            }
+        }
+        Ok(result)
     }
     pub async fn disconnect_user(
         &self,
@@ -310,36 +423,126 @@ impl CallManager {
         if requester != target && source.role != CallRole::Admin {
             return Err(CallServiceError::NotAuthorized);
         }
-        if requester == target && source.role == CallRole::Admin && g.member_ids().await.len() == 1
-        {
-            g.mark_ending().await;
-            self.livekit.delete_room(id).await?;
-            self.groups.remove(&id);
-            log_event!(
-                0,
-                PrintType::Call,
-                LogLevel::Info,
-                "call.ended",
-                "call_id={} requester_user_id={}",
-                id,
-                requester
-            );
+        if requester == target {
+            // Explicit leave ends the call only when nobody else is connected.
+            let participants = match self.livekit.participant_ids(id).await {
+                Ok(participants) => participants,
+                Err(CallError::RoomNotFound { .. }) => Vec::new(),
+                Err(error) => return Err(error.into()),
+            };
+            if participants
+                .iter()
+                .all(|participant| *participant == target)
+            {
+                self.delete_room(id).await?;
+                if let Some(db) = &self.persistence {
+                    db.remove(id)
+                        .map_err(|_| CallServiceError::DeliveryFailed)?;
+                }
+                g.mark_ending().await;
+                self.groups.remove(&id);
+                return Ok(());
+            }
+            match self.livekit.remove_participant(id, target).await {
+                Ok(()) | Err(CallError::RoomNotFound { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+            {
+                let mut state = g.state.write().await;
+                let member = state
+                    .members
+                    .get_mut(&target)
+                    .ok_or(CallServiceError::InvalidUser)?;
+                if let Some(db) = &self.persistence {
+                    db.set_participating(id, target, false)
+                        .map_err(|_| CallServiceError::DeliveryFailed)?;
+                }
+                member.participating = false;
+            }
+            if source.role == CallRole::Admin {
+                let mut state = g.state.write().await;
+                let Some(next_id) = state
+                    .members
+                    .keys()
+                    .copied()
+                    .find(|id| *id != target && participants.contains(id))
+                    .or_else(|| state.members.keys().copied().find(|id| *id != target))
+                else {
+                    return Err(CallServiceError::InvalidRequest);
+                };
+                if let Some(db) = &self.persistence {
+                    db.transfer_admin(id, target, next_id)
+                        .map_err(|_| CallServiceError::DeliveryFailed)?;
+                }
+                state
+                    .members
+                    .get_mut(&target)
+                    .ok_or(CallServiceError::InvalidUser)?
+                    .role = CallRole::Member;
+                state
+                    .members
+                    .get_mut(&next_id)
+                    .ok_or(CallServiceError::InvalidUser)?
+                    .role = CallRole::Admin;
+            }
+            g.update_metadata().await?;
             return Ok(());
+        }
+        // Kicking revokes future tokens as well as removing the participant.
+        match self.livekit.remove_participant(id, target).await {
+            Ok(()) | Err(CallError::RoomNotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(db) = &self.persistence {
+            db.revoke(id, target)
+                .map_err(|_| CallServiceError::DeliveryFailed)?;
         }
         g.revoke(target)
             .await
             .ok_or(CallServiceError::InvalidUser)?;
-        self.livekit.remove_participant(id, target).await?;
         g.update_metadata().await?;
         Ok(())
+    }
+    pub async fn reconcile_participants(
+        &self,
+        id: Uuid,
+        participants: &[u64],
+    ) -> Result<(), CallServiceError> {
+        let group = self.get_call(id).await.ok_or(CallServiceError::NotFound)?;
+        let mut state = group.state.write().await;
+        if state
+            .members
+            .values()
+            .all(|member| member.participating == participants.contains(&member.user_id))
+        {
+            return Ok(());
+        }
+        if let Some(db) = &self.persistence {
+            db.reconcile_participants(id, participants)
+                .map_err(|_| CallServiceError::DeliveryFailed)?;
+        }
+        for member in state.members.values_mut() {
+            member.participating = participants.contains(&member.user_id);
+        }
+        Ok(())
+    }
+    async fn delete_room(&self, id: Uuid) -> Result<(), CallServiceError> {
+        match self.livekit.delete_room(id).await {
+            Ok(()) | Err(CallError::RoomNotFound { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
     pub async fn end_call(&self, id: Uuid, requester: u64) -> Result<(), CallServiceError> {
         let g = self.get_call(id).await.ok_or(CallServiceError::NotFound)?;
         if g.member(requester).await.map(|m| m.role == CallRole::Admin) != Some(true) {
             return Err(CallServiceError::NotAuthorized);
         }
+        self.delete_room(id).await?;
+        if let Some(db) = &self.persistence {
+            db.remove(id)
+                .map_err(|_| CallServiceError::DeliveryFailed)?;
+        }
         g.mark_ending().await;
-        self.livekit.delete_room(id).await?;
         self.groups.remove(&id);
         log_event!(
             0,
@@ -357,34 +560,11 @@ impl CallManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn secret() -> CallSecretEnvelope {
-        CallSecretEnvelope {
-            secret_id: "s".into(),
-            version_number: 1,
-            encrypted_secret: vec![1],
-            kem_ciphertext: vec![2],
-            wrapping_scheme: "test".into(),
-        }
-    }
     #[tokio::test]
-    async fn failed_room_creation_does_not_retain_creation_lock() {
-        let manager = CallManager::default();
-        let id = Uuid::new_v4();
-        assert!(
-            manager
-                .get_or_create_token(1, id, Some(secret()))
-                .await
-                .is_err()
-        );
-        assert!(manager.creation_locks.is_empty());
-        assert!(manager.groups.is_empty());
-    }
-
-    #[tokio::test]
-    async fn missing_call_without_creator_secret_is_not_found() {
+    async fn missing_call_is_not_found_even_with_a_token_request() {
         assert!(matches!(
             CallManager::default()
-                .get_or_create_token(1, Uuid::new_v4(), None)
+                .get_call_token(1, Uuid::new_v4())
                 .await,
             Err(CallServiceError::NotFound)
         ));
@@ -405,12 +585,11 @@ mod tests {
             id,
             1,
             1,
-            secret(),
             manager.livekit.clone(),
             CallLimits::default(),
         ));
         manager.groups.insert(id, group.clone());
-        manager.add_invite(id, 1, 2, secret()).await.unwrap();
+        manager.add_invite(id, 1, 2).await.unwrap();
         assert!(group.member(2).await.is_none());
         let _ = manager.get_call_token(2, id).await;
         assert!(group.member(2).await.is_some());
@@ -435,7 +614,6 @@ mod tests {
                     id,
                     1,
                     owner,
-                    secret(),
                     manager.livekit.clone(),
                     limits.clone(),
                 )),
@@ -449,7 +627,7 @@ mod tests {
             let barrier = barrier.clone();
             tasks.push(tokio::spawn(async move {
                 barrier.wait().await;
-                manager.add_invite(id, owner, 42, secret()).await
+                manager.add_invite(id, owner, 42).await
             }));
         }
         let first = tasks.remove(0).await.unwrap();
@@ -468,13 +646,12 @@ mod tests {
                 id,
                 1,
                 1,
-                secret(),
                 manager.livekit.clone(),
                 CallLimits::default(),
             )),
         );
         assert!(matches!(
-            manager.add_invite(id, 1, 1, secret()).await,
+            manager.add_invite(id, 1, 1).await,
             Err(CallServiceError::InvalidRequest)
         ));
     }

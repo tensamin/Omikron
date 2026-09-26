@@ -762,20 +762,57 @@ impl IotaConnection {
         let empty = calls.is_empty();
 
         for call in calls {
-            let state = call.state.read().await;
+            let (call_self, pending, members) = {
+                let state = call.state.read().await;
+                (
+                    state.members.get(&user_id).cloned(),
+                    state.pending_invites.get(&user_id).cloned(),
+                    state.members.keys().copied().collect::<Vec<_>>(),
+                )
+            };
 
-            // Find ourselves in the call to get our specific status
-            let call_self = state.members.get(&user_id).cloned();
+            if call_self.is_none() && pending.is_none() {
+                continue;
+            }
 
-            if let Some(call_self) = call_self {
-                let timeout = call_self.timeout_until_ms.unwrap_or(0);
-                let admin = call_self.role == crate::calls::call_group::CallRole::Admin;
+            // Iota is authoritative for entitlement and the recipient envelope.
+            let request = CommunicationValue::new(CommunicationType::CallEnvelopeGet)
+                .with_id(crate::calls::call_manager::CallManager::timestamp() as u32)
+                .add_typed_default(
+                    DataType::ReceiverId,
+                    DataValue::SignedNumber(user_id.into()),
+                )
+                .add_typed_default(DataType::CallId, DataValue::Str(call.call_id.to_string()));
+            let secret = self
+                .state
+                .rho
+                .get_for_user(user_id as i64)
+                .await
+                .map(|rho| rho.get_iota_connection().clone());
+            let secret = match secret {
+                Some(connection) => {
+                    connection
+                        .await_response(&request, Some(std::time::Duration::from_secs(8)))
+                        .await
+                }
+                None => Err("Iota unavailable".into()),
+            }
+            .ok()
+            .filter(|response| response.is_type(CommunicationType::CallEnvelopeGet))
+            .and_then(|response| response.get_data(DataType::CallSecret).cloned());
+            if let Some(secret) = secret {
+                let timeout = call_self
+                    .as_ref()
+                    .and_then(|member| member.timeout_until_ms)
+                    .unwrap_or(0);
+                let admin = call_self
+                    .as_ref()
+                    .is_some_and(|member| member.role == crate::calls::call_group::CallRole::Admin);
 
                 // List of all members in the call
-                let member_ids: Vec<DataValue> = state
-                    .members
-                    .values()
-                    .map(|m| DataValue::SignedNumber(m.user_id.into()))
+                let member_ids: Vec<DataValue> = members
+                    .iter()
+                    .map(|id| DataValue::SignedNumber((*id).into()))
                     .collect();
 
                 // Build base call container
@@ -792,6 +829,21 @@ impl IotaConnection {
                     data_type_id(DataType::CallMembers, &tm),
                     DataValue::Array(member_ids),
                 );
+                base_call_map.insert(data_type_id(DataType::CallSecret, &tm), secret);
+                base_call_map.insert(
+                    data_type_id(DataType::CreatedAt, &tm),
+                    DataValue::SignedNumber(call.created_at_ms.into()),
+                );
+                if let Some(pending) = pending {
+                    base_call_map.insert(
+                        data_type_id(DataType::CallInvited, &tm),
+                        DataValue::Bool(true),
+                    );
+                    base_call_map.insert(
+                        data_type_id(DataType::SenderId, &tm),
+                        DataValue::SignedNumber(pending.inviter_id.into()),
+                    );
+                }
 
                 if timeout > 0 {
                     base_call_map.insert(
@@ -805,19 +857,11 @@ impl IotaConnection {
                         .insert(data_type_id(DataType::HasAdmin, &tm), DataValue::Bool(true));
                 }
 
-                if let Some(secret) = call.get_secret_for_user(user_id).await {
-                    base_call_map.insert(
-                        data_type_id(DataType::CallSecret, &tm),
-                        secret.to_data_value(),
-                    );
-                }
-
                 // Add to global calls with only this user's recipient-specific secret.
                 global_calls.push(DataValue::container_from_map(&base_call_map));
 
                 // Attach this call to EVERY member of the call (other than ourselves)
-                for member in state.members.values() {
-                    let member_id = member.user_id;
+                for member_id in members {
                     if member_id == user_id {
                         continue;
                     }
