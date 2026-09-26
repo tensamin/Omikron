@@ -33,6 +33,12 @@ pub enum CallServiceError {
     #[error(transparent)]
     LiveKit(#[from] CallError),
 }
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum InviteRelation {
+    Member,
+    Pending,
+    New,
+}
 pub struct CallManager {
     pub(crate) groups: DashMap<Uuid, Arc<CallGroup>>,
     admission_locks: DashMap<u64, Arc<Mutex<()>>>,
@@ -263,7 +269,10 @@ impl CallManager {
             .map_err(Into::into)
     }
     pub async fn add_invite(&self, id: Uuid, from: u64, to: u64) -> Result<(), CallServiceError> {
-        let g = self.check_invite(id, from, to).await?;
+        let (g, relation) = self.check_invite(id, from, to).await?;
+        if relation == InviteRelation::Member {
+            return Ok(());
+        }
         let admission_lock = self
             .admission_locks
             .entry(to)
@@ -271,7 +280,9 @@ impl CallManager {
             .clone();
         let result = {
             let _guard = admission_lock.lock().await;
-            if self.get_call_groups(to).await.len() >= self.limits.max_calls_per_user {
+            if relation == InviteRelation::New
+                && self.get_call_groups(to).await.len() >= self.limits.max_calls_per_user
+            {
                 Err(CallServiceError::ResourceLimit)
             } else {
                 g.invite_with_storage(from, to, self.persistence.as_deref())
@@ -301,7 +312,7 @@ impl CallManager {
         id: Uuid,
         from: u64,
         to: u64,
-    ) -> Result<Arc<CallGroup>, CallServiceError> {
+    ) -> Result<(Arc<CallGroup>, InviteRelation), CallServiceError> {
         let g = self.get_call(id).await.ok_or(CallServiceError::NotFound)?;
         if from == to || g.created_at_ms + 259_200_000 <= Self::now_ms()? {
             return Err(CallServiceError::InvalidRequest);
@@ -315,19 +326,30 @@ impl CallManager {
             || caller
                 .timeout_until_ms
                 .is_some_and(|until| until > Self::timestamp())
-            || state.members.contains_key(&to)
-            || state.pending_invites.contains_key(&to)
         {
             return Err(CallServiceError::InvalidRequest);
         }
-        if state.pending_invites.len() >= self.limits.max_pending_invites_per_call {
+        let relation = if state.members.contains_key(&to) {
+            InviteRelation::Member
+        } else if state.pending_invites.get(&to).is_some_and(|invite| {
+            invite.created_at_ms + self.limits.invite_ttl.as_millis() as i64 > Self::timestamp()
+        }) {
+            InviteRelation::Pending
+        } else {
+            InviteRelation::New
+        };
+        if relation == InviteRelation::New
+            && state.pending_invites.len() >= self.limits.max_pending_invites_per_call
+        {
             return Err(CallServiceError::ResourceLimit);
         }
         drop(state);
-        if self.get_call_groups(to).await.len() >= self.limits.max_calls_per_user {
+        if relation == InviteRelation::New
+            && self.get_call_groups(to).await.len() >= self.limits.max_calls_per_user
+        {
             return Err(CallServiceError::ResourceLimit);
         }
-        Ok(g)
+        Ok((g, relation))
     }
     pub async fn call_data(
         &self,
@@ -654,5 +676,44 @@ mod tests {
             manager.add_invite(id, 1, 1).await,
             Err(CallServiceError::InvalidRequest)
         ));
+    }
+    #[tokio::test]
+    async fn reinviting_a_member_or_lapsed_participant_succeeds() {
+        let manager = Arc::new(CallManager::new_with_owner(
+            Arc::new(LiveKitService::new(Some(crate::config::LiveKitConfig {
+                hostname: "https://livekit.invalid".into(),
+                client_url: "wss://livekit.invalid".into(),
+                api_key: "key".into(),
+                api_secret: "secret".into(),
+            }))),
+            1,
+        ));
+        let id = Uuid::new_v4();
+        let group = Arc::new(CallGroup::new_with_service(
+            id,
+            1,
+            1,
+            manager.livekit.clone(),
+            CallLimits::default(),
+        ));
+        manager.groups.insert(id, group.clone());
+        // First invite creates a pending invite.
+        manager.add_invite(id, 1, 2).await.unwrap();
+        // A repeat invite while pending stays idempotent.
+        manager.add_invite(id, 1, 2).await.unwrap();
+        assert!(group.member(2).await.is_none());
+        // The invitee joins and becomes a member.
+        let _ = manager.get_call_token(2, id).await;
+        assert!(group.member(2).await.is_some());
+        // Re-inviting a connected member succeeds (it is a nudge, not an error).
+        manager.add_invite(id, 1, 2).await.unwrap();
+        assert!(group.member(2).await.is_some());
+        // The member leaves; membership is retained so they can rejoin.
+        group.revoke(2).await;
+        assert!(group.member(2).await.is_none());
+        // And a re-invite after leaving also succeeds, restoring the invite.
+        manager.add_invite(id, 1, 2).await.unwrap();
+        assert!(group.member(2).await.is_none());
+        assert!(group.is_related(2).await);
     }
 }

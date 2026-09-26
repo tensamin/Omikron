@@ -762,12 +762,13 @@ impl IotaConnection {
         let empty = calls.is_empty();
 
         for call in calls {
-            let (call_self, pending, members) = {
+            let (call_self, pending, members, pending_invitees) = {
                 let state = call.state.read().await;
                 (
                     state.members.get(&user_id).cloned(),
                     state.pending_invites.get(&user_id).cloned(),
                     state.members.keys().copied().collect::<Vec<_>>(),
+                    state.pending_invites.keys().copied().collect::<Vec<_>>(),
                 )
             };
 
@@ -777,7 +778,7 @@ impl IotaConnection {
 
             // Iota is authoritative for entitlement and the recipient envelope.
             let request = CommunicationValue::new(CommunicationType::CallEnvelopeGet)
-                .with_id(crate::calls::call_manager::CallManager::timestamp() as u32)
+                .with_id(crate::services::call_state::next_call_lookup_id())
                 .add_typed_default(
                     DataType::ReceiverId,
                     DataValue::SignedNumber(user_id.into()),
@@ -809,9 +810,11 @@ impl IotaConnection {
                     .as_ref()
                     .is_some_and(|member| member.role == crate::calls::call_group::CallRole::Admin);
 
-                // List of all members in the call
+                // List of all members in the call, plus pending invitees so
+                // clients recognize joinable calls for a contact.
                 let member_ids: Vec<DataValue> = members
                     .iter()
+                    .chain(pending_invitees.iter())
                     .map(|id| DataValue::SignedNumber((*id).into()))
                     .collect();
 
@@ -964,6 +967,8 @@ impl IotaConnection {
         };
 
         let typed_data: Vec<_> = response.iter_typed_data().collect();
+        let mut augmented_calls = false;
+        let mut original_calls = None;
         for (key, value) in typed_data {
             if key == Some(DataType::Contacts) {
                 if let Some(contacts) = value.as_array() {
@@ -972,6 +977,7 @@ impl IotaConnection {
                         .call_state_aggregator
                         .augment_contacts(user_id, contacts.clone())
                         .await;
+                    augmented_calls = true;
                     output =
                         output.add_typed_default(DataType::Contacts, DataValue::Array(contacts));
                     output =
@@ -979,8 +985,20 @@ impl IotaConnection {
                     continue;
                 }
             }
+            // The Iota snapshot always carries an empty Calls array; the
+            // augmented value above is authoritative. Re-adding the original
+            // here would clobber it.
+            if key == Some(DataType::Calls) {
+                original_calls = Some(value.clone());
+                continue;
+            }
             if let Some(data_type) = key {
                 output = output.add_typed_default(data_type, value.clone());
+            }
+        }
+        if !augmented_calls {
+            if let Some(calls) = original_calls {
+                output = output.add_typed_default(DataType::Calls, calls);
             }
         }
         output

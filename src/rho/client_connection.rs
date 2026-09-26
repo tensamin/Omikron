@@ -1194,7 +1194,7 @@ impl ClientConnection {
                         DataValue::SignedNumber(created_at.into()),
                     )
                     .add_typed_default(DataType::CallSecret, secret.to_data_value()),
-                Some(Duration::from_secs(8)),
+                Some(Duration::from_secs(20)),
             )
             .await
             .map_err(|_| ())?;
@@ -1303,7 +1303,7 @@ impl ClientConnection {
                         DataType::ReceiverId,
                         DataValue::SignedNumber(receiver_id.into()),
                     ),
-                Some(Duration::from_secs(8)),
+                Some(Duration::from_secs(20)),
             )
             .await;
         if !matches!(contact_response, Ok(ref response) if response.is_type(CommunicationType::CallContactCheck) && response.get_data(DataType::IsBlocked).as_bool() == Some(true))
@@ -1325,9 +1325,9 @@ impl ClientConnection {
         let policy_response = target_rho
             .get_iota_connection()
             .clone()
-            .await_response(&policy_request, Some(Duration::from_secs(8)))
+            .await_response(&policy_request, Some(Duration::from_secs(20)))
             .await;
-        let blocked = match policy_response {
+        let blocked = match &policy_response {
             Ok(response) if response.is_type(CommunicationType::UserBlockCheck) => {
                 response.get_data(DataType::IsBlocked).as_bool()
             }
@@ -1341,7 +1341,21 @@ impl ClientConnection {
             }
             Some(false) => {}
             None => {
-                self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                crate::log_event!(
+                    0,
+                    crate::util::logger::PrintType::Call,
+                    crate::util::logger::LogLevel::Warn,
+                    "call.invite_block_check_unavailable",
+                    "call_id={} sender_user_id={} recipient_user_id={} response={:?}",
+                    call_id,
+                    sender_id,
+                    receiver_id,
+                    policy_response
+                        .as_ref()
+                        .map(|response| response.get_type_name())
+                        .map_err(|error| error.as_str())
+                );
+                self.send_error_response(message_id, CommunicationType::ErrorNoIota)
                     .await;
                 return;
             }
@@ -1351,41 +1365,75 @@ impl ClientConnection {
                 .await;
             return;
         };
-        if let Err(error) = self
+        let relation = match self
             .state
             .call_manager
             .check_invite(call_id, self.user_id, receiver_id as u64)
             .await
         {
-            self.send_error_response(message_id, call_error_type(&error))
-                .await;
-            return;
-        }
-        if self
-            .store_call_envelope(
-                receiver_id as u64,
-                self.user_id,
-                call_id,
-                group.created_at_ms,
-                &secret,
-            )
-            .await
-            .is_err()
-        {
-            self.send_error_response(message_id, CommunicationType::ErrorNoIota)
-                .await;
-            return;
-        }
-        let invited = self
-            .state
-            .call_manager
-            .add_invite(call_id, self.user_id, receiver_id.unsigned_abs())
-            .await;
-        if let Err(error) = invited {
-            self.send_error_response(message_id, call_error_type(&error))
-                .await;
-            return;
-        }
+            Ok((_, relation)) => relation,
+            Err(error) => {
+                self.send_error_response(message_id, call_error_type(&error))
+                    .await;
+                return;
+            }
+        };
+        let forward_secret = match relation {
+            crate::calls::call_manager::InviteRelation::New => {
+                if self
+                    .store_call_envelope(
+                        receiver_id as u64,
+                        self.user_id,
+                        call_id,
+                        group.created_at_ms,
+                        &secret,
+                    )
+                    .await
+                    .is_err()
+                {
+                    self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                        .await;
+                    return;
+                }
+                if let Err(error) = self
+                    .state
+                    .call_manager
+                    .add_invite(call_id, self.user_id, receiver_id.unsigned_abs())
+                    .await
+                {
+                    self.send_error_response(message_id, call_error_type(&error))
+                        .await;
+                    return;
+                }
+                secret
+            }
+            relation => {
+                // Members and pending invitees already hold an envelope on
+                // their Iota. A re-invite must replay exactly that ciphertext,
+                // not freshly randomized bytes they cannot decrypt.
+                if relation == crate::calls::call_manager::InviteRelation::Pending {
+                    // Refresh the recorded inviter so the badge names the latest inviter.
+                    if let Err(error) = self
+                        .state
+                        .call_manager
+                        .add_invite(call_id, self.user_id, receiver_id.unsigned_abs())
+                        .await
+                    {
+                        self.send_error_response(message_id, call_error_type(&error))
+                            .await;
+                        return;
+                    }
+                }
+                match self.get_call_envelope(receiver_id as u64, call_id).await {
+                    Ok(stored) => stored,
+                    Err(()) => {
+                        self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                            .await;
+                        return;
+                    }
+                }
+            }
+        };
 
         if !self
             .state
@@ -1399,9 +1447,10 @@ impl ClientConnection {
 
         // Create and send call distribution message
         let forward = CommunicationValue::new(CommunicationType::CallInvite)
+            .with_id(next_policy_request_id())
             .with_receiver(receiver_id.unsigned_abs())
             .with_sender(sender_id as u64)
-            .add_typed_default(DataType::CallSecret, secret.to_data_value())
+            .add_typed_default(DataType::CallSecret, forward_secret.to_data_value())
             .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
             .add_typed_default(
                 DataType::ReceiverId,
@@ -1416,13 +1465,39 @@ impl ClientConnection {
                 DataValue::SignedNumber((self.state.call_manager.owner_omikron_id as i64).into()),
             );
 
-        // The invitation is already stored; live delivery is best effort.
-        let _ = target_rho
-            .send_to_local_user(receiver_id.unsigned_abs(), &forward)
-            .await;
-
         let response = CommunicationValue::new(CommunicationType::Success).with_id(message_id);
         self.send_message(&response).await;
+
+        // The invitation is durable. A stalled client must not delay the sender's acknowledgement.
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                Duration::from_secs(8),
+                target_rho.send_to_local_user(receiver_id.unsigned_abs(), &forward),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => crate::log_event!(
+                    0,
+                    crate::util::logger::PrintType::Call,
+                    crate::util::logger::LogLevel::Warn,
+                    "call.invite_live_delivery_failed",
+                    "call_id={} recipient_user_id={} error={}",
+                    call_id,
+                    receiver_id,
+                    error
+                ),
+                Err(_) => crate::log_event!(
+                    0,
+                    crate::util::logger::PrintType::Call,
+                    crate::util::logger::LogLevel::Warn,
+                    "call.invite_live_delivery_failed",
+                    "call_id={} recipient_user_id={} error=timeout",
+                    call_id,
+                    receiver_id
+                ),
+            }
+        });
     }
 
     /// Handle get call request

@@ -106,7 +106,7 @@ impl CallPersistence {
         created_at: i64,
     ) -> Result<(), rusqlite::Error> {
         let db = self.db.lock().unwrap();
-        db.execute("INSERT INTO call_invites (call_id, user_id, inviter_id, created_at_ms) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(call_id, user_id) DO UPDATE SET inviter_id=excluded.inviter_id", params![id.to_string(), user as i64, inviter as i64, created_at])?;
+        db.execute("INSERT INTO call_invites (call_id, user_id, inviter_id, created_at_ms) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(call_id, user_id) DO UPDATE SET inviter_id=excluded.inviter_id, created_at_ms=excluded.created_at_ms", params![id.to_string(), user as i64, inviter as i64, created_at])?;
         Ok(())
     }
 

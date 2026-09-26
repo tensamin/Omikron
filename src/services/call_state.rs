@@ -1,10 +1,34 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 use std::time::Duration;
 
 use crate::{calls::call_manager::CallManager, util::data_type_id};
+
+/*
+ * Correlation ids for Omikron-to-Iota call lookups. Timestamps truncate badly
+ * to u32 and collide across concurrent snapshots, which silently drops one
+ * side's envelope lookup, so ids come from a dedicated counter instead.
+ */
+static NEXT_CALL_LOOKUP_ID: AtomicU32 = AtomicU32::new(1);
+
+pub(crate) fn next_call_lookup_id() -> u32 {
+    let mut current = NEXT_CALL_LOOKUP_ID.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).unwrap_or(1);
+        match NEXT_CALL_LOOKUP_ID.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 pub struct CallStateAggregator {
     call_manager: Arc<CallManager>,
@@ -34,12 +58,13 @@ impl CallStateAggregator {
         let mut global_calls = Vec::new();
 
         for call in self.call_manager.get_call_groups(user_id).await {
-            let (call_self, pending, members) = {
+            let (call_self, pending, members, pending_invitees) = {
                 let state = call.state.read().await;
                 (
                     state.members.get(&user_id).cloned(),
                     state.pending_invites.get(&user_id).cloned(),
                     state.members.keys().copied().collect::<Vec<_>>(),
+                    state.pending_invites.keys().copied().collect::<Vec<_>>(),
                 )
             };
             if call_self.is_none() && pending.is_none() {
@@ -50,7 +75,7 @@ impl CallStateAggregator {
                     continue;
                 };
                 let request = CommunicationValue::new(CommunicationType::CallEnvelopeGet)
-                    .with_id(crate::calls::call_manager::CallManager::timestamp() as u32)
+                    .with_id(crate::services::call_state::next_call_lookup_id())
                     .add_typed_default(
                         DataType::ReceiverId,
                         DataValue::SignedNumber(user_id.into()),
@@ -85,9 +110,12 @@ impl CallStateAggregator {
             );
             call_map.insert(
                 data_type_id(DataType::CallMembers, &tm),
+                // The wire list includes pending invitees so clients can
+                // recognize joinable calls for a contact before joining.
                 DataValue::Array(
                     members
                         .iter()
+                        .chain(pending_invitees.iter())
                         .map(|member| DataValue::SignedNumber((*member).into()))
                         .collect(),
                 ),
