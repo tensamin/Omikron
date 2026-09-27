@@ -1,10 +1,13 @@
 mod anonymous_clients;
+#[allow(dead_code)]
+mod app_protection;
 mod app_state;
 mod calls;
 mod config;
 mod data;
 mod identity;
 mod omega;
+mod provisioning;
 mod rho;
 mod services;
 mod util;

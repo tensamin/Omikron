@@ -8,6 +8,7 @@ use crate::{
     calls::{call_manager::CallManager, call_util::LiveKitService},
     config::Config,
     omega::omega_connection::OmegaConnection,
+    provisioning::ProvisioningManager,
     rho::rho_manager::RhoManager,
     services::call_state::CallStateAggregator,
 };
@@ -77,6 +78,7 @@ pub struct AppState {
     pub call_state_aggregator: Arc<CallStateAggregator>,
     pub livekit: Arc<LiveKitService>,
     pub rho_connection_limits: Arc<RhoConnectionLimits>,
+    pub provisioning: Arc<ProvisioningManager>,
 }
 
 impl AppState {
@@ -94,6 +96,10 @@ impl AppState {
             config.rho_max_anonymous_connections_per_ip,
         ));
         Arc::new(Self {
+            provisioning: Arc::new(ProvisioningManager::new(
+                config.provisioning_session_ttl,
+                config.provisioning_max_sessions,
+            )),
             config,
             keyring,
             omega,

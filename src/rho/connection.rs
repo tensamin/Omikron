@@ -8,8 +8,8 @@ use crate::{
     log_err, log_in, log_out,
     rho::{
         app_connection::AppConnection, client_connection::ClientConnection,
-        iota_connection::IotaConnection, registration_connection::RegistrationConnection,
-        rho_connection::RhoConnection,
+        iota_connection::IotaConnection, provisioning_connection::ProvisioningConnection,
+        registration_connection::RegistrationConnection, rho_connection::RhoConnection,
     },
     util::logger::PrintType,
 };
@@ -202,6 +202,14 @@ mod tests {
             connection_kind(Some("registering-client"), &AuthState::Authenticated),
             None
         );
+        assert_eq!(
+            connection_kind(Some("provisioning-client"), &AuthState::Unauthenticated),
+            Some(ConnectionKind::ProvisioningClient)
+        );
+        assert_eq!(
+            connection_kind(Some("provisioning-client"), &AuthState::Authenticated),
+            None
+        );
     }
 
     #[test]
@@ -247,6 +255,7 @@ pub enum ConnectionKind {
     Iota,
     AnonymousClient,
     RegisteringClient,
+    ProvisioningClient,
     TAuth,
 }
 
@@ -257,6 +266,9 @@ fn connection_kind(description: Option<&str>, auth_state: &AuthState) -> Option<
         (Some("anonymous"), AuthState::Unauthenticated) => Some(ConnectionKind::AnonymousClient),
         (Some("registering-client"), AuthState::Unauthenticated) => {
             Some(ConnectionKind::RegisteringClient)
+        }
+        (Some("provisioning-client"), AuthState::Unauthenticated) => {
+            Some(ConnectionKind::ProvisioningClient)
         }
         (Some("tauth"), AuthState::Unauthenticated) => Some(ConnectionKind::TAuth),
         _ => None,
@@ -290,7 +302,10 @@ impl GeneralConnection {
     pub fn new(conn: WebMTPConnection, state: Arc<AppState>) -> Option<Arc<Self>> {
         let kind = connection_kind(conn.description.as_deref(), &conn.auth_state)?;
 
-        let id = if kind == ConnectionKind::RegisteringClient {
+        let id = if matches!(
+            kind,
+            ConnectionKind::RegisteringClient | ConnectionKind::ProvisioningClient
+        ) {
             (rand::random::<u64>() & ((1_u64 << 48) - 1)).max(1)
         } else {
             conn.client_id
@@ -306,7 +321,9 @@ impl GeneralConnection {
             id,
             rho_connection: Arc::new(RwLock::new(None)),
             session_id: Arc::new(RwLock::new(match kind {
-                ConnectionKind::Client | ConnectionKind::RegisteringClient => {
+                ConnectionKind::Client
+                | ConnectionKind::RegisteringClient
+                | ConnectionKind::ProvisioningClient => {
                     ((Uuid::new_v4().as_u128() as u64) & ((1_u64 << 53) - 1)).max(1)
                 }
                 _ => id,
@@ -317,6 +334,10 @@ impl GeneralConnection {
 
     pub fn connection_kind(&self) -> ConnectionKind {
         self.connection_kind
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub async fn handle(self: Arc<Self>) {
@@ -347,6 +368,12 @@ impl GeneralConnection {
             }
             ConnectionKind::RegisteringClient => {
                 RegistrationConnection::from_general(self.clone())
+                    .start()
+                    .await;
+                true
+            }
+            ConnectionKind::ProvisioningClient => {
+                ProvisioningConnection::from_general(self.clone())
                     .start()
                     .await;
                 true

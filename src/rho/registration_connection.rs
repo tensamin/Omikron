@@ -6,10 +6,7 @@ use crate::{
     util::logger::PrintType,
 };
 use mtp::{
-    codec::{
-        CommunicationType, CommunicationValue, DataType, DataValue, ProtectionPolicy,
-        ProtectionPurpose,
-    },
+    codec::{CommunicationType, CommunicationValue, DataType, DataValue, ProtectionPolicy},
     crypto::PublicKeyBundle,
 };
 use std::sync::Arc;
@@ -279,7 +276,7 @@ impl RegistrationConnection {
             .verify_with_policy(
                 registration.user_id as u64,
                 &registration.public_key,
-                ProtectionPurpose::from(0x71),
+                crate::app_protection::purpose(crate::app_protection::REGISTRATION_ACTIVATION),
                 ProtectionPolicy::dual(),
             )
             .is_err()

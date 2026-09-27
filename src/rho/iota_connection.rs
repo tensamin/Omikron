@@ -11,7 +11,7 @@ use crate::rho::connection::{
 use crate::rho::relay_router::{self, RelaySource};
 use crate::util::data_type_id;
 use crate::util::logger::PrintType;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use mtp::codec::CommunicationType;
 use mtp::codec::CommunicationValue;
 use mtp::codec::DataType;
@@ -991,6 +991,47 @@ impl IotaConnection {
                     timeout.as_secs()
                 ))
             }
+        }
+    }
+
+    /// Use a relay-owned frame ID so independent callers cannot collide on Iota.
+    pub async fn await_response_rekeyed(
+        self: Arc<Self>,
+        cv: &CommunicationValue,
+        timeout_duration: Option<Duration>,
+    ) -> Result<CommunicationValue, String> {
+        let external_id = cv.require_id().map_err(|error| error.to_string())?;
+        let (tx, mut rx) = mpsc::channel(1);
+        let internal_id = loop {
+            let candidate = rand::random::<u32>();
+            if candidate == 0 {
+                continue;
+            }
+            match self.waiting_tasks.entry(candidate) {
+                Entry::Occupied(_) => continue,
+                Entry::Vacant(entry) => {
+                    entry.insert(Box::new({
+                        let tx = tx.clone();
+                        move |_, response| {
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let _ = tx.send(response).await;
+                            });
+                            true
+                        }
+                    }));
+                    break candidate;
+                }
+            }
+        };
+        self.send_message(&cv.clone().with_id(internal_id)).await;
+        let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
+        let result = tokio::time::timeout(timeout, rx.recv()).await;
+        self.waiting_tasks.remove(&internal_id);
+        match result {
+            Ok(Some(response)) => Ok(response.with_id(external_id)),
+            Ok(None) => Err("Iota response channel closed".into()),
+            Err(_) => Err("Iota request timed out".into()),
         }
     }
 }

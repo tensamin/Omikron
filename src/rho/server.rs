@@ -261,6 +261,7 @@ pub async fn start(
 
     let web_config = web_config(state.config.rho_max_connections)?;
     let mut host = MTPWebServer::new(host_config, web_config).await?;
+    let mut provisioning_cleanup = tokio::time::interval(Duration::from_secs(30));
     log!(
         0,
         PrintType::General,
@@ -272,6 +273,10 @@ pub async fn start(
     loop {
         let accepted = tokio::select! {
             _ = shutdown.wait_for(|shutting_down| *shutting_down) => break,
+            _ = provisioning_cleanup.tick() => {
+                state.provisioning.prune_expired();
+                continue;
+            }
             accepted = host.accept() => accepted,
         };
         let conn = match accepted {
@@ -318,6 +323,7 @@ pub async fn start(
                 conn.connection_kind(),
                 ConnectionKind::AnonymousClient
                     | ConnectionKind::RegisteringClient
+                    | ConnectionKind::ProvisioningClient
                     | ConnectionKind::TAuth
             ) {
                 match state
@@ -344,6 +350,7 @@ pub async fn start(
                 conn.connection_kind(),
                 ConnectionKind::AnonymousClient
                     | ConnectionKind::RegisteringClient
+                    | ConnectionKind::ProvisioningClient
                     | ConnectionKind::TAuth
             ) {
                 let Some(peer_ip) = peer_ip else {

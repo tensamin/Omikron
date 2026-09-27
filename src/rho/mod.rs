@@ -2,6 +2,7 @@ pub mod app_connection;
 pub mod client_connection;
 pub mod connection;
 pub mod iota_connection;
+pub mod provisioning_connection;
 pub mod registration_connection;
 pub mod relay_router;
 pub mod rho_connection;

@@ -585,6 +585,41 @@ impl ClientConnection {
             if matches!(
                 cv.get_comm_type_enum(),
                 Some(
+                    CommunicationType::PasswordEnrollmentStart
+                        | CommunicationType::PasswordEnrollmentFinish
+                        | CommunicationType::PasswordEnrollmentStatus
+                        | CommunicationType::PasswordEnrollmentDisable
+                )
+            ) {
+                let Some(rho) = self.get_rho_connection().await else {
+                    self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                        .await;
+                    return;
+                };
+                if cv.receiver() != Some(rho.get_iota_id().await)
+                    || cv.payload().as_encrypted().is_none()
+                {
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                        .await;
+                    return;
+                }
+                match rho
+                    .get_iota_connection()
+                    .clone()
+                    .await_response_rekeyed(&cv, Some(Duration::from_secs(30)))
+                    .await
+                {
+                    Ok(response) => self.send_message(&response.with_id(message_id)).await,
+                    Err(_) => {
+                        self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                            .await
+                    }
+                }
+                return;
+            }
+            if matches!(
+                cv.get_comm_type_enum(),
+                Some(
                     CommunicationType::TAuthAuthorize
                         | CommunicationType::TAuthGrantList
                         | CommunicationType::TAuthGrantRevoke

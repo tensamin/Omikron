@@ -75,6 +75,8 @@ pub struct Config {
     pub rho_max_anonymous_connections: usize,
     /// Maximum number of anonymous sessions from one peer IP address.
     pub rho_max_anonymous_connections_per_ip: usize,
+    pub provisioning_session_ttl: Duration,
+    pub provisioning_max_sessions: usize,
     /// Maximum number of log entries waiting for the logger thread.
     pub logger_queue_capacity: usize,
     pub livekit: Option<LiveKitConfig>,
@@ -191,6 +193,14 @@ impl Config {
             rho_max_connections,
             rho_max_anonymous_connections,
             rho_max_anonymous_connections_per_ip,
+            provisioning_session_ttl: Duration::from_secs(parse_positive_or_default(
+                "PROVISIONING_SESSION_TTL_SECONDS",
+                600,
+            )?),
+            provisioning_max_sessions: parse_positive_or_default(
+                "PROVISIONING_MAX_SESSIONS",
+                1024,
+            )?,
             logger_queue_capacity,
             livekit: livekit_from_environment()?,
         })
