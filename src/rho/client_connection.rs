@@ -13,11 +13,12 @@ use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue};
 use mtp::crypto::PublicKeyBundle;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use std::{collections::VecDeque, str::FromStr};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 use uuid::Uuid;
 
 static NEXT_POLICY_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
@@ -67,7 +68,6 @@ pub enum DeviceClass {
 pub struct SessionActivity {
     pub reported: bool,
     pub device_class: DeviceClass,
-    pub foreground: bool,
     pub notification_capable: bool,
 }
 
@@ -76,7 +76,6 @@ impl Default for SessionActivity {
         Self {
             reported: false,
             device_class: DeviceClass::Web,
-            foreground: false,
             notification_capable: false,
         }
     }
@@ -157,6 +156,7 @@ pub struct ClientConnection {
     message_slots: Arc<tokio::sync::Semaphore>,
     client_state_sync: Arc<Mutex<ClientStateSyncState>>,
     session_activity: Arc<RwLock<SessionActivity>>,
+    foreground_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
 }
 
 impl ClientConnection {
@@ -244,11 +244,29 @@ impl ClientConnection {
             message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
             client_state_sync: Arc::new(Mutex::new(ClientStateSyncState::default())),
             session_activity: Arc::new(RwLock::new(SessionActivity::default())),
+            foreground_requests: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub async fn session_activity(&self) -> SessionActivity {
         self.session_activity.read().await.clone()
+    }
+
+    pub async fn foreground(&self) -> bool {
+        let id = NEXT_POLICY_REQUEST_ID.fetch_add(1, Ordering::Relaxed) | 0x8000_0000;
+        let (sender, receiver) = oneshot::channel();
+        self.foreground_requests.lock().await.insert(id, sender);
+        let request = CommunicationValue::new(CommunicationType::SessionActivitySet).with_id(id);
+        let foreground = tokio::time::timeout(Duration::from_secs(1), async {
+            self.send_relay(&request).await.ok()?;
+            receiver.await.ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        self.foreground_requests.lock().await.remove(&id);
+        foreground
     }
     pub fn start(self: Arc<Self>) {
         let self_clone = self.clone();
@@ -470,6 +488,11 @@ impl ClientConnection {
             }
 
             if cv.is_type(CommunicationType::SessionActivitySet) {
+                if let Some(reply) = self.foreground_requests.lock().await.remove(&message_id) {
+                    let _ =
+                        reply.send(cv.get_data(DataType::Foreground).as_bool().unwrap_or(false));
+                    return;
+                }
                 let device_class = match cv.get_data(DataType::DeviceClass).as_str() {
                     Some("desktop") => DeviceClass::Desktop,
                     Some("mobile") => DeviceClass::Mobile,
@@ -479,11 +502,6 @@ impl ClientConnection {
                             .await;
                         return;
                     }
-                };
-                let Some(foreground) = cv.get_data(DataType::Foreground).as_bool() else {
-                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
-                        .await;
-                    return;
                 };
                 let Some(notification_capable) =
                     cv.get_data(DataType::NotificationCapable).as_bool()
@@ -495,7 +513,6 @@ impl ClientConnection {
                 *self.session_activity.write().await = SessionActivity {
                     reported: true,
                     device_class,
-                    foreground,
                     notification_capable,
                 };
                 self.send_message(
@@ -688,6 +705,13 @@ impl ClientConnection {
             }
 
             if cv.is_type(CommunicationType::AccountStateRequest) {
+                let device_class = match cv.get_data(DataType::DeviceClass).as_str() {
+                    Some("desktop") => Some(DeviceClass::Desktop),
+                    Some("mobile") => Some(DeviceClass::Mobile),
+                    Some("web") => Some(DeviceClass::Web),
+                    _ => None,
+                };
+                let notification_capable = cv.get_data(DataType::NotificationCapable).as_bool();
                 let can_request = {
                     let mut state = self.client_state_sync.lock().await;
                     if matches!(state.phase, ClientStateSyncPhase::Idle) {
@@ -706,6 +730,15 @@ impl ClientConnection {
                         .await;
                     return;
                 }
+                if let (Some(device_class), Some(notification_capable)) =
+                    (device_class, notification_capable)
+                {
+                    *self.session_activity.write().await = SessionActivity {
+                        reported: true,
+                        device_class,
+                        notification_capable,
+                    };
+                }
                 let Some(rho) = self.get_rho_connection().await else {
                     self.reset_client_state_sync().await;
                     self.send_error_response(message_id, CommunicationType::ErrorNoIota)
@@ -714,6 +747,8 @@ impl ClientConnection {
                 };
                 let mut request = cv.clone();
                 request.remove_data(DataType::SessionId);
+                request.remove_data(DataType::DeviceClass);
+                request.remove_data(DataType::NotificationCapable);
                 let request = request.with_sender(self.user_id).add_typed_default(
                     DataType::SessionId,
                     DataValue::UnsignedNumber(self.session_id.into()),
@@ -1904,6 +1939,7 @@ impl ClientConnection {
             return;
         }
         *is_open_guard = false;
+        self.foreground_requests.lock().await.clear();
 
         let _ = self.sender.close();
     }
@@ -2006,6 +2042,7 @@ impl Clone for ClientConnection {
             message_slots: Arc::clone(&self.message_slots),
             client_state_sync: Arc::clone(&self.client_state_sync),
             session_activity: Arc::clone(&self.session_activity),
+            foreground_requests: Arc::clone(&self.foreground_requests),
         }
     }
 }
