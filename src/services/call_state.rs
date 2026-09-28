@@ -1,17 +1,51 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-use mtp::codec::{DataType, DataValue, TypeMap};
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
+use std::time::Duration;
 
 use crate::{calls::call_manager::CallManager, util::data_type_id};
 
+/*
+ * Correlation ids for Omikron-to-Iota call lookups. Timestamps truncate badly
+ * to u32 and collide across concurrent snapshots, which silently drops one
+ * side's envelope lookup, so ids come from a dedicated counter instead.
+ */
+static NEXT_CALL_LOOKUP_ID: AtomicU32 = AtomicU32::new(1);
+
+pub(crate) fn next_call_lookup_id() -> u32 {
+    let mut current = NEXT_CALL_LOOKUP_ID.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1).unwrap_or(1);
+        match NEXT_CALL_LOOKUP_ID.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 pub struct CallStateAggregator {
     call_manager: Arc<CallManager>,
+    rho: Option<Arc<crate::rho::rho_manager::RhoManager>>,
 }
 
 impl CallStateAggregator {
     pub fn new(call_manager: Arc<CallManager>) -> Self {
-        Self { call_manager }
+        Self {
+            call_manager,
+            rho: None,
+        }
+    }
+
+    pub fn with_rho(mut self, rho: Arc<crate::rho::rho_manager::RhoManager>) -> Self {
+        self.rho = Some(rho);
+        self
     }
 
     pub async fn augment_contacts(
@@ -24,10 +58,46 @@ impl CallStateAggregator {
         let mut global_calls = Vec::new();
 
         for call in self.call_manager.get_call_groups(user_id).await {
-            let state = call.state.read().await;
-            let Some(call_self) = state.members.get(&user_id) else {
-                continue;
+            let (call_self, pending, members, pending_invitees) = {
+                let state = call.state.read().await;
+                (
+                    state.members.get(&user_id).cloned(),
+                    state.pending_invites.get(&user_id).cloned(),
+                    state.members.keys().copied().collect::<Vec<_>>(),
+                    state.pending_invites.keys().copied().collect::<Vec<_>>(),
+                )
             };
+            if call_self.is_none() && pending.is_none() {
+                continue;
+            }
+            let secret = if let Some(rho_manager) = &self.rho {
+                let Some(rho) = rho_manager.get_for_user(user_id as i64).await else {
+                    continue;
+                };
+                let request = CommunicationValue::new(CommunicationType::CallEnvelopeGet)
+                    .with_id(crate::services::call_state::next_call_lookup_id())
+                    .add_typed_default(
+                        DataType::ReceiverId,
+                        DataValue::SignedNumber(user_id.into()),
+                    )
+                    .add_typed_default(DataType::CallId, DataValue::Str(call.call_id.to_string()));
+                match rho
+                    .get_iota_connection()
+                    .clone()
+                    .await_response(&request, Some(Duration::from_secs(8)))
+                    .await
+                {
+                    Ok(response) if response.is_type(CommunicationType::CallEnvelopeGet) => {
+                        response.get_data(DataType::CallSecret).cloned()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if self.rho.is_some() && secret.is_none() {
+                continue;
+            }
 
             let mut call_map = BTreeMap::new();
             call_map.insert(
@@ -40,40 +110,55 @@ impl CallStateAggregator {
             );
             call_map.insert(
                 data_type_id(DataType::CallMembers, &tm),
+                // The wire list includes pending invitees so clients can
+                // recognize joinable calls for a contact before joining.
                 DataValue::Array(
-                    state
-                        .members
-                        .values()
-                        .map(|member| DataValue::SignedNumber(member.user_id.into()))
+                    members
+                        .iter()
+                        .chain(pending_invitees.iter())
+                        .map(|member| DataValue::SignedNumber((*member).into()))
                         .collect(),
                 ),
             );
 
-            if let Some(timeout) = call_self.timeout_until_ms {
+            if let Some(timeout) = call_self
+                .as_ref()
+                .and_then(|member| member.timeout_until_ms)
+            {
                 call_map.insert(
                     data_type_id(DataType::Timeout, &tm),
                     DataValue::SignedNumber((timeout as i64).into()),
                 );
             }
-            if call_self.role == crate::calls::call_group::CallRole::Admin {
+            if call_self
+                .as_ref()
+                .is_some_and(|member| member.role == crate::calls::call_group::CallRole::Admin)
+            {
                 call_map.insert(data_type_id(DataType::HasAdmin, &tm), DataValue::Bool(true));
             }
-            if let Some(secret) = call.get_secret_for_user(user_id).await {
+            if let Some(secret) = secret {
+                call_map.insert(data_type_id(DataType::CallSecret, &tm), secret);
+            }
+            call_map.insert(
+                data_type_id(DataType::CreatedAt, &tm),
+                DataValue::SignedNumber(call.created_at_ms.into()),
+            );
+            if let Some(pending) = pending {
                 call_map.insert(
-                    data_type_id(DataType::CallSecret, &tm),
-                    secret.to_data_value(),
+                    data_type_id(DataType::CallInvited, &tm),
+                    DataValue::Bool(true),
+                );
+                call_map.insert(
+                    data_type_id(DataType::SenderId, &tm),
+                    DataValue::SignedNumber(pending.inviter_id.into()),
                 );
             }
 
             let call_value = DataValue::container_from_map(&call_map);
             global_calls.push(call_value.clone());
-            for member in state
-                .members
-                .values()
-                .filter(|member| member.user_id != user_id)
-            {
+            for member in members.into_iter().filter(|member| *member != user_id) {
                 invites
-                    .entry(member.user_id as i64)
+                    .entry(member as i64)
                     .or_insert_with(Vec::new)
                     .push(call_value.clone());
             }
@@ -105,7 +190,7 @@ impl CallStateAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calls::call_group::{CallGroup, CallSecretEnvelope};
+    use crate::calls::call_group::CallGroup;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -127,30 +212,10 @@ mod tests {
             call_id,
             42,
             1,
-            CallSecretEnvelope {
-                secret_id: "s".into(),
-                version_number: 1,
-                encrypted_secret: vec![],
-                kem_ciphertext: vec![],
-                wrapping_scheme: "s".into(),
-            },
             Arc::new(crate::calls::call_util::LiveKitService::new(None)),
             crate::config::CallLimits::default(),
         ));
-        group
-            .invite(
-                1,
-                2,
-                CallSecretEnvelope {
-                    secret_id: "s2".into(),
-                    version_number: 1,
-                    encrypted_secret: vec![],
-                    kem_ciphertext: vec![],
-                    wrapping_scheme: "s".into(),
-                },
-            )
-            .await
-            .unwrap();
+        group.invite(1, 2).await.unwrap();
         group.accept_invite(2).await.unwrap();
         manager.groups.insert(call_id, group);
 

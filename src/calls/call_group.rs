@@ -8,20 +8,17 @@ use crate::{
 };
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 use serde::Serialize;
-use std::{
-    collections::BTreeMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub struct CallGroup {
     pub call_id: Uuid,
     pub owner_omikron_id: u64,
+    pub created_at_ms: i64,
     pub state: RwLock<CallGroupState>,
-    livekit: Arc<LiveKitService>,
-    limits: CallLimits,
+    pub(crate) livekit: Arc<LiveKitService>,
+    pub(crate) limits: CallLimits,
 }
 pub struct CallGroupState {
     pub members: BTreeMap<u64, CallMember>,
@@ -35,13 +32,12 @@ pub struct CallMember {
     pub user_id: u64,
     pub role: CallRole,
     pub timeout_until_ms: Option<i64>,
-    pub secret: Option<CallSecretEnvelope>,
+    pub participating: bool,
 }
 #[derive(Clone)]
 pub struct PendingCallInvite {
     pub inviter_id: u64,
-    pub secret: CallSecretEnvelope,
-    pub created_at: Instant,
+    pub created_at_ms: i64,
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum CallRole {
@@ -116,6 +112,12 @@ impl CallSecretEnvelope {
         DataValue::container_from_map(&m)
     }
 }
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
 pub fn call_invite_secret_from_cv(cv: &CommunicationValue) -> Option<CallSecretEnvelope> {
     CallSecretEnvelope::from_data_value(cv.get_data(DataType::CallSecret)?)
 }
@@ -130,7 +132,6 @@ impl CallGroup {
         id: Uuid,
         owner: u64,
         creator: u64,
-        secret: CallSecretEnvelope,
         livekit: Arc<LiveKitService>,
         limits: CallLimits,
     ) -> Self {
@@ -141,12 +142,16 @@ impl CallGroup {
                 user_id: creator,
                 role: CallRole::Admin,
                 timeout_until_ms: None,
-                secret: Some(secret),
+                participating: false,
             },
         );
         Self {
             call_id: id,
             owner_omikron_id: owner,
+            created_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as i64)
+                .unwrap_or_default(),
             state: RwLock::new(CallGroupState {
                 members,
                 pending_invites: BTreeMap::new(),
@@ -164,24 +169,12 @@ impl CallGroup {
     pub async fn is_related(&self, id: u64) -> bool {
         let s = self.state.read().await;
         s.members.contains_key(&id)
-            || s.pending_invites
-                .get(&id)
-                .is_some_and(|invite| invite.created_at.elapsed() <= self.limits.invite_ttl)
+            || s.pending_invites.get(&id).is_some_and(|invite| {
+                invite.created_at_ms + self.limits.invite_ttl.as_millis() as i64 > now_ms()
+            })
     }
     pub async fn member_ids(&self) -> Vec<u64> {
         self.state.read().await.members.keys().copied().collect()
-    }
-    pub async fn get_secret_for_user(&self, id: u64) -> Option<CallSecretEnvelope> {
-        let s = self.state.read().await;
-        s.members
-            .get(&id)
-            .and_then(|m| m.secret.clone())
-            .or_else(|| {
-                s.pending_invites
-                    .get(&id)
-                    .filter(|invite| invite.created_at.elapsed() <= self.limits.invite_ttl)
-                    .map(|i| i.secret.clone())
-            })
     }
     pub async fn get_caller(&self, id: u64) -> Option<Caller> {
         let m = self.member(id).await?;
@@ -209,18 +202,25 @@ impl CallGroup {
     pub async fn get_short_link(&self) -> Option<String> {
         self.state.read().await.short_link.clone()
     }
-    pub async fn invite(
+    pub async fn invite(&self, from: u64, to: u64) -> Result<(), CallServiceError> {
+        self.invite_with_storage(from, to, None).await
+    }
+    pub async fn invite_with_storage(
         &self,
         from: u64,
         to: u64,
-        secret: CallSecretEnvelope,
+        persistence: Option<&crate::calls::persistence::CallPersistence>,
     ) -> Result<(), CallServiceError> {
         let mut state = self.state.write().await;
-        state
-            .pending_invites
-            .retain(|_, invite| invite.created_at.elapsed() <= self.limits.invite_ttl);
+        let now = now_ms();
+        state.pending_invites.retain(|_, invite| {
+            invite.created_at_ms + self.limits.invite_ttl.as_millis() as i64 > now
+        });
         if state.ending
-            || !state.members.contains_key(&from)
+            || !state
+                .members
+                .get(&from)
+                .is_some_and(|member| member.timeout_until_ms.is_none_or(|until| until <= now))
             || from == to
             || state.members.contains_key(&to)
         {
@@ -231,49 +231,44 @@ impl CallGroup {
         {
             return Err(CallServiceError::ResourceLimit);
         }
+        if let Some(db) = persistence {
+            db.store_invite(self.call_id, to, from, now)
+                .map_err(|_| CallServiceError::DeliveryFailed)?;
+        }
         state.pending_invites.insert(
             to,
             PendingCallInvite {
                 inviter_id: from,
-                secret,
-                created_at: Instant::now(),
+                created_at_ms: now,
             },
         );
         Ok(())
     }
-    pub async fn rollback_invite(&self, id: u64) {
-        self.state.write().await.pending_invites.remove(&id);
-    }
     pub async fn accept_invite(&self, id: u64) -> Result<CallMember, CallServiceError> {
         let mut s = self.state.write().await;
-        s.pending_invites
-            .retain(|_, invite| invite.created_at.elapsed() <= self.limits.invite_ttl);
+        s.pending_invites.retain(|_, invite| {
+            invite.created_at_ms + self.limits.invite_ttl.as_millis() as i64 > now_ms()
+        });
         if s.ending {
             return Err(CallServiceError::InvalidRequest);
         }
         if s.members.len() >= self.limits.max_members_per_call {
             return Err(CallServiceError::ResourceLimit);
         }
-        let i = s
-            .pending_invites
+        s.pending_invites
             .remove(&id)
             .ok_or(CallServiceError::NotAuthorized)?;
         let m = CallMember {
             user_id: id,
             role: CallRole::Member,
             timeout_until_ms: None,
-            secret: Some(i.secret),
+            participating: false,
         };
         s.members.insert(id, m.clone());
         Ok(m)
     }
     pub async fn revoke(&self, id: u64) -> Option<CallMember> {
         self.state.write().await.members.remove(&id)
-    }
-    pub async fn timeout(&self, id: u64, until: i64) -> Result<(), ()> {
-        let mut s = self.state.write().await;
-        s.members.get_mut(&id).ok_or(())?.timeout_until_ms = Some(until);
-        Ok(())
     }
     pub async fn is_anonymous(&self) -> bool {
         self.state.read().await.anonymous_joining
@@ -302,10 +297,16 @@ impl CallGroup {
         enable: bool,
         omega: &OmegaConnection,
     ) -> Result<Option<String>, CallError> {
-        {
-            self.state.write().await.anonymous_joining = enable;
+        let previous = {
+            let mut state = self.state.write().await;
+            let previous = state.anonymous_joining;
+            state.anonymous_joining = enable;
+            previous
+        };
+        if let Err(error) = self.update_metadata().await {
+            self.state.write().await.anonymous_joining = previous;
+            return Err(error);
         }
-        self.update_metadata().await?;
         if !enable {
             return Ok(None);
         }
@@ -352,13 +353,6 @@ mod tests {
 
     #[tokio::test]
     async fn expired_invite_cannot_join_or_expose_secret() {
-        let secret = CallSecretEnvelope {
-            secret_id: "test".into(),
-            version_number: 1,
-            encrypted_secret: vec![1],
-            kem_ciphertext: vec![2],
-            wrapping_scheme: "test".into(),
-        };
         let limits = CallLimits {
             max_members_per_call: 2,
             max_pending_invites_per_call: 1,
@@ -369,23 +363,21 @@ mod tests {
             Uuid::new_v4(),
             1,
             1,
-            secret.clone(),
             Arc::new(LiveKitService::new(None)),
             limits,
         );
-        group.invite(1, 2, secret.clone()).await.unwrap();
+        group.invite(1, 2).await.unwrap();
         assert!(matches!(
-            group.invite(1, 3, secret.clone()).await,
+            group.invite(1, 3).await,
             Err(CallServiceError::ResourceLimit)
         ));
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(!group.is_related(2).await);
-        assert!(group.get_secret_for_user(2).await.is_none());
         assert!(matches!(
             group.accept_invite(2).await,
             Err(CallServiceError::NotAuthorized)
         ));
-        group.invite(1, 3, secret).await.unwrap();
+        group.invite(1, 3).await.unwrap();
     }
 
     #[test]

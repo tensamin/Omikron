@@ -13,11 +13,12 @@ use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue};
 use mtp::crypto::PublicKeyBundle;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use std::{collections::VecDeque, str::FromStr};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, oneshot};
 use uuid::Uuid;
 
 static NEXT_POLICY_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
@@ -67,7 +68,6 @@ pub enum DeviceClass {
 pub struct SessionActivity {
     pub reported: bool,
     pub device_class: DeviceClass,
-    pub foreground: bool,
     pub notification_capable: bool,
 }
 
@@ -76,7 +76,6 @@ impl Default for SessionActivity {
         Self {
             reported: false,
             device_class: DeviceClass::Web,
-            foreground: false,
             notification_capable: false,
         }
     }
@@ -157,6 +156,7 @@ pub struct ClientConnection {
     message_slots: Arc<tokio::sync::Semaphore>,
     client_state_sync: Arc<Mutex<ClientStateSyncState>>,
     session_activity: Arc<RwLock<SessionActivity>>,
+    foreground_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
 }
 
 impl ClientConnection {
@@ -244,11 +244,29 @@ impl ClientConnection {
             message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
             client_state_sync: Arc::new(Mutex::new(ClientStateSyncState::default())),
             session_activity: Arc::new(RwLock::new(SessionActivity::default())),
+            foreground_requests: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub async fn session_activity(&self) -> SessionActivity {
         self.session_activity.read().await.clone()
+    }
+
+    pub async fn foreground(&self) -> bool {
+        let id = NEXT_POLICY_REQUEST_ID.fetch_add(1, Ordering::Relaxed) | 0x8000_0000;
+        let (sender, receiver) = oneshot::channel();
+        self.foreground_requests.lock().await.insert(id, sender);
+        let request = CommunicationValue::new(CommunicationType::SessionActivitySet).with_id(id);
+        let foreground = tokio::time::timeout(Duration::from_secs(1), async {
+            self.send_relay(&request).await.ok()?;
+            receiver.await.ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        self.foreground_requests.lock().await.remove(&id);
+        foreground
     }
     pub fn start(self: Arc<Self>) {
         let self_clone = self.clone();
@@ -470,6 +488,11 @@ impl ClientConnection {
             }
 
             if cv.is_type(CommunicationType::SessionActivitySet) {
+                if let Some(reply) = self.foreground_requests.lock().await.remove(&message_id) {
+                    let _ =
+                        reply.send(cv.get_data(DataType::Foreground).as_bool().unwrap_or(false));
+                    return;
+                }
                 let device_class = match cv.get_data(DataType::DeviceClass).as_str() {
                     Some("desktop") => DeviceClass::Desktop,
                     Some("mobile") => DeviceClass::Mobile,
@@ -479,11 +502,6 @@ impl ClientConnection {
                             .await;
                         return;
                     }
-                };
-                let Some(foreground) = cv.get_data(DataType::Foreground).as_bool() else {
-                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
-                        .await;
-                    return;
                 };
                 let Some(notification_capable) =
                     cv.get_data(DataType::NotificationCapable).as_bool()
@@ -495,7 +513,6 @@ impl ClientConnection {
                 *self.session_activity.write().await = SessionActivity {
                     reported: true,
                     device_class,
-                    foreground,
                     notification_capable,
                 };
                 self.send_message(
@@ -548,6 +565,39 @@ impl ClientConnection {
             }
 
             // Handle call invites
+            if cv.is_type(CommunicationType::CallReserve) {
+                let result = self.state.call_manager.reserve(self.user_id).await;
+                match result {
+                    Ok(id) => {
+                        self.clone()
+                            .send_message(
+                                &CommunicationValue::new(CommunicationType::CallReserve)
+                                    .with_id(message_id)
+                                    .add_typed_default(
+                                        DataType::CallId,
+                                        DataValue::Str(id.to_string()),
+                                    )
+                                    .add_typed_default(
+                                        DataType::OmikronId,
+                                        DataValue::SignedNumber(
+                                            (self.state.call_manager.owner_omikron_id as i64)
+                                                .into(),
+                                        ),
+                                    ),
+                            )
+                            .await
+                    }
+                    Err(error) => {
+                        self.send_error_response(message_id, call_error_type(&error))
+                            .await
+                    }
+                }
+                return;
+            }
+            if cv.is_type(CommunicationType::CallActivate) {
+                self.handle_call_activate(cv).await;
+                return;
+            }
             if cv.is_type(CommunicationType::CallInvite) {
                 self.handle_call_invite(cv).await;
                 return;
@@ -690,6 +740,13 @@ impl ClientConnection {
             }
 
             if cv.is_type(CommunicationType::AccountStateRequest) {
+                let device_class = match cv.get_data(DataType::DeviceClass).as_str() {
+                    Some("desktop") => Some(DeviceClass::Desktop),
+                    Some("mobile") => Some(DeviceClass::Mobile),
+                    Some("web") => Some(DeviceClass::Web),
+                    _ => None,
+                };
+                let notification_capable = cv.get_data(DataType::NotificationCapable).as_bool();
                 let can_request = {
                     let mut state = self.client_state_sync.lock().await;
                     if matches!(state.phase, ClientStateSyncPhase::Idle) {
@@ -708,6 +765,15 @@ impl ClientConnection {
                         .await;
                     return;
                 }
+                if let (Some(device_class), Some(notification_capable)) =
+                    (device_class, notification_capable)
+                {
+                    *self.session_activity.write().await = SessionActivity {
+                        reported: true,
+                        device_class,
+                        notification_capable,
+                    };
+                }
                 let Some(rho) = self.get_rho_connection().await else {
                     self.reset_client_state_sync().await;
                     self.send_error_response(message_id, CommunicationType::ErrorNoIota)
@@ -716,6 +782,8 @@ impl ClientConnection {
                 };
                 let mut request = cv.clone();
                 request.remove_data(DataType::SessionId);
+                request.remove_data(DataType::DeviceClass);
+                request.remove_data(DataType::NotificationCapable);
                 let request = request.with_sender(self.user_id).add_typed_default(
                     DataType::SessionId,
                     DataValue::UnsignedNumber(self.session_id.into()),
@@ -1073,6 +1141,174 @@ impl ClientConnection {
     }
 
     /// Handle call invite
+    async fn handle_call_activate(self: Arc<Self>, cv: CommunicationValue) {
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
+        let Some(id) = cv
+            .get_data(DataType::CallId)
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
+                .await;
+            return;
+        };
+        let Some(secret) = call_invite_secret_from_cv(&cv) else {
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                .await;
+            return;
+        };
+        let created_at = match self
+            .state
+            .call_manager
+            .reservation_created_at(self.user_id, id)
+            .await
+        {
+            Ok(created_at) => created_at,
+            Err(error) => {
+                self.send_error_response(message_id, call_error_type(&error))
+                    .await;
+                return;
+            }
+        };
+        if self
+            .store_call_envelope(self.user_id, self.user_id, id, created_at, &secret)
+            .await
+            .is_err()
+        {
+            self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                .await;
+            return;
+        }
+        match self
+            .state
+            .call_manager
+            .activate(self.user_id, id, created_at)
+            .await
+        {
+            Ok(token) => {
+                let created_at = self
+                    .state
+                    .call_manager
+                    .get_call(id)
+                    .await
+                    .map(|group| group.created_at_ms)
+                    .unwrap_or_default();
+                let mut response = CommunicationValue::new(CommunicationType::CallActivate)
+                    .with_id(message_id)
+                    .add_typed_default(DataType::CallToken, DataValue::Str(token))
+                    .add_typed_default(
+                        DataType::CreatedAt,
+                        DataValue::SignedNumber(created_at.into()),
+                    )
+                    .add_typed_default(
+                        DataType::OmikronId,
+                        DataValue::SignedNumber(
+                            (self.state.call_manager.owner_omikron_id as i64).into(),
+                        ),
+                    );
+                response = response
+                    .add_data(
+                        DataTypeId(189),
+                        DataValue::Str(
+                            self.state
+                                .config
+                                .livekit
+                                .as_ref()
+                                .map(|config| config.client_url.clone())
+                                .unwrap_or_default(),
+                        ),
+                    )
+                    .expect("CallEndpoint is defined in the type map");
+                self.send_message(&response).await;
+            }
+            Err(error) => {
+                self.send_error_response(message_id, call_error_type(&error))
+                    .await
+            }
+        }
+    }
+
+    async fn store_call_envelope(
+        &self,
+        recipient: u64,
+        inviter: u64,
+        id: Uuid,
+        created_at: i64,
+        secret: &crate::calls::call_group::CallSecretEnvelope,
+    ) -> Result<(), ()> {
+        let rho = self
+            .state
+            .rho
+            .get_for_user(recipient as i64)
+            .await
+            .ok_or(())?;
+        let response = rho
+            .get_iota_connection()
+            .clone()
+            .await_response(
+                &CommunicationValue::new(CommunicationType::CallEnvelopeStore)
+                    .with_id(next_policy_request_id())
+                    .add_typed_default(
+                        DataType::ReceiverId,
+                        DataValue::SignedNumber((recipient as i64).into()),
+                    )
+                    .add_typed_default(
+                        DataType::CallInviterId,
+                        DataValue::SignedNumber((inviter as i64).into()),
+                    )
+                    .add_typed_default(DataType::CallId, DataValue::Str(id.to_string()))
+                    .add_typed_default(
+                        DataType::CreatedAt,
+                        DataValue::SignedNumber(created_at.into()),
+                    )
+                    .add_typed_default(DataType::CallSecret, secret.to_data_value()),
+                Some(Duration::from_secs(20)),
+            )
+            .await
+            .map_err(|_| ())?;
+        response
+            .is_type(CommunicationType::Success)
+            .then_some(())
+            .ok_or(())
+    }
+
+    async fn get_call_envelope(
+        &self,
+        recipient: u64,
+        id: Uuid,
+    ) -> Result<crate::calls::call_group::CallSecretEnvelope, ()> {
+        let rho = self
+            .state
+            .rho
+            .get_for_user(recipient as i64)
+            .await
+            .ok_or(())?;
+        let response = rho
+            .get_iota_connection()
+            .clone()
+            .await_response(
+                &CommunicationValue::new(CommunicationType::CallEnvelopeGet)
+                    .with_id(next_policy_request_id())
+                    .add_typed_default(
+                        DataType::ReceiverId,
+                        DataValue::SignedNumber((recipient as i64).into()),
+                    )
+                    .add_typed_default(DataType::CallId, DataValue::Str(id.to_string())),
+                Some(Duration::from_secs(8)),
+            )
+            .await
+            .map_err(|_| ())?;
+        if !response.is_type(CommunicationType::CallEnvelopeGet) {
+            return Err(());
+        }
+        crate::calls::call_group::CallSecretEnvelope::from_data_value(
+            response.get_data(DataType::CallSecret).ok_or(())?,
+        )
+        .ok_or(())
+    }
+
     async fn handle_call_invite(self: Arc<Self>, cv: CommunicationValue) {
         let Ok(message_id) = cv.require_id() else {
             return;
@@ -1118,6 +1354,34 @@ impl ClientConnection {
             }
         };
         let sender_id = self.get_user_id().await as i64;
+        let Some(sender_rho) = self.state.rho.get_for_user(sender_id).await else {
+            self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                .await;
+            return;
+        };
+        let contact_response = sender_rho
+            .get_iota_connection()
+            .clone()
+            .await_response(
+                &CommunicationValue::new(CommunicationType::CallContactCheck)
+                    .with_id(next_policy_request_id())
+                    .add_typed_default(
+                        DataType::SenderId,
+                        DataValue::SignedNumber(sender_id.into()),
+                    )
+                    .add_typed_default(
+                        DataType::ReceiverId,
+                        DataValue::SignedNumber(receiver_id.into()),
+                    ),
+                Some(Duration::from_secs(20)),
+            )
+            .await;
+        if !matches!(contact_response, Ok(ref response) if response.is_type(CommunicationType::CallContactCheck) && response.get_data(DataType::IsBlocked).as_bool() == Some(true))
+        {
+            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
+                .await;
+            return;
+        }
         let policy_request = CommunicationValue::new(CommunicationType::UserBlockCheck)
             .with_id(next_policy_request_id())
             .add_typed_default(
@@ -1131,9 +1395,9 @@ impl ClientConnection {
         let policy_response = target_rho
             .get_iota_connection()
             .clone()
-            .await_response(&policy_request, Some(Duration::from_secs(8)))
+            .await_response(&policy_request, Some(Duration::from_secs(20)))
             .await;
-        let blocked = match policy_response {
+        let blocked = match &policy_response {
             Ok(response) if response.is_type(CommunicationType::UserBlockCheck) => {
                 response.get_data(DataType::IsBlocked).as_bool()
             }
@@ -1147,26 +1411,99 @@ impl ClientConnection {
             }
             Some(false) => {}
             None => {
-                self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                crate::log_event!(
+                    0,
+                    crate::util::logger::PrintType::Call,
+                    crate::util::logger::LogLevel::Warn,
+                    "call.invite_block_check_unavailable",
+                    "call_id={} sender_user_id={} recipient_user_id={} response={:?}",
+                    call_id,
+                    sender_id,
+                    receiver_id,
+                    policy_response
+                        .as_ref()
+                        .map(|response| response.get_type_name())
+                        .map_err(|error| error.as_str())
+                );
+                self.send_error_response(message_id, CommunicationType::ErrorNoIota)
                     .await;
                 return;
             }
         }
-        let invited = self
-            .state
-            .call_manager
-            .add_invite(
-                call_id,
-                self.user_id,
-                receiver_id.unsigned_abs(),
-                secret.clone(),
-            )
-            .await;
-        if let Err(error) = invited {
-            self.send_error_response(message_id, call_error_type(&error))
+        let Some(group) = self.state.call_manager.get_call(call_id).await else {
+            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
                 .await;
             return;
-        }
+        };
+        let relation = match self
+            .state
+            .call_manager
+            .check_invite(call_id, self.user_id, receiver_id as u64)
+            .await
+        {
+            Ok((_, relation)) => relation,
+            Err(error) => {
+                self.send_error_response(message_id, call_error_type(&error))
+                    .await;
+                return;
+            }
+        };
+        let forward_secret = match relation {
+            crate::calls::call_manager::InviteRelation::New => {
+                if self
+                    .store_call_envelope(
+                        receiver_id as u64,
+                        self.user_id,
+                        call_id,
+                        group.created_at_ms,
+                        &secret,
+                    )
+                    .await
+                    .is_err()
+                {
+                    self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                        .await;
+                    return;
+                }
+                if let Err(error) = self
+                    .state
+                    .call_manager
+                    .add_invite(call_id, self.user_id, receiver_id.unsigned_abs())
+                    .await
+                {
+                    self.send_error_response(message_id, call_error_type(&error))
+                        .await;
+                    return;
+                }
+                secret
+            }
+            relation => {
+                // Members and pending invitees already hold an envelope on
+                // their Iota. A re-invite must replay exactly that ciphertext,
+                // not freshly randomized bytes they cannot decrypt.
+                if relation == crate::calls::call_manager::InviteRelation::Pending {
+                    // Refresh the recorded inviter so the badge names the latest inviter.
+                    if let Err(error) = self
+                        .state
+                        .call_manager
+                        .add_invite(call_id, self.user_id, receiver_id.unsigned_abs())
+                        .await
+                    {
+                        self.send_error_response(message_id, call_error_type(&error))
+                            .await;
+                        return;
+                    }
+                }
+                match self.get_call_envelope(receiver_id as u64, call_id).await {
+                    Ok(stored) => stored,
+                    Err(()) => {
+                        self.send_error_response(message_id, CommunicationType::ErrorNoIota)
+                            .await;
+                        return;
+                    }
+                }
+            }
+        };
 
         if !self
             .state
@@ -1180,9 +1517,10 @@ impl ClientConnection {
 
         // Create and send call distribution message
         let forward = CommunicationValue::new(CommunicationType::CallInvite)
+            .with_id(next_policy_request_id())
             .with_receiver(receiver_id.unsigned_abs())
             .with_sender(sender_id as u64)
-            .add_typed_default(DataType::CallSecret, secret.to_data_value())
+            .add_typed_default(DataType::CallSecret, forward_secret.to_data_value())
             .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()))
             .add_typed_default(
                 DataType::ReceiverId,
@@ -1197,22 +1535,39 @@ impl ClientConnection {
                 DataValue::SignedNumber((self.state.call_manager.owner_omikron_id as i64).into()),
             );
 
-        if target_rho
-            .send_to_local_user(receiver_id.unsigned_abs(), &forward)
-            .await
-            .is_err()
-        {
-            self.state
-                .call_manager
-                .rollback_invite(call_id, receiver_id.unsigned_abs())
-                .await;
-            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
-                .await;
-            return;
-        }
-
         let response = CommunicationValue::new(CommunicationType::Success).with_id(message_id);
         self.send_message(&response).await;
+
+        // The invitation is durable. A stalled client must not delay the sender's acknowledgement.
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                Duration::from_secs(8),
+                target_rho.send_to_local_user(receiver_id.unsigned_abs(), &forward),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => crate::log_event!(
+                    0,
+                    crate::util::logger::PrintType::Call,
+                    crate::util::logger::LogLevel::Warn,
+                    "call.invite_live_delivery_failed",
+                    "call_id={} recipient_user_id={} error={}",
+                    call_id,
+                    receiver_id,
+                    error
+                ),
+                Err(_) => crate::log_event!(
+                    0,
+                    crate::util::logger::PrintType::Call,
+                    crate::util::logger::LogLevel::Warn,
+                    "call.invite_live_delivery_failed",
+                    "call_id={} recipient_user_id={} error=timeout",
+                    call_id,
+                    receiver_id
+                ),
+            }
+        });
     }
 
     /// Handle get call request
@@ -1238,32 +1593,83 @@ impl ClientConnection {
             }
         };
 
-        let creator_value = cv.get_data(DataType::CallSecret);
-        let creator =
-            creator_value.and_then(crate::calls::call_group::CallSecretEnvelope::from_data_value);
-        crate::log_event!(
-            0,
-            crate::util::logger::PrintType::Call,
-            crate::util::logger::LogLevel::Debug,
-            "call.token_requested",
-            "call_id={call_id} user_id={user_id} owner_omikron_id={} exists_locally={} creator_secret_present={} creator_secret_parsed={}",
-            self.state.call_manager.owner_omikron_id,
-            self.state.call_manager.get_call(call_id).await.is_some(),
-            creator_value.is_some(),
-            creator.is_some(),
-        );
+        let Some(group) = self.state.call_manager.get_call(call_id).await else {
+            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
+                .await;
+            return;
+        };
+        if !group.is_related(user_id).await
+            || self.get_call_envelope(user_id, call_id).await.is_err()
+        {
+            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
+                .await;
+            return;
+        }
+        let pending = group.member(user_id).await.is_none();
+        if pending {
+            let inviter = group
+                .state
+                .read()
+                .await
+                .pending_invites
+                .get(&user_id)
+                .map(|invite| invite.inviter_id);
+            let Some(inviter) = inviter else {
+                self.send_error_response(message_id, CommunicationType::ErrorNotFound)
+                    .await;
+                return;
+            };
+            let Some(rho) = self.state.rho.get_for_user(user_id as i64).await else {
+                self.send_error_response(message_id, CommunicationType::ErrorNotFound)
+                    .await;
+                return;
+            };
+            let response = rho
+                .get_iota_connection()
+                .clone()
+                .await_response(
+                    &CommunicationValue::new(CommunicationType::CallContactAccept)
+                        .with_id(next_policy_request_id())
+                        .add_typed_default(
+                            DataType::ReceiverId,
+                            DataValue::SignedNumber(user_id.into()),
+                        )
+                        .add_typed_default(
+                            DataType::CallInviterId,
+                            DataValue::SignedNumber(inviter.into()),
+                        ),
+                    Some(Duration::from_secs(8)),
+                )
+                .await;
+            if !matches!(response, Ok(response) if response.is_type(CommunicationType::Success)) {
+                self.send_error_response(message_id, CommunicationType::ErrorNotFound)
+                    .await;
+                return;
+            }
+        }
 
         match self
             .state
             .call_manager
-            .get_or_create_token(user_id, call_id, creator)
+            .get_call_token(user_id, call_id)
             .await
         {
             Ok(token) => {
+                let created_at = self
+                    .state
+                    .call_manager
+                    .get_call(call_id)
+                    .await
+                    .map(|group| group.created_at_ms)
+                    .unwrap_or_default();
                 let response = CommunicationValue::new(CommunicationType::CallToken)
                     .with_id(message_id)
                     .with_receiver(user_id as u64)
                     .add_typed_default(DataType::CallToken, DataValue::Str(token))
+                    .add_typed_default(
+                        DataType::CreatedAt,
+                        DataValue::SignedNumber(created_at.into()),
+                    )
                     .add_typed_default(
                         DataType::OmikronId,
                         DataValue::SignedNumber(
@@ -1336,8 +1742,16 @@ impl ClientConnection {
             }
         };
 
+        let secret = match self.get_call_envelope(user_id, call_id).await {
+            Ok(secret) => secret,
+            Err(()) => {
+                self.send_error_response(message_id, CommunicationType::ErrorNotFound)
+                    .await;
+                return;
+            }
+        };
         match self.state.call_manager.call_data(call_id, user_id).await {
-            Ok(member_ids) => {
+            Ok((member_ids, created_at)) => {
                 let user_ids = member_ids
                     .into_iter()
                     .map(|id| DataValue::SignedNumber(id.into()))
@@ -1345,7 +1759,12 @@ impl ClientConnection {
                 let response = CommunicationValue::new(CommunicationType::CallData)
                     .with_id(message_id)
                     .with_receiver(user_id as u64)
-                    .add_typed_default(DataType::UserIds, DataValue::Array(user_ids));
+                    .add_typed_default(DataType::UserIds, DataValue::Array(user_ids))
+                    .add_typed_default(
+                        DataType::CreatedAt,
+                        DataValue::SignedNumber(created_at.into()),
+                    )
+                    .add_typed_default(DataType::CallSecret, secret.to_data_value());
                 self.send_message(&response).await;
             }
             Err(error) => {
@@ -1406,6 +1825,7 @@ impl ClientConnection {
                 .await;
             return;
         };
+        let previous = self.state.call_manager.get_call(call_id).await;
         match self
             .state
             .call_manager
@@ -1413,6 +1833,9 @@ impl ClientConnection {
             .await
         {
             Ok(()) => {
+                if self.state.call_manager.get_call(call_id).await.is_none() {
+                    self.notify_call_ended(call_id, previous).await;
+                }
                 self.send_message(
                     &CommunicationValue::new(CommunicationType::Success).with_id(message_id),
                 )
@@ -1421,6 +1844,30 @@ impl ClientConnection {
             Err(error) => {
                 self.send_error_response(message_id, call_error_type(&error))
                     .await
+            }
+        }
+    }
+    async fn notify_call_ended(
+        &self,
+        id: Uuid,
+        group: Option<Arc<crate::calls::call_group::CallGroup>>,
+    ) {
+        let Some(group) = group else {
+            return;
+        };
+        let state = group.state.read().await;
+        let users = state
+            .members
+            .keys()
+            .chain(state.pending_invites.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        for user in users {
+            if let Some(rho) = self.state.rho.get_for_user(user as i64).await {
+                let event = CommunicationValue::new(CommunicationType::CallEnded)
+                    .with_receiver(user)
+                    .add_typed_default(DataType::CallId, DataValue::Str(id.to_string()));
+                let _ = rho.send_to_local_user(user, &event).await;
             }
         }
     }
@@ -1452,7 +1899,12 @@ impl ClientConnection {
                 .await;
             return;
         }
-        match call.set_anonymous_joining(enable, &self.state.omega).await {
+        match self
+            .state
+            .call_manager
+            .set_anonymous_joining(call_id, enable, &self.state.omega)
+            .await
+        {
             Ok(link) => {
                 let mut response =
                     CommunicationValue::new(CommunicationType::CallSetAnonymousJoining)
@@ -1464,8 +1916,8 @@ impl ClientConnection {
                 }
                 self.send_message(&response).await;
             }
-            Err(_) => {
-                self.send_error_response(message_id, CommunicationType::ErrorInternal)
+            Err(error) => {
+                self.send_error_response(message_id, call_error_type(&error))
                     .await
             }
         }
@@ -1488,6 +1940,7 @@ impl ClientConnection {
                 .await;
             return;
         };
+        let previous = self.state.call_manager.get_call(call_id).await;
         match self
             .state
             .call_manager
@@ -1495,6 +1948,7 @@ impl ClientConnection {
             .await
         {
             Ok(()) => {
+                self.notify_call_ended(call_id, previous).await;
                 self.send_message(
                     &CommunicationValue::new(CommunicationType::Success).with_id(message_id),
                 )
@@ -1520,6 +1974,7 @@ impl ClientConnection {
             return;
         }
         *is_open_guard = false;
+        self.foreground_requests.lock().await.clear();
 
         let _ = self.sender.close();
     }
@@ -1622,6 +2077,7 @@ impl Clone for ClientConnection {
             message_slots: Arc::clone(&self.message_slots),
             client_state_sync: Arc::clone(&self.client_state_sync),
             session_activity: Arc::clone(&self.session_activity),
+            foreground_requests: Arc::clone(&self.foreground_requests),
         }
     }
 }

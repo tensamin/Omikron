@@ -101,12 +101,40 @@ impl LiveKitService {
         )
         .await
         .map_err(|_| CallError::RequestTimedOut { call_id })?
-        .map_err(|error| CallError::ParticipantRemovalFailed {
-            call_id,
-            user_id,
-            detail: error.to_string(),
+        .map_err(|error| {
+            let detail = error.to_string();
+            if detail.contains("not_found:") || detail.contains("does not exist") {
+                CallError::RoomNotFound { call_id }
+            } else {
+                CallError::ParticipantRemovalFailed {
+                    call_id,
+                    user_id,
+                    detail,
+                }
+            }
         })?;
         Ok(())
+    }
+
+    pub async fn participant_ids(&self, call_id: Uuid) -> Result<Vec<u64>, CallError> {
+        let participants = tokio::time::timeout(
+            LIVEKIT_REQUEST_TIMEOUT,
+            self.room_client()?.list_participants(&call_id.to_string()),
+        )
+        .await
+        .map_err(|_| CallError::RequestTimedOut { call_id })?
+        .map_err(|error| {
+            let detail = error.to_string();
+            if detail.contains("not_found:") || detail.contains("requested room does not exist") {
+                CallError::RoomNotFound { call_id }
+            } else {
+                CallError::RoomLookupFailed { detail }
+            }
+        })?;
+        Ok(participants
+            .into_iter()
+            .filter_map(|p| p.identity.parse().ok())
+            .collect())
     }
 
     pub async fn delete_room(&self, call_id: Uuid) -> Result<(), CallError> {
@@ -116,9 +144,13 @@ impl LiveKitService {
         )
         .await
         .map_err(|_| CallError::RequestTimedOut { call_id })?
-        .map_err(|error| CallError::RoomCreationFailed {
-            call_id,
-            detail: error.to_string(),
+        .map_err(|error| {
+            let detail = error.to_string();
+            if detail.contains("not_found:") || detail.contains("requested room does not exist") {
+                CallError::RoomNotFound { call_id }
+            } else {
+                CallError::RoomCreationFailed { call_id, detail }
+            }
         })?;
         Ok(())
     }
@@ -149,11 +181,15 @@ impl LiveKitService {
     }
 
     #[allow(dead_code)]
-    pub fn garbage_collect_calls(self: Arc<Self>, manager: Arc<CallManager>) {
+    pub fn garbage_collect_calls(
+        self: Arc<Self>,
+        manager: Arc<CallManager>,
+        rho: Arc<crate::rho::rho_manager::RhoManager>,
+    ) {
         tokio::spawn(async move {
             loop {
                 match self.room_client() {
-                    Ok(room_service) => clean_calls(&manager, room_service).await,
+                    Ok(room_service) => clean_calls(&manager, room_service, &rho).await,
                     Err(CallError::NotConfigured) => return,
                     Err(error) => log_err!(0, PrintType::Call, "Call cleanup skipped: {error}"),
                 }
@@ -163,8 +199,41 @@ impl LiveKitService {
     }
 }
 
+/*
+ * Server-side teardown (expiry, empty-room grace, vanished room) must reach
+ * connected clients the same way an explicit end does.
+ */
+async fn notify_call_ended(
+    rho: &crate::rho::rho_manager::RhoManager,
+    id: Uuid,
+    group: &crate::calls::call_group::CallGroup,
+) {
+    use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+    let users: Vec<u64> = {
+        let state = group.state.read().await;
+        state
+            .members
+            .keys()
+            .chain(state.pending_invites.keys())
+            .copied()
+            .collect()
+    };
+    for user in users {
+        if let Some(rho_conn) = rho.get_for_user(user as i64).await {
+            let event = CommunicationValue::new(CommunicationType::CallEnded)
+                .with_receiver(user)
+                .add_typed_default(DataType::CallId, DataValue::Str(id.to_string()));
+            let _ = rho_conn.send_to_local_user(user, &event).await;
+        }
+    }
+}
+
 #[allow(dead_code)]
-pub async fn clean_calls(manager: &CallManager, room_service: RoomClient) {
+pub async fn clean_calls(
+    manager: &CallManager,
+    room_service: RoomClient,
+    rho: &crate::rho::rho_manager::RhoManager,
+) {
     let rooms =
         match tokio::time::timeout(LIVEKIT_REQUEST_TIMEOUT, room_service.list_rooms(Vec::new()))
             .await
@@ -184,10 +253,10 @@ pub async fn clean_calls(manager: &CallManager, room_service: RoomClient) {
             }
         };
 
-    let mut call_ids = Vec::new();
+    let mut live_rooms = std::collections::HashMap::new();
     for room in rooms {
         if let Ok(id) = Uuid::from_str(&room.name) {
-            call_ids.push(id);
+            live_rooms.insert(id, room.num_participants);
         }
     }
 
@@ -198,8 +267,74 @@ pub async fn clean_calls(manager: &CallManager, room_service: RoomClient) {
         .map(|entry| *entry.key())
         .collect::<Vec<_>>();
     for id in tracked_calls {
-        if !call_ids.contains(&id) {
+        let now = CallManager::timestamp();
+        let Some(group) = manager.get_call(id).await else {
+            continue;
+        };
+        if now >= group.created_at_ms + 259_200_000 {
+            if !matches!(
+                manager.livekit.delete_room(id).await,
+                Ok(()) | Err(CallError::RoomNotFound { .. })
+            ) {
+                continue;
+            }
+            if let Some(db) = &manager.persistence {
+                if db.remove(id).is_err() {
+                    continue;
+                }
+            }
+            notify_call_ended(rho, id, &group).await;
             manager.groups.remove(&id);
+            continue;
+        }
+
+        match live_rooms.get(&id) {
+            Some(&participants) if participants > 0 => {
+                let identities = match tokio::time::timeout(
+                    LIVEKIT_REQUEST_TIMEOUT,
+                    room_service.list_participants(&id.to_string()),
+                )
+                .await
+                {
+                    Ok(Ok(participants)) => participants
+                        .into_iter()
+                        .filter_map(|p| p.identity.parse().ok())
+                        .collect::<Vec<_>>(),
+                    _ => continue,
+                };
+                if manager
+                    .reconcile_participants(id, &identities)
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                if let Some(db) = &manager.persistence {
+                    let _ = db.set_empty_since(id, None);
+                }
+            }
+            _ => {
+                if manager.reconcile_participants(id, &[]).await.is_err() {
+                    continue;
+                }
+                if let Some(db) = &manager.persistence {
+                    if let Ok(since) = db.empty_since(id, now) {
+                        if now - since >= 300_000 {
+                            if !matches!(
+                                manager.livekit.delete_room(id).await,
+                                Ok(()) | Err(CallError::RoomNotFound { .. })
+                            ) {
+                                continue;
+                            }
+                            if db.remove(id).is_err() {
+                                continue;
+                            }
+                            notify_call_ended(rho, id, &group).await;
+                            manager.groups.remove(&id);
+                        }
+                    }
+                }
+            }
         }
     }
 

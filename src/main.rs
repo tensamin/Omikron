@@ -84,12 +84,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     omega.clone().start().await;
     start_task_cleanup_loop(omega.clone());
     let livekit = std::sync::Arc::new(LiveKitService::new(config.livekit.clone()));
-    let call_manager = std::sync::Arc::new(CallManager::new_with_limits(
-        livekit.clone(),
-        config.omikron_id,
-        config.call_limits.clone(),
-    ));
-    livekit.clone().garbage_collect_calls(call_manager.clone());
+    let call_manager = std::sync::Arc::new(
+        CallManager::new_with_limits(
+            livekit.clone(),
+            config.omikron_id,
+            config.call_limits.clone(),
+        )
+        .with_persistence(std::sync::Arc::new(
+            crate::calls::persistence::CallPersistence::open(std::path::Path::new(
+                &std::env::var("CALL_DB_PATH").unwrap_or_else(|_| "calls.sqlite3".into()),
+            ))?,
+        )),
+    );
+    call_manager.restore().await?;
+    livekit
+        .clone()
+        .garbage_collect_calls(call_manager.clone(), rho.clone());
     let state = AppState::new(config.clone(), keyring, omega, rho, call_manager, livekit);
     let (shutdown, _) = watch::channel(false);
     let server = start(state, shutdown.subscribe());

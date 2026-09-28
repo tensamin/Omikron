@@ -401,12 +401,7 @@ impl AnonymousClientConnection {
         let invited = self
             .state
             .call_manager
-            .add_invite(
-                call_id,
-                self.user_id,
-                receiver_id.unsigned_abs(),
-                secret.clone(),
-            )
+            .add_invite(call_id, self.user_id, receiver_id.unsigned_abs())
             .await;
         if invited.is_err() {
             self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)

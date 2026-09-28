@@ -1,5 +1,5 @@
 use super::{
-    client_connection::{ClientConnection, DeviceClass, SessionActivity},
+    client_connection::{ClientConnection, DeviceClass},
     iota_connection::IotaConnection,
 };
 
@@ -7,13 +7,15 @@ use super::relay_router::RouteTarget;
 use crate::{log_err, rho::connection::OptionalDataValueCompat};
 use dashmap::DashMap;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, OnceCell, RwLock};
 
 pub struct RhoConnection {
     iota_connection: Arc<IotaConnection>,
     user_ids: Arc<RwLock<Vec<i64>>>,
     client_connections: DashMap<(u64, u64), Arc<ClientConnection>>,
+    foreground_queries: Mutex<HashMap<u64, Arc<OnceCell<bool>>>>,
 }
 
 fn message_targets_client(cv: &CommunicationValue, user_id: u64, session_id: u64) -> bool {
@@ -48,23 +50,6 @@ fn must_follow_initial_state(cv: &CommunicationValue) -> bool {
     )
 }
 
-fn should_suppress_notification(
-    session_id: u64,
-    activity: &SessionActivity,
-    sessions: &[(u64, SessionActivity)],
-) -> bool {
-    activity.reported
-        && activity.device_class == DeviceClass::Mobile
-        && !activity.foreground
-        && sessions.iter().any(|(other_session_id, other)| {
-            *other_session_id != session_id
-                && other.reported
-                && other.foreground
-                && other.notification_capable
-                && matches!(other.device_class, DeviceClass::Desktop | DeviceClass::Web)
-        })
-}
-
 fn local_delivery_result(attempted: usize, sent: usize) -> Result<usize, String> {
     if attempted == 0 {
         Err("client offline".to_string())
@@ -82,6 +67,7 @@ impl RhoConnection {
             iota_connection,
             user_ids: Arc::new(RwLock::new(user_ids.clone())),
             client_connections: DashMap::new(),
+            foreground_queries: Mutex::new(HashMap::new()),
         };
 
         rho_connection
@@ -305,39 +291,81 @@ impl RhoConnection {
         }
 
         let target_connections: Vec<_> = connections
-            .into_iter()
+            .iter()
             .filter(|connection| {
                 message_targets_client(&cv, connection.user_id, connection.session_id)
             })
+            .cloned()
             .collect();
-        let activities = if cv.is_type(CommunicationType::MessageLive) {
-            let mut activities = Vec::with_capacity(target_connections.len());
-            for connection in &target_connections {
-                activities.push((connection.session_id, connection.session_activity().await));
+        let mut mobile_sessions = Vec::new();
+        let mut desktop_sessions = Vec::new();
+        if cv.is_type(CommunicationType::MessageLive) {
+            for connection in &connections {
+                if connection.user_id != cv.receiver().unwrap_or_default() {
+                    continue;
+                }
+                let activity = connection.session_activity().await;
+                if !activity.reported {
+                    continue;
+                }
+                if activity.device_class == DeviceClass::Mobile
+                    && target_connections
+                        .iter()
+                        .any(|target| target.session_id == connection.session_id)
+                {
+                    mobile_sessions.push(connection.session_id);
+                } else if activity.notification_capable
+                    && matches!(
+                        activity.device_class,
+                        DeviceClass::Desktop | DeviceClass::Web
+                    )
+                {
+                    desktop_sessions.push(connection.clone());
+                }
             }
-            activities
+        }
+        let suppress_mobile = if !mobile_sessions.is_empty() && !desktop_sessions.is_empty() {
+            let user_id = cv.receiver().unwrap_or_default();
+            let query = {
+                let mut queries = self.foreground_queries.lock().await;
+                queries
+                    .entry(user_id)
+                    .or_insert_with(|| Arc::new(OnceCell::new()))
+                    .clone()
+            };
+            let focused = *query
+                .get_or_init(|| async {
+                    let mut pending = tokio::task::JoinSet::new();
+                    for connection in desktop_sessions {
+                        pending.spawn(async move { connection.foreground().await });
+                    }
+                    while let Some(result) = pending.join_next().await {
+                        if matches!(result, Ok(true)) {
+                            pending.detach_all();
+                            return true;
+                        }
+                    }
+                    false
+                })
+                .await;
+            let mut queries = self.foreground_queries.lock().await;
+            if queries
+                .get(&user_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &query))
+            {
+                queries.remove(&user_id);
+            }
+            focused
         } else {
-            Vec::new()
+            false
         };
 
         for connection in target_connections {
-            let activity = activities
-                .iter()
-                .find(|(session_id, _)| *session_id == connection.session_id)
-                .map(|(_, activity)| activity);
-            let client_cv = if let Some(activity) = activity {
-                if activity.reported {
-                    cv.clone().add_typed_default(
-                        DataType::SuppressNotification,
-                        DataValue::Bool(should_suppress_notification(
-                            connection.session_id,
-                            activity,
-                            &activities,
-                        )),
-                    )
-                } else {
-                    cv.clone()
-                }
+            let client_cv = if mobile_sessions.contains(&connection.session_id) {
+                cv.clone().add_typed_default(
+                    DataType::SuppressNotification,
+                    DataValue::Bool(suppress_mobile),
+                )
             } else {
                 cv.clone()
             };
@@ -439,11 +467,7 @@ impl RhoConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::super::client_connection::{DeviceClass, SessionActivity};
-    use super::{
-        local_delivery_result, message_targets_client, must_follow_initial_state,
-        should_suppress_notification,
-    };
+    use super::{local_delivery_result, message_targets_client, must_follow_initial_state};
     use mtp::codec::{CommunicationType, CommunicationValue, DataType};
 
     #[test]
@@ -469,49 +493,5 @@ mod tests {
         assert!(must_follow_initial_state(&CommunicationValue::new(
             CommunicationType::MessageState
         )));
-    }
-
-    #[test]
-    fn mobile_notification_suppression_requires_reported_foreground_desktop_or_web() {
-        let mobile = SessionActivity {
-            reported: true,
-            device_class: DeviceClass::Mobile,
-            foreground: false,
-            notification_capable: true,
-        };
-        let desktop = SessionActivity {
-            reported: true,
-            device_class: DeviceClass::Desktop,
-            foreground: true,
-            notification_capable: true,
-        };
-
-        assert!(should_suppress_notification(
-            2,
-            &mobile,
-            &[(1, desktop.clone()), (2, mobile.clone())]
-        ));
-        assert!(!should_suppress_notification(
-            2,
-            &mobile,
-            &[
-                (
-                    1,
-                    SessionActivity {
-                        foreground: false,
-                        ..desktop.clone()
-                    }
-                ),
-                (2, mobile.clone())
-            ]
-        ));
-        assert!(!should_suppress_notification(
-            2,
-            &SessionActivity {
-                foreground: true,
-                ..mobile.clone()
-            },
-            &[(1, desktop), (2, mobile)]
-        ));
     }
 }
