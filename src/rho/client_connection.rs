@@ -656,7 +656,7 @@ impl ClientConnection {
                 match rho
                     .get_iota_connection()
                     .clone()
-                    .await_response_rekeyed(&cv, Some(Duration::from_secs(30)))
+                    .await_response(&cv, Some(Duration::from_secs(30)))
                     .await
                 {
                     Ok(response) => self.send_message(&response.with_id(message_id)).await,

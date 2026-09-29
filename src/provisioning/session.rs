@@ -3,6 +3,7 @@ use std::{sync::Weak, time::Instant};
 use mtp::crypto::PublicKeyBundle;
 use uuid::Uuid;
 
+use super::error::ProvisioningError;
 use crate::rho::connection::MtpSender;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,6 +11,24 @@ pub enum ProvisioningMethod {
     Password,
     QrContactCreated,
     QrOwnerCreated,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProvisioningFailure {
+    UpstreamUnavailable,
+    UpstreamRejected,
+    InvalidUpstreamResponse,
+    PeerDisconnected,
+    DeliveryFailed,
+}
+
+#[derive(Clone)]
+pub struct TerminatedProvisioning {
+    pub id: Uuid,
+    pub method: ProvisioningMethod,
+    pub reason: ProvisioningFailure,
+    pub contact: Option<ProvisioningParticipant>,
+    pub owner: Option<ProvisioningParticipant>,
 }
 
 impl ProvisioningMethod {
@@ -77,7 +96,7 @@ pub struct ProvisioningSession {
 }
 
 impl ProvisioningSession {
-    pub fn require_actor(&self, id: u64, role: ProvisioningRole) -> Result<(), &'static str> {
+    pub fn require_actor(&self, id: u64, role: ProvisioningRole) -> Result<(), ProvisioningError> {
         let participant = match role {
             ProvisioningRole::Contact => self.contact.as_ref(),
             ProvisioningRole::Owner => self.owner.as_ref(),
@@ -85,16 +104,16 @@ impl ProvisioningSession {
         if participant.map(|participant| participant.id) == Some(id) {
             Ok(())
         } else {
-            Err("wrong participant")
+            Err(ProvisioningError::WrongParticipant)
         }
     }
 
-    pub fn can_deliver(&self) -> Result<(), &'static str> {
+    pub fn can_deliver(&self) -> Result<(), ProvisioningError> {
         if self.state != ProvisioningState::AccountBound {
-            return Err("account is not bound");
+            return Err(ProvisioningError::InvalidState);
         }
         match self.method {
-            ProvisioningMethod::Password => Err("password delivery requires Iota authorization"),
+            ProvisioningMethod::Password => Err(ProvisioningError::WrongMethod),
             ProvisioningMethod::QrContactCreated
                 if self.contact.is_some() && self.owner.is_some() =>
             {
@@ -105,7 +124,10 @@ impl ProvisioningSession {
             {
                 Ok(())
             }
-            _ => Err("peer or owner confirmation missing"),
+            ProvisioningMethod::QrOwnerCreated if !self.owner_confirmed => {
+                Err(ProvisioningError::ConfirmationRequired)
+            }
+            _ => Err(ProvisioningError::PeerMissing),
         }
     }
 }

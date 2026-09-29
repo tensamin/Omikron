@@ -357,7 +357,7 @@ mod tests {
             max_members_per_call: 2,
             max_pending_invites_per_call: 1,
             max_calls_per_user: 1,
-            invite_ttl: Duration::from_millis(1),
+            invite_ttl: Duration::from_secs(60),
         };
         let group = CallGroup::new_with_service(
             Uuid::new_v4(),
@@ -371,7 +371,14 @@ mod tests {
             group.invite(1, 3).await,
             Err(CallServiceError::ResourceLimit)
         ));
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        group
+            .state
+            .write()
+            .await
+            .pending_invites
+            .get_mut(&2)
+            .unwrap()
+            .created_at_ms = now_ms() - 60_001;
         assert!(!group.is_related(2).await);
         assert!(matches!(
             group.accept_invite(2).await,

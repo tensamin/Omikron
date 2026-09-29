@@ -419,12 +419,32 @@ pub fn format_cv(cv: &CommunicationValue) -> String {
         return parts.join(": ");
     }
 
+    if has_sensitive_payload(cv) {
+        parts.push("<sensitive payload omitted>".to_string());
+        return parts.join(": ");
+    }
+
     if let Some(data) = cv.data() {
         let type_map = cv.type_map().cloned().unwrap_or_else(TypeMap::latest);
         parts.push(format_data_container(data, &type_map));
     }
 
     parts.join(": ")
+}
+
+fn has_sensitive_payload(cv: &CommunicationValue) -> bool {
+    matches!(
+        cv.get_comm_type_enum(),
+        Some(
+            CommunicationType::PasswordEnrollmentStart
+                | CommunicationType::PasswordEnrollmentResponse
+                | CommunicationType::PasswordEnrollmentFinish
+                | CommunicationType::PasswordProvisioningStart
+                | CommunicationType::PasswordProvisioningResponse
+                | CommunicationType::PasswordProvisioningFinish
+                | CommunicationType::ProvisioningCredential
+        )
+    )
 }
 
 fn format_data_container(data: &[(DataTypeId, DataValue)], type_map: &TypeMap) -> String {
@@ -488,6 +508,28 @@ fn format_data_container(data: &[(DataTypeId, DataValue)], type_map: &TypeMap) -
 mod tests {
     use super::{LogLevel, LogMessage, PrintType, format_cv, write_message};
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+
+    #[test]
+    fn password_payload_is_redacted() {
+        let frame = CommunicationValue::new(CommunicationType::PasswordProvisioningStart)
+            .with_id(42)
+            .add_typed_default(DataType::OpaqueMessage, DataValue::Bytes(vec![0xde, 0xad]));
+        let formatted = format_cv(&frame);
+        assert!(formatted.contains("PasswordProvisioningStart"));
+        assert!(formatted.contains("<sensitive payload omitted>"));
+        assert!(!formatted.contains("OpaqueMessage"));
+    }
+
+    #[test]
+    fn provisioning_credential_is_redacted() {
+        let frame = CommunicationValue::new(CommunicationType::ProvisioningCredential)
+            .with_id(9)
+            .add_typed_default(
+                DataType::EncryptedCredential,
+                DataValue::Bytes(vec![1, 2, 3, 4]),
+            );
+        assert!(format_cv(&frame).contains("<sensitive payload omitted>"));
+    }
 
     #[test]
     fn protocol_values_are_metadata_only() {

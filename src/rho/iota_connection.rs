@@ -20,6 +20,7 @@ use mtp::codec::DataValue;
 use mtp::codec::TypeMap;
 use mtp::crypto::KemPublicKey;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
@@ -63,6 +64,33 @@ pub(crate) fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, 
     Some((user_id, 0, contact_ids))
 }
 
+type ResponseTask = Box<dyn FnOnce(u32, CommunicationValue) -> bool + Send + Sync>;
+
+#[cfg(test)]
+fn reserve_response_id_with<F>(
+    waiting_tasks: &DashMap<u32, ResponseTask>,
+    mut candidate: F,
+    task: ResponseTask,
+) -> u32
+where
+    F: FnMut() -> u32,
+{
+    let mut task = Some(task);
+    loop {
+        let id = candidate();
+        if id == 0 {
+            continue;
+        }
+        match waiting_tasks.entry(id) {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(entry) => {
+                entry.insert(task.take().expect("task inserted once"));
+                return id;
+            }
+        }
+    }
+}
+
 fn registration_request(value: &CommunicationValue, iota_id: u64) -> CommunicationValue {
     value
         .clone()
@@ -104,8 +132,8 @@ pub struct IotaConnection {
     pub receiver: Arc<MtpReceiver>,
     pub user_ids: Arc<RwLock<Vec<u64>>>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
-    pub waiting_tasks:
-        DashMap<u32, Box<dyn Fn(Arc<IotaConnection>, CommunicationValue) -> bool + Send + Sync>>,
+    pub waiting_tasks: DashMap<u32, ResponseTask>,
+    next_response_id: AtomicU32,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     message_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -123,6 +151,7 @@ impl IotaConnection {
             iota_id: iota_id,
             client_version: general.client_version.read().await.clone(),
             waiting_tasks: DashMap::new(),
+            next_response_id: AtomicU32::new(rand::random::<u32>().max(1)),
             message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
         })
     }
@@ -394,7 +423,7 @@ impl IotaConnection {
 
         let msg_id = message_id;
         if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
-            if (task)(self.clone(), cv.clone()) {
+            if (task)(msg_id, cv.clone()) {
                 return;
             }
         }
@@ -1005,6 +1034,7 @@ impl IotaConnection {
     }
 
     pub async fn handle_close(&self) {
+        self.waiting_tasks.clear();
         log_out!(
             self.iota_id as i64,
             PrintType::Iota,
@@ -1016,76 +1046,38 @@ impl IotaConnection {
         }
     }
 
-    #[allow(dead_code)]
-    pub async fn await_response(
-        self: Arc<IotaConnection>,
-        cv: &CommunicationValue,
-        timeout_duration: Option<Duration>,
-    ) -> Result<CommunicationValue, String> {
-        let (tx, mut rx) = mpsc::channel(1);
-        let msg_id = cv
-            .require_id()
-            .map_err(|error| format!("request is missing correlation id: {error}"))?;
-
-        let task_tx = tx.clone();
-        self.waiting_tasks.insert(
-            msg_id,
-            Box::new(move |_, response_cv| {
-                let inner_tx = task_tx.clone();
-                tokio::spawn(async move {
-                    let _ = inner_tx.send(response_cv).await;
-                });
-                true
-            }),
-        );
-
-        self.send_message(cv).await;
-
-        let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
-
-        match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Some(response_cv)) => Ok(response_cv),
-            Ok(_) => Err("Failed to receive response, channel was closed.".to_string()),
-            Err(_) => {
-                self.waiting_tasks.remove(&msg_id);
-                Err(format!(
-                    "Request timed out after {} seconds.",
-                    timeout.as_secs()
-                ))
-            }
-        }
-    }
-
-    /// Use a relay-owned frame ID so independent callers cannot collide on Iota.
-    pub async fn await_response_rekeyed(
-        self: Arc<Self>,
-        cv: &CommunicationValue,
-        timeout_duration: Option<Duration>,
-    ) -> Result<CommunicationValue, String> {
-        let external_id = cv.require_id().map_err(|error| error.to_string())?;
-        let (tx, mut rx) = mpsc::channel(1);
-        let internal_id = loop {
-            let candidate = rand::random::<u32>();
+    fn reserve_response_id(&self, task: ResponseTask) -> u32 {
+        let mut task = Some(task);
+        loop {
+            let candidate = self.next_response_id.fetch_add(1, Ordering::Relaxed);
             if candidate == 0 {
                 continue;
             }
             match self.waiting_tasks.entry(candidate) {
-                Entry::Occupied(_) => continue,
+                Entry::Occupied(_) => {}
                 Entry::Vacant(entry) => {
-                    entry.insert(Box::new({
-                        let tx = tx.clone();
-                        move |_, response| {
-                            let tx = tx.clone();
-                            tokio::spawn(async move {
-                                let _ = tx.send(response).await;
-                            });
-                            true
-                        }
-                    }));
-                    break candidate;
+                    entry.insert(task.take().expect("response task inserted once"));
+                    return candidate;
                 }
             }
-        };
+        }
+    }
+
+    pub async fn await_response(
+        self: Arc<Self>,
+        cv: &CommunicationValue,
+        timeout_duration: Option<Duration>,
+    ) -> Result<CommunicationValue, String> {
+        let external_id = cv
+            .require_id()
+            .map_err(|error| format!("request is missing correlation ID: {error}"))?;
+        let (tx, mut rx) = mpsc::channel(1);
+        let internal_id = self.reserve_response_id(Box::new(move |_, response| {
+            tokio::spawn(async move {
+                let _ = tx.send(response).await;
+            });
+            true
+        }));
         self.send_message(&cv.clone().with_id(internal_id)).await;
         let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
         let result = tokio::time::timeout(timeout, rx.recv()).await;
@@ -1110,8 +1102,12 @@ impl std::fmt::Debug for IotaConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{contact_snapshot, is_iota_omega_management_operation, registration_request};
+    use super::{
+        contact_snapshot, is_iota_omega_management_operation, registration_request,
+        reserve_response_id_with,
+    };
     use crate::util::data_type_id;
+    use dashmap::DashMap;
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 
     fn snapshot(user_ids: DataValue) -> CommunicationValue {
@@ -1119,6 +1115,80 @@ mod tests {
             .with_receiver(7)
             .add_typed_default(DataType::SessionId, DataValue::SignedNumber(11))
             .add_typed_default(DataType::UserIds, user_ids)
+    }
+
+    #[test]
+    fn response_id_allocator_skips_collisions_and_zero() {
+        let waiting = DashMap::new();
+        waiting.insert(42, Box::new(|_, _| true) as super::ResponseTask);
+        let mut candidates = [0, 42, 42, 73].into_iter();
+        let id = reserve_response_id_with(
+            &waiting,
+            || candidates.next().unwrap(),
+            Box::new(|_, _| true),
+        );
+        assert_eq!(id, 73);
+        assert!(waiting.contains_key(&42));
+        assert!(waiting.contains_key(&73));
+        assert!(!waiting.contains_key(&0));
+    }
+
+    #[test]
+    fn clearing_waiters_on_disconnect_closes_response_channels() {
+        let waiting = DashMap::new();
+        let (sender, receiver) = std::sync::mpsc::channel::<CommunicationValue>();
+        reserve_response_id_with(
+            &waiting,
+            || 17,
+            Box::new(move |_, response| {
+                sender.send(response).unwrap();
+                true
+            }),
+        );
+        waiting.clear();
+        assert!(receiver.recv().is_err());
+    }
+
+    #[test]
+    fn same_external_ids_have_distinct_internal_correlations() {
+        let waiting = DashMap::new();
+        let mut candidates = [100, 100, 101].into_iter();
+        let external_id = 42;
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let first = reserve_response_id_with(
+            &waiting,
+            || candidates.next().unwrap(),
+            Box::new(move |_, response| {
+                first_tx.send(response.with_id(external_id)).unwrap();
+                true
+            }),
+        );
+        let second = reserve_response_id_with(
+            &waiting,
+            || candidates.next().unwrap(),
+            Box::new(move |_, response| {
+                second_tx.send(response.with_id(external_id)).unwrap();
+                true
+            }),
+        );
+        assert_ne!(first, second);
+        let (_, second_task) = waiting.remove(&second).unwrap();
+        assert!(second_task(
+            second,
+            CommunicationValue::new(CommunicationType::Success).with_id(second)
+        ));
+        let (_, first_task) = waiting.remove(&first).unwrap();
+        assert!(first_task(
+            first,
+            CommunicationValue::new(CommunicationType::ErrorInvalidData).with_id(first)
+        ));
+        let first_response = first_rx.recv().unwrap();
+        let second_response = second_rx.recv().unwrap();
+        assert_eq!(first_response.id(), Some(42));
+        assert!(first_response.is_type(CommunicationType::ErrorInvalidData));
+        assert_eq!(second_response.id(), Some(42));
+        assert!(second_response.is_type(CommunicationType::Success));
     }
 
     #[test]

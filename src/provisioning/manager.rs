@@ -2,9 +2,10 @@ use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use uuid::Uuid;
 
+use super::ProvisioningError;
 use super::session::{
-    ProvisioningMethod, ProvisioningParticipant, ProvisioningRole, ProvisioningSession,
-    ProvisioningState, ResolvedAccount,
+    ProvisioningFailure, ProvisioningMethod, ProvisioningParticipant, ProvisioningRole,
+    ProvisioningSession, ProvisioningState, ResolvedAccount, TerminatedProvisioning,
 };
 
 #[derive(Default)]
@@ -20,6 +21,32 @@ pub struct ProvisioningManager {
 }
 
 impl ProvisioningManager {
+    fn require_active_locked<'a>(
+        &self,
+        sessions: &'a mut Sessions,
+        id: Uuid,
+        participant_id: u64,
+    ) -> Result<&'a mut ProvisioningSession, ProvisioningError> {
+        let expired = sessions
+            .by_id
+            .get(&id)
+            .ok_or(ProvisioningError::UnknownSession)?
+            .created_at
+            .elapsed()
+            >= self.ttl;
+        if expired {
+            self.remove_locked(sessions, id);
+            return Err(ProvisioningError::Expired);
+        }
+        if sessions.by_participant.get(&participant_id) != Some(&id) {
+            return Err(ProvisioningError::WrongSession);
+        }
+        sessions
+            .by_id
+            .get_mut(&id)
+            .ok_or(ProvisioningError::UnknownSession)
+    }
+
     pub fn new(ttl: Duration, max_sessions: usize) -> Self {
         Self {
             sessions: Mutex::new(Sessions::default()),
@@ -42,16 +69,17 @@ impl ProvisioningManager {
         &self,
         method: ProvisioningMethod,
         participant: ProvisioningParticipant,
-    ) -> Result<Uuid, &'static str> {
+    ) -> Result<Uuid, ProvisioningError> {
         self.prune_expired();
         let mut sessions = self.sessions.lock().unwrap();
-        if sessions.by_participant.contains_key(&participant.id)
-            || sessions.by_id.len() >= self.max_sessions
-        {
-            return Err("session limit reached");
+        if sessions.by_participant.contains_key(&participant.id) {
+            return Err(ProvisioningError::AlreadyInSession);
+        }
+        if sessions.by_id.len() >= self.max_sessions {
+            return Err(ProvisioningError::SessionLimit);
         }
         if method == ProvisioningMethod::Password && participant.role != ProvisioningRole::Contact {
-            return Err("password sessions require a contact");
+            return Err(ProvisioningError::WrongParticipant);
         }
         let id = Uuid::new_v4();
         let (contact, owner) = match participant.role {
@@ -79,24 +107,31 @@ impl ProvisioningManager {
         &self,
         id: Uuid,
         participant: ProvisioningParticipant,
-    ) -> Result<ProvisioningSession, &'static str> {
+    ) -> Result<ProvisioningSession, ProvisioningError> {
         self.prune_expired();
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.by_participant.contains_key(&participant.id) {
-            return Err("already in a session");
+            return Err(ProvisioningError::AlreadyInSession);
         }
-        let session = sessions.by_id.get_mut(&id).ok_or("unknown session")?;
+        let session = sessions
+            .by_id
+            .get_mut(&id)
+            .ok_or(ProvisioningError::UnknownSession)?;
+        if session.created_at.elapsed() >= self.ttl {
+            self.remove_locked(&mut sessions, id);
+            return Err(ProvisioningError::Expired);
+        }
         if session.method == ProvisioningMethod::Password
             || session.state != ProvisioningState::Created
         {
-            return Err("session cannot be joined");
+            return Err(ProvisioningError::InvalidState);
         }
         let slot = match participant.role {
             ProvisioningRole::Contact => &mut session.contact,
             ProvisioningRole::Owner => &mut session.owner,
         };
         if slot.is_some() {
-            return Err("role already occupied");
+            return Err(ProvisioningError::RoleOccupied);
         }
         *slot = Some(participant.clone());
         session.state = ProvisioningState::PeerReady;
@@ -109,26 +144,34 @@ impl ProvisioningManager {
         &self,
         id: Uuid,
         participant_id: u64,
-    ) -> Result<ProvisioningSession, &'static str> {
+    ) -> Result<ProvisioningSession, ProvisioningError> {
         self.prune_expired();
         let sessions = self.sessions.lock().unwrap();
         if sessions.by_participant.get(&participant_id) != Some(&id) {
-            return Err("wrong session");
+            return Err(ProvisioningError::WrongSession);
         }
-        sessions.by_id.get(&id).cloned().ok_or("unknown session")
+        sessions
+            .by_id
+            .get(&id)
+            .cloned()
+            .ok_or(ProvisioningError::UnknownSession)
     }
 
     pub fn for_participant(
         &self,
         participant_id: u64,
-    ) -> Result<ProvisioningSession, &'static str> {
+    ) -> Result<ProvisioningSession, ProvisioningError> {
         self.prune_expired();
         let sessions = self.sessions.lock().unwrap();
         let id = sessions
             .by_participant
             .get(&participant_id)
-            .ok_or("no active session")?;
-        sessions.by_id.get(id).cloned().ok_or("unknown session")
+            .ok_or(ProvisioningError::UnknownSession)?;
+        sessions
+            .by_id
+            .get(id)
+            .cloned()
+            .ok_or(ProvisioningError::UnknownSession)
     }
 
     pub fn bind(
@@ -136,21 +179,18 @@ impl ProvisioningManager {
         id: Uuid,
         participant_id: u64,
         account: ResolvedAccount,
-    ) -> Result<ProvisioningSession, &'static str> {
+    ) -> Result<ProvisioningSession, ProvisioningError> {
         let mut sessions = self.sessions.lock().unwrap();
-        if sessions.by_participant.get(&participant_id) != Some(&id) {
-            return Err("wrong session");
-        }
-        let session = sessions.by_id.get_mut(&id).ok_or("unknown session")?;
+        let session = self.require_active_locked(&mut sessions, id, participant_id)?;
         if session.method != ProvisioningMethod::Password {
             session.require_actor(participant_id, ProvisioningRole::Owner)?;
             if session.state != ProvisioningState::PeerReady {
-                return Err("peer not ready");
+                return Err(ProvisioningError::InvalidState);
             }
         } else {
             session.require_actor(participant_id, ProvisioningRole::Contact)?;
             if session.state != ProvisioningState::Created {
-                return Err("already bound");
+                return Err(ProvisioningError::InvalidState);
             }
         }
         session.account = Some(account);
@@ -158,17 +198,14 @@ impl ProvisioningManager {
         Ok(session.clone())
     }
 
-    pub fn confirm(&self, id: Uuid, participant_id: u64) -> Result<(), &'static str> {
+    pub fn confirm(&self, id: Uuid, participant_id: u64) -> Result<(), ProvisioningError> {
         let mut sessions = self.sessions.lock().unwrap();
-        if sessions.by_participant.get(&participant_id) != Some(&id) {
-            return Err("wrong session");
-        }
-        let session = sessions.by_id.get_mut(&id).ok_or("unknown session")?;
+        let session = self.require_active_locked(&mut sessions, id, participant_id)?;
         session.require_actor(participant_id, ProvisioningRole::Owner)?;
         if session.method != ProvisioningMethod::QrOwnerCreated
             || session.state != ProvisioningState::AccountBound
         {
-            return Err("confirmation not allowed");
+            return Err(ProvisioningError::InvalidState);
         }
         session.owner_confirmed = true;
         Ok(())
@@ -178,17 +215,15 @@ impl ProvisioningManager {
         &self,
         id: Uuid,
         participant_id: u64,
-    ) -> Result<ProvisioningSession, &'static str> {
+    ) -> Result<ProvisioningSession, ProvisioningError> {
         let mut sessions = self.sessions.lock().unwrap();
-        if sessions.by_participant.get(&participant_id) != Some(&id) {
-            return Err("wrong session");
-        }
-        let session = sessions.by_id.get_mut(&id).ok_or("unknown session")?;
+        let session = self.require_active_locked(&mut sessions, id, participant_id)?;
         session.require_actor(participant_id, ProvisioningRole::Contact)?;
-        if session.method != ProvisioningMethod::Password
-            || session.state != ProvisioningState::AccountBound
-        {
-            return Err("password session is not ready");
+        if session.method != ProvisioningMethod::Password {
+            return Err(ProvisioningError::WrongMethod);
+        }
+        if session.state != ProvisioningState::AccountBound {
+            return Err(ProvisioningError::InvalidState);
         }
         session.state = ProvisioningState::Authorizing;
         Ok(session.clone())
@@ -198,30 +233,33 @@ impl ProvisioningManager {
         &self,
         id: Uuid,
         participant_id: u64,
-    ) -> Result<ProvisioningSession, &'static str> {
+    ) -> Result<ProvisioningSession, ProvisioningError> {
         let mut sessions = self.sessions.lock().unwrap();
-        if sessions.by_participant.get(&participant_id) != Some(&id) {
-            return Err("wrong session");
-        }
-        let session = sessions.by_id.get_mut(&id).ok_or("unknown session")?;
+        let session = self.require_active_locked(&mut sessions, id, participant_id)?;
         session.require_actor(participant_id, ProvisioningRole::Contact)?;
-        if session.method != ProvisioningMethod::Password
-            || session.state != ProvisioningState::Authorizing
-        {
-            return Err("password session is not authorizing");
+        if session.method != ProvisioningMethod::Password {
+            return Err(ProvisioningError::WrongMethod);
+        }
+        if session.state != ProvisioningState::Authorizing {
+            return Err(ProvisioningError::InvalidState);
         }
         session.state = ProvisioningState::Finishing;
         Ok(session.clone())
     }
 
-    pub fn password_delivered(&self, id: Uuid, participant_id: u64) -> Result<(), &'static str> {
+    pub fn password_delivered(
+        &self,
+        id: Uuid,
+        participant_id: u64,
+    ) -> Result<(), ProvisioningError> {
         let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions.by_id.get_mut(&id).ok_or("unknown session")?;
+        let session = self.require_active_locked(&mut sessions, id, participant_id)?;
         session.require_actor(participant_id, ProvisioningRole::Contact)?;
-        if session.method != ProvisioningMethod::Password
-            || session.state != ProvisioningState::Finishing
-        {
-            return Err("password session is not finishing");
+        if session.method != ProvisioningMethod::Password {
+            return Err(ProvisioningError::WrongMethod);
+        }
+        if session.state != ProvisioningState::Finishing {
+            return Err(ProvisioningError::InvalidState);
         }
         session.state = ProvisioningState::CredentialDelivered;
         Ok(())
@@ -232,27 +270,24 @@ impl ProvisioningManager {
         id: Uuid,
         participant_id: u64,
         receiver_id: u64,
-    ) -> Result<ProvisioningSession, &'static str> {
+    ) -> Result<ProvisioningSession, ProvisioningError> {
         let mut sessions = self.sessions.lock().unwrap();
-        if sessions.by_participant.get(&participant_id) != Some(&id) {
-            return Err("wrong session");
-        }
-        let session = sessions.by_id.get_mut(&id).ok_or("unknown session")?;
+        let session = self.require_active_locked(&mut sessions, id, participant_id)?;
         session.require_actor(participant_id, ProvisioningRole::Owner)?;
         session.can_deliver()?;
         if session.contact.as_ref().map(|contact| contact.id) != Some(receiver_id) {
-            return Err("wrong recipient");
+            return Err(ProvisioningError::WrongRecipient);
         }
         session.state = ProvisioningState::Authorizing;
         Ok(session.clone())
     }
 
-    pub fn delivered(&self, id: Uuid, participant_id: u64) -> Result<(), &'static str> {
+    pub fn delivered(&self, id: Uuid, participant_id: u64) -> Result<(), ProvisioningError> {
         let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions.by_id.get_mut(&id).ok_or("unknown session")?;
+        let session = self.require_active_locked(&mut sessions, id, participant_id)?;
         session.require_actor(participant_id, ProvisioningRole::Owner)?;
         if session.state != ProvisioningState::Authorizing {
-            return Err("not delivering");
+            return Err(ProvisioningError::InvalidState);
         }
         session.state = ProvisioningState::CredentialDelivered;
         Ok(())
@@ -262,12 +297,12 @@ impl ProvisioningManager {
         &self,
         id: Uuid,
         participant_id: u64,
-    ) -> Result<Option<ProvisioningParticipant>, &'static str> {
+    ) -> Result<Option<ProvisioningParticipant>, ProvisioningError> {
         let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions.by_id.get(&id).ok_or("unknown session")?;
+        let session = self.require_active_locked(&mut sessions, id, participant_id)?;
         session.require_actor(participant_id, ProvisioningRole::Contact)?;
         if session.state != ProvisioningState::CredentialDelivered {
-            return Err("credential not delivered");
+            return Err(ProvisioningError::InvalidState);
         }
         let owner = session.owner.clone();
         self.remove_locked(&mut sessions, id);
@@ -279,6 +314,36 @@ impl ProvisioningManager {
         if let Some(id) = sessions.by_participant.get(&participant_id).copied() {
             self.remove_locked(&mut sessions, id);
         }
+    }
+
+    pub fn fail_forward(
+        &self,
+        id: Uuid,
+        participant_id: u64,
+        reason: ProvisioningFailure,
+    ) -> Result<TerminatedProvisioning, ProvisioningError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.by_participant.get(&participant_id) != Some(&id) {
+            return Err(ProvisioningError::WrongSession);
+        }
+        let session = sessions
+            .by_id
+            .get(&id)
+            .ok_or(ProvisioningError::UnknownSession)?;
+        if session.contact.as_ref().map(|participant| participant.id) != Some(participant_id)
+            && session.owner.as_ref().map(|participant| participant.id) != Some(participant_id)
+        {
+            return Err(ProvisioningError::WrongParticipant);
+        }
+        let terminated = TerminatedProvisioning {
+            id,
+            method: session.method,
+            reason,
+            contact: session.contact.clone(),
+            owner: session.owner.clone(),
+        };
+        self.remove_locked(&mut sessions, id);
+        Ok(terminated)
     }
 
     fn remove_locked(&self, sessions: &mut Sessions, id: Uuid) {
@@ -312,6 +377,94 @@ mod tests {
             iota_id: 11,
             public_key: Keyring::generate().public_key_bundle(),
         }
+    }
+
+    #[test]
+    fn failed_forward_removes_session_and_participant_mapping() {
+        let manager = ProvisioningManager::new(Duration::from_secs(60), 10);
+        let contact = participant(7, ProvisioningRole::Contact);
+        let id = manager
+            .create(ProvisioningMethod::Password, contact.clone())
+            .unwrap();
+        manager.bind(id, 7, account()).unwrap();
+        manager.password_start(id, 7).unwrap();
+        let terminated = manager
+            .fail_forward(id, 7, ProvisioningFailure::UpstreamUnavailable)
+            .unwrap();
+        assert_eq!(terminated.reason, ProvisioningFailure::UpstreamUnavailable);
+        assert!(manager.snapshot(id, 7).is_err());
+        assert!(manager.password_finish(id, 7).is_err());
+        assert!(
+            manager
+                .create(ProvisioningMethod::Password, contact)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn failed_qr_forward_releases_both_participants() {
+        let manager = ProvisioningManager::new(Duration::from_secs(60), 10);
+        let id = manager
+            .create(
+                ProvisioningMethod::QrOwnerCreated,
+                participant(1, ProvisioningRole::Owner),
+            )
+            .unwrap();
+        manager
+            .join(id, participant(2, ProvisioningRole::Contact))
+            .unwrap();
+        manager.bind(id, 1, account()).unwrap();
+        manager.confirm(id, 1).unwrap();
+        manager.authorize_delivery(id, 1, 2).unwrap();
+        manager
+            .fail_forward(id, 1, ProvisioningFailure::PeerDisconnected)
+            .unwrap();
+        assert!(manager.for_participant(1).is_err());
+        assert!(manager.for_participant(2).is_err());
+    }
+
+    #[test]
+    fn failed_ke3_forward_cannot_deliver_or_complete_old_session() {
+        let manager = ProvisioningManager::new(Duration::from_secs(60), 10);
+        let id = manager
+            .create(
+                ProvisioningMethod::Password,
+                participant(7, ProvisioningRole::Contact),
+            )
+            .unwrap();
+        manager.bind(id, 7, account()).unwrap();
+        manager.password_start(id, 7).unwrap();
+        manager.password_finish(id, 7).unwrap();
+        manager
+            .fail_forward(id, 7, ProvisioningFailure::UpstreamRejected)
+            .unwrap();
+        assert!(manager.password_delivered(id, 7).is_err());
+        assert!(manager.complete(id, 7).is_err());
+        assert!(
+            manager
+                .create(
+                    ProvisioningMethod::Password,
+                    participant(7, ProvisioningRole::Contact)
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn delivered_credential_cannot_be_relayed_twice() {
+        let manager = ProvisioningManager::new(Duration::from_secs(60), 10);
+        let id = manager
+            .create(
+                ProvisioningMethod::Password,
+                participant(7, ProvisioningRole::Contact),
+            )
+            .unwrap();
+        manager.bind(id, 7, account()).unwrap();
+        manager.password_start(id, 7).unwrap();
+        manager.password_finish(id, 7).unwrap();
+        manager.password_delivered(id, 7).unwrap();
+        assert!(manager.password_delivered(id, 7).is_err());
+        assert!(manager.password_finish(id, 7).is_err());
     }
 
     #[test]
@@ -366,7 +519,8 @@ mod tests {
             .unwrap();
         manager.bind(id, 2, account()).unwrap();
         assert!(manager.authorize_delivery(id, 2, 1).is_ok());
-        manager.remove_participant(2);
+        manager.delivered(id, 2).unwrap();
+        manager.complete(id, 1).unwrap();
         assert!(manager.snapshot(id, 1).is_err());
     }
 
@@ -402,5 +556,112 @@ mod tests {
         assert!(manager.complete(id, 1).is_err());
         manager.password_delivered(id, 1).unwrap();
         manager.complete(id, 1).unwrap();
+    }
+
+    #[test]
+    fn expired_password_session_cannot_transition() {
+        let manager = ProvisioningManager::new(Duration::ZERO, 10);
+        let id = manager
+            .create(
+                ProvisioningMethod::Password,
+                participant(1, ProvisioningRole::Contact),
+            )
+            .unwrap();
+        assert!(matches!(
+            manager.bind(id, 1, account()),
+            Err(ProvisioningError::Expired)
+        ));
+        assert!(manager.password_start(id, 1).is_err());
+        assert!(manager.password_finish(id, 1).is_err());
+        assert!(manager.password_delivered(id, 1).is_err());
+        assert!(manager.complete(id, 1).is_err());
+    }
+
+    #[test]
+    fn expired_qr_sessions_cannot_transition() {
+        for (method, role) in [
+            (
+                ProvisioningMethod::QrContactCreated,
+                ProvisioningRole::Contact,
+            ),
+            (ProvisioningMethod::QrOwnerCreated, ProvisioningRole::Owner),
+        ] {
+            let manager = ProvisioningManager::new(Duration::ZERO, 10);
+            let id = manager.create(method, participant(1, role)).unwrap();
+            assert_eq!(
+                manager.bind(id, 1, account()).err(),
+                Some(ProvisioningError::Expired)
+            );
+            assert!(manager.confirm(id, 1).is_err());
+            assert!(manager.authorize_delivery(id, 1, 2).is_err());
+            assert!(manager.delivered(id, 1).is_err());
+            assert!(manager.complete(id, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn delivery_requires_active_membership_and_unexpired_session() {
+        let manager = ProvisioningManager::new(Duration::from_secs(60), 10);
+        let password = manager
+            .create(
+                ProvisioningMethod::Password,
+                participant(1, ProvisioningRole::Contact),
+            )
+            .unwrap();
+        manager.bind(password, 1, account()).unwrap();
+        manager.password_start(password, 1).unwrap();
+        manager.password_finish(password, 1).unwrap();
+        let other = manager
+            .create(
+                ProvisioningMethod::Password,
+                participant(2, ProvisioningRole::Contact),
+            )
+            .unwrap();
+        assert_eq!(
+            manager.password_delivered(password, 2),
+            Err(ProvisioningError::WrongSession)
+        );
+        assert_eq!(
+            manager.password_delivered(other, 1),
+            Err(ProvisioningError::WrongSession)
+        );
+        manager
+            .sessions
+            .lock()
+            .unwrap()
+            .by_id
+            .get_mut(&password)
+            .unwrap()
+            .created_at -= Duration::from_secs(61);
+        assert_eq!(
+            manager.password_delivered(password, 1),
+            Err(ProvisioningError::Expired)
+        );
+
+        let qr = manager
+            .create(
+                ProvisioningMethod::QrOwnerCreated,
+                participant(3, ProvisioningRole::Owner),
+            )
+            .unwrap();
+        manager
+            .join(qr, participant(4, ProvisioningRole::Contact))
+            .unwrap();
+        manager.bind(qr, 3, account()).unwrap();
+        manager.confirm(qr, 3).unwrap();
+        manager.authorize_delivery(qr, 3, 4).unwrap();
+        assert_eq!(
+            manager.delivered(qr, 4),
+            Err(ProvisioningError::WrongParticipant)
+        );
+        manager
+            .sessions
+            .lock()
+            .unwrap()
+            .by_id
+            .get_mut(&qr)
+            .unwrap()
+            .created_at -= Duration::from_secs(61);
+        assert_eq!(manager.delivered(qr, 3), Err(ProvisioningError::Expired));
     }
 }
