@@ -70,6 +70,15 @@ impl ProvisioningManager {
         method: ProvisioningMethod,
         participant: ProvisioningParticipant,
     ) -> Result<Uuid, ProvisioningError> {
+        self.create_with_id(Uuid::new_v4(), method, participant)
+    }
+
+    pub fn create_with_id(
+        &self,
+        id: Uuid,
+        method: ProvisioningMethod,
+        participant: ProvisioningParticipant,
+    ) -> Result<Uuid, ProvisioningError> {
         self.prune_expired();
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.by_participant.contains_key(&participant.id) {
@@ -81,7 +90,9 @@ impl ProvisioningManager {
         if method == ProvisioningMethod::Password && participant.role != ProvisioningRole::Contact {
             return Err(ProvisioningError::WrongParticipant);
         }
-        let id = Uuid::new_v4();
+        if sessions.by_id.contains_key(&id) {
+            return Err(ProvisioningError::AlreadyInSession);
+        }
         let (contact, owner) = match participant.role {
             ProvisioningRole::Contact => (Some(participant.clone()), None),
             ProvisioningRole::Owner => (None, Some(participant.clone())),
@@ -137,6 +148,39 @@ impl ProvisioningManager {
         session.state = ProvisioningState::PeerReady;
         let snapshot = session.clone();
         sessions.by_participant.insert(participant.id, id);
+        Ok(snapshot)
+    }
+
+    pub fn claim(
+        &self,
+        id: Uuid,
+        owner: ProvisioningParticipant,
+        account: ResolvedAccount,
+    ) -> Result<ProvisioningSession, ProvisioningError> {
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.by_participant.contains_key(&owner.id) {
+            return Err(ProvisioningError::AlreadyInSession);
+        }
+        let session = sessions
+            .by_id
+            .get_mut(&id)
+            .ok_or(ProvisioningError::UnknownSession)?;
+        if session.created_at.elapsed() >= self.ttl {
+            self.remove_locked(&mut sessions, id);
+            return Err(ProvisioningError::Expired);
+        }
+        if session.method != ProvisioningMethod::QrContactCreated
+            || session.state != ProvisioningState::Created
+            || owner.role != ProvisioningRole::Owner
+            || session.owner.is_some()
+        {
+            return Err(ProvisioningError::InvalidState);
+        }
+        session.owner = Some(owner.clone());
+        session.account = Some(account);
+        session.state = ProvisioningState::AccountBound;
+        let snapshot = session.clone();
+        sessions.by_participant.insert(owner.id, id);
         Ok(snapshot)
     }
 
@@ -201,8 +245,24 @@ impl ProvisioningManager {
     pub fn confirm(&self, id: Uuid, participant_id: u64) -> Result<(), ProvisioningError> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = self.require_active_locked(&mut sessions, id, participant_id)?;
+        if session.method == ProvisioningMethod::QrContactCreated {
+            if session.contact.as_ref().map(|contact| contact.id) == Some(participant_id) {
+                if session.state != ProvisioningState::AccountBound {
+                    return Err(ProvisioningError::InvalidState);
+                }
+                session.state = ProvisioningState::PeerReady;
+                return Ok(());
+            }
+            session.require_actor(participant_id, ProvisioningRole::Owner)?;
+            if session.state != ProvisioningState::PeerReady {
+                return Err(ProvisioningError::ConfirmationRequired);
+            }
+            session.state = ProvisioningState::AccountBound;
+            session.owner_confirmed = true;
+            return Ok(());
+        }
         session.require_actor(participant_id, ProvisioningRole::Owner)?;
-        if session.method != ProvisioningMethod::QrOwnerCreated
+        if session.method == ProvisioningMethod::Password
             || session.state != ProvisioningState::AccountBound
         {
             return Err(ProvisioningError::InvalidState);
@@ -380,6 +440,80 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_claim_is_atomic_and_keeps_registered_key() {
+        let manager = ProvisioningManager::new(Duration::from_secs(60), 10);
+        let contact = participant(1, ProvisioningRole::Contact);
+        let public_key = contact.temporary_public_key.try_to_base64().unwrap();
+        let id = manager
+            .create(ProvisioningMethod::QrContactCreated, contact)
+            .unwrap();
+        let claimed = manager
+            .claim(id, participant(2, ProvisioningRole::Owner), account())
+            .unwrap();
+        assert_eq!(
+            claimed
+                .contact
+                .unwrap()
+                .temporary_public_key
+                .try_to_base64()
+                .unwrap(),
+            public_key
+        );
+        assert!(
+            manager
+                .claim(id, participant(3, ProvisioningRole::Owner), account())
+                .is_err()
+        );
+        assert!(manager.authorize_delivery(id, 3, 1).is_err());
+        assert!(manager.authorize_delivery(id, 2, 1).is_err());
+        assert!(manager.confirm(id, 2).is_err());
+        manager.confirm(id, 1).unwrap();
+        manager.confirm(id, 2).unwrap();
+        manager.authorize_delivery(id, 2, 1).unwrap();
+        assert!(manager.authorize_delivery(id, 2, 1).is_err());
+        manager.delivered(id, 2).unwrap();
+        manager.complete(id, 1).unwrap();
+        assert!(
+            manager
+                .claim(id, participant(3, ProvisioningRole::Owner), account())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn concurrent_claims_have_exactly_one_winner() {
+        let manager = std::sync::Arc::new(ProvisioningManager::new(Duration::from_secs(60), 10));
+        let id = manager
+            .create(
+                ProvisioningMethod::QrContactCreated,
+                participant(1, ProvisioningRole::Contact),
+            )
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let attempts: Vec<_> = [2, 3]
+            .into_iter()
+            .map(|actor| {
+                let manager = manager.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let owner = participant(actor, ProvisioningRole::Owner);
+                    let account = account();
+                    barrier.wait();
+                    manager.claim(id, owner, account).is_ok()
+                })
+            })
+            .collect();
+        assert_eq!(
+            attempts
+                .into_iter()
+                .map(|attempt| attempt.join().unwrap())
+                .filter(|won| *won)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn failed_forward_removes_session_and_participant_mapping() {
         let manager = ProvisioningManager::new(Duration::from_secs(60), 10);
         let contact = participant(7, ProvisioningRole::Contact);
@@ -506,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn contact_created_qr_does_not_require_confirmation() {
+    fn contact_created_qr_requires_confirmation_and_is_single_claim() {
         let manager = ProvisioningManager::new(Duration::from_secs(60), 10);
         let id = manager
             .create(
@@ -518,6 +652,14 @@ mod tests {
             .join(id, participant(2, ProvisioningRole::Owner))
             .unwrap();
         manager.bind(id, 2, account()).unwrap();
+        assert!(
+            manager
+                .join(id, participant(3, ProvisioningRole::Owner))
+                .is_err()
+        );
+        assert!(manager.authorize_delivery(id, 2, 1).is_err());
+        manager.confirm(id, 1).unwrap();
+        manager.confirm(id, 2).unwrap();
         assert!(manager.authorize_delivery(id, 2, 1).is_ok());
         manager.delivered(id, 2).unwrap();
         manager.complete(id, 1).unwrap();

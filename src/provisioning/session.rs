@@ -115,7 +115,7 @@ impl ProvisioningSession {
         match self.method {
             ProvisioningMethod::Password => Err(ProvisioningError::WrongMethod),
             ProvisioningMethod::QrContactCreated
-                if self.contact.is_some() && self.owner.is_some() =>
+                if self.contact.is_some() && self.owner.is_some() && self.owner_confirmed =>
             {
                 Ok(())
             }
@@ -124,7 +124,9 @@ impl ProvisioningSession {
             {
                 Ok(())
             }
-            ProvisioningMethod::QrOwnerCreated if !self.owner_confirmed => {
+            ProvisioningMethod::QrOwnerCreated | ProvisioningMethod::QrContactCreated
+                if !self.owner_confirmed =>
+            {
                 Err(ProvisioningError::ConfirmationRequired)
             }
             _ => Err(ProvisioningError::PeerMissing),

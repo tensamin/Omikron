@@ -418,6 +418,25 @@ impl ClientConnection {
 
             let mut cv = cv;
 
+            if matches!(
+                cv.get_comm_type_enum(),
+                Some(
+                    CommunicationType::ProvisioningBindAccount
+                        | CommunicationType::QrProvisioningConfirm
+                        | CommunicationType::ProvisioningCredential
+                        | CommunicationType::ProvisioningCancel
+                )
+            ) {
+                if super::provisioning_connection::handle_authenticated_login(&self, &cv)
+                    .await
+                    .is_err()
+                {
+                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                        .await;
+                }
+                return;
+            }
+
             if cv.is_type(CommunicationType::Relay) {
                 let next_hop = match cv.require_receiver() {
                     Ok(next_hop) => next_hop,
@@ -1981,6 +2000,20 @@ impl ClientConnection {
 
     /// Handle connection close
     pub async fn handle_close(self: Arc<Self>) {
+        if let Ok(session) = self.state.provisioning.for_participant(self.session_id) {
+            if let Some(sender) = session.contact.and_then(|peer| peer.sender.upgrade()) {
+                let _ = sender
+                    .send(
+                        &CommunicationValue::new(CommunicationType::ProvisioningCancel)
+                            .add_typed_default(
+                                DataType::Uuid,
+                                DataValue::Str(session.id.to_string()),
+                            ),
+                    )
+                    .await;
+            }
+        }
+        self.state.provisioning.remove_participant(self.session_id);
         let user_id = self.get_user_id().await;
         if let Some(rho_conn) = self.state.rho.get_for_user(user_id as i64).await {
             rho_conn.close_client_connection(self.clone()).await;

@@ -172,6 +172,7 @@ impl ProvisioningConnection {
                 DataType::PublicKey,
                 DataType::Username,
                 DataType::UserId,
+                DataType::Uuid,
             ],
             Some(CommunicationType::ProvisioningJoin) => &[
                 DataType::Uuid,
@@ -304,6 +305,15 @@ impl ProvisioningConnection {
             }
         }
         let _ = self.sender.close();
+        if let Ok(session) = self
+            .general
+            .state
+            .provisioning
+            .for_participant(self.general.id())
+        {
+            self.terminate_forward(session.id, ProvisioningFailure::PeerDisconnected)
+                .await;
+        }
         self.general
             .state
             .provisioning
@@ -357,10 +367,19 @@ impl ProvisioningConnection {
         {
             Some("password") => ProvisioningMethod::Password,
             Some("qr-contact-created") => ProvisioningMethod::QrContactCreated,
-            Some("qr-owner-created") => ProvisioningMethod::QrOwnerCreated,
+            Some("qr-owner-created") => return Err("legacy QR login is no longer supported"),
             _ => return Err("invalid method"),
         };
         let role = Self::role(request)?;
+        if self
+            .general
+            .state
+            .provisioning
+            .for_participant(self.general.id())
+            .is_ok()
+        {
+            return Err("connection already has a login session".into());
+        }
         if request.get_data(DataType::Username).is_some()
             && request.get_data(DataType::UserId).is_some()
         {
@@ -395,7 +414,15 @@ impl ProvisioningConnection {
             .general
             .state
             .provisioning
-            .create(method, participant)
+            .create_with_id(
+                if method == ProvisioningMethod::QrContactCreated {
+                    Self::session_id(request)?
+                } else {
+                    Uuid::new_v4()
+                },
+                method,
+                participant,
+            )
             .map_err(|_| "cannot create session")?;
         if let Some(account) = account {
             self.general
@@ -431,6 +458,10 @@ impl ProvisioningConnection {
     async fn join(&self, request: &CommunicationValue) -> Result<(), ProvisioningOperationError> {
         let id = Self::session_id(request)?;
         let role = Self::role(request)?;
+        // Contact-created login claims are handled only on authenticated connections.
+        if role == ProvisioningRole::Owner {
+            return Err("owner joins are no longer supported".into());
+        }
         let participant = self.participant(request, role)?;
         let frame_id = request.id().ok_or("missing request ID")?;
         let session = self
@@ -438,6 +469,11 @@ impl ProvisioningConnection {
             .state
             .provisioning
             .join(id, participant.clone())?;
+        if session.method == ProvisioningMethod::QrContactCreated {
+            self.terminate_forward(id, ProvisioningFailure::DeliveryFailed)
+                .await;
+            return Err("QR login must be claimed by an authenticated client".into());
+        }
         let peer = match role {
             ProvisioningRole::Contact => session.owner,
             ProvisioningRole::Owner => session.contact,
@@ -615,6 +651,22 @@ impl ProvisioningConnection {
             .state
             .provisioning
             .confirm(id, self.general.id())?;
+        let session = self
+            .general
+            .state
+            .provisioning
+            .snapshot(id, self.general.id())?;
+        if session.method == ProvisioningMethod::QrContactCreated {
+            if let Some(sender) = session.owner.and_then(|peer| peer.sender.upgrade()) {
+                sender
+                    .send(
+                        &CommunicationValue::new(CommunicationType::QrProvisioningConfirm)
+                            .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string())),
+                    )
+                    .await
+                    .map_err(|_| "owner disconnected")?;
+            }
+        }
         if let Err(error) = self.send_success(request).await {
             self.terminate_forward(id, ProvisioningFailure::DeliveryFailed)
                 .await;
@@ -667,10 +719,11 @@ impl ProvisioningConnection {
             .state
             .provisioning
             .snapshot(Self::session_id(request)?, self.general.id())?;
-        self.general
-            .state
-            .provisioning
-            .remove_participant(self.general.id());
+        self.terminate_forward(
+            Self::session_id(request)?,
+            ProvisioningFailure::PeerDisconnected,
+        )
+        .await;
         self.send_success(request).await
     }
 
@@ -794,7 +847,7 @@ impl ProvisioningConnection {
     }
 }
 
-fn authorize_qr_credential(
+pub(crate) fn authorize_qr_credential(
     manager: &ProvisioningManager,
     participant_id: u64,
     request: &CommunicationValue,
@@ -808,6 +861,129 @@ fn authorize_qr_credential(
     manager
         .authorize_delivery(session.id, participant_id, recipient)
         .map_err(Into::into)
+}
+
+pub(crate) async fn handle_authenticated_login(
+    client: &super::client_connection::ClientConnection,
+    request: &CommunicationValue,
+) -> Result<(), &'static str> {
+    let participant_id = client.session_id;
+    let manager = &client.state.provisioning;
+    if !ProvisioningConnection::valid_fields(request) {
+        return Err("invalid login fields");
+    }
+    if request.is_type(CommunicationType::ProvisioningCredential) {
+        let session = authorize_qr_credential(manager, participant_id, request)?;
+        let contact = session
+            .contact
+            .and_then(|peer| peer.sender.upgrade())
+            .ok_or("contact disconnected")?;
+        manager.delivered(session.id, participant_id)?;
+        return contact.send(request).await.map_err(|_| "delivery failed");
+    }
+    let id = ProvisioningConnection::session_id(request)?;
+    if request.is_type(CommunicationType::ProvisioningBindAccount) {
+        if request
+            .get_data(DataType::UserId)
+            .and_then(DataValue::as_signed_number)
+            != Some(client.user_id.into())
+        {
+            return Err("claim does not match authenticated user");
+        }
+        let lookup = CommunicationValue::new(CommunicationType::GetUserData)
+            .with_sender(client.state.omega.omikron_id())
+            .add_typed_default(
+                DataType::UserId,
+                DataValue::SignedNumber(client.user_id.into()),
+            );
+        let response = client
+            .state
+            .omega
+            .clone()
+            .await_response(&lookup, Some(Duration::from_secs(20)))
+            .await
+            .map_err(|_| "account lookup failed")?;
+        let string = |field| {
+            response
+                .get_data(field)
+                .and_then(DataValue::as_str)
+                .map(str::to_owned)
+                .ok_or("invalid account")
+        };
+        let key = PublicKeyBundle::from_base64(&string(DataType::PublicKey)?)
+            .map_err(|_| "invalid account key")?;
+        let account = ResolvedAccount {
+            user_id: i64::try_from(client.user_id).map_err(|_| "invalid user ID")?,
+            username: string(DataType::Username)?,
+            principal: string(DataType::Principal)?,
+            iota_id: response
+                .get_data(DataType::IotaId)
+                .and_then(DataValue::as_signed_number)
+                .and_then(|value| i64::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or("invalid Iota")?,
+            public_key: key.clone(),
+        };
+        let session = manager.claim(
+            id,
+            ProvisioningParticipant {
+                id: participant_id,
+                role: ProvisioningRole::Owner,
+                temporary_public_key: key,
+                sender: Arc::downgrade(&client.sender),
+            },
+            account.clone(),
+        )?;
+        let contact = session.contact.ok_or("contact missing")?;
+        let sender = contact.sender.upgrade().ok_or("contact disconnected")?;
+        let event = account_bound_message(
+            id,
+            &account,
+            &account
+                .public_key
+                .try_to_base64()
+                .map_err(|_| "invalid key")?,
+            None,
+        );
+        let reply = peer_joined_message(id, &contact, request.id())?;
+        if deliver_peer_then_reply(
+            event,
+            reply,
+            |event| async move { sender.send(&event).await.is_ok() },
+            |reply| async move { client.sender.send(&reply).await.is_ok() },
+        )
+        .await
+        .is_err()
+        {
+            manager.remove_participant(participant_id);
+            return Err("claim delivery failed");
+        }
+        return Ok(());
+    }
+    if request.is_type(CommunicationType::QrProvisioningConfirm) {
+        manager.confirm(id, participant_id)?;
+    } else if request.is_type(CommunicationType::ProvisioningCancel) {
+        let session = manager.snapshot(id, participant_id)?;
+        manager.remove_participant(participant_id);
+        if let Some(sender) = session.contact.and_then(|peer| peer.sender.upgrade()) {
+            let _ = sender
+                .send(
+                    &CommunicationValue::new(CommunicationType::ProvisioningCancel)
+                        .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string())),
+                )
+                .await;
+        }
+    } else {
+        return Err("invalid QR operation");
+    }
+    client
+        .sender
+        .send(
+            &CommunicationValue::new(CommunicationType::Success)
+                .with_id(request.id().ok_or("missing request ID")?),
+        )
+        .await
+        .map_err(|_| "reply failed")
 }
 
 fn build_password_iota_request(
@@ -1126,10 +1302,11 @@ mod tests {
             assert!(
                 authorize_qr_credential(&manager, 1, &protected.clone().with_receiver(3)).is_err()
             );
-            if method == ProvisioningMethod::QrOwnerCreated {
-                assert!(authorize_qr_credential(&manager, 1, &protected).is_err());
-                manager.confirm(id, 1).unwrap();
+            assert!(authorize_qr_credential(&manager, 1, &protected).is_err());
+            if method == ProvisioningMethod::QrContactCreated {
+                manager.confirm(id, 2).unwrap();
             }
+            manager.confirm(id, 1).unwrap();
             authorize_qr_credential(&manager, 1, &protected).unwrap();
             assert_eq!(protected.payload(), &original_payload);
             manager.delivered(id, 1).unwrap();
