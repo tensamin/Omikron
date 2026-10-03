@@ -460,7 +460,10 @@ impl ProvisioningConnection {
             }
         };
         let reply_to_joiner = match peer_joined_message(id, &peer, Some(frame_id)) {
-            Ok(message) => message,
+            Ok(message) => message.add_typed_default(
+                DataType::ClientId,
+                DataValue::UnsignedNumber(participant.id.into()),
+            ),
             Err(error) => {
                 self.terminate_forward(id, ProvisioningFailure::DeliveryFailed)
                     .await;

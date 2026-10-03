@@ -962,6 +962,12 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+
+[[package]]
+name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
@@ -1661,8 +1667,8 @@ dependencies = [
 
 [[package]]
 name = "mtp"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
  "mtp-client",
  "mtp-codec",
@@ -1672,14 +1678,15 @@ dependencies = [
  "mtp-files",
  "mtp-host",
  "mtp-native",
+ "mtp-pipes",
  "mtp-type-map",
  "mtp-webserver",
 ]
 
 [[package]]
 name = "mtp-client"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
  "mtp-codec",
  "mtp-common",
@@ -1691,8 +1698,8 @@ dependencies = [
 
 [[package]]
 name = "mtp-codec"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
  "base64 0.23.1",
  "byteorder",
@@ -1705,29 +1712,31 @@ dependencies = [
 
 [[package]]
 name = "mtp-common"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
+ "js-sys",
  "rand 0.10.3",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "mtp-core"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
  "async-trait",
  "mtp-codec",
  "mtp-common",
  "tokio",
+ "tokio_with_wasm",
  "tracing",
 ]
 
 [[package]]
 name = "mtp-crypto"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -1749,8 +1758,8 @@ dependencies = [
 
 [[package]]
 name = "mtp-files"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
  "mtp-crypto",
  "rand 0.10.3",
@@ -1760,8 +1769,8 @@ dependencies = [
 
 [[package]]
 name = "mtp-h3"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1777,8 +1786,8 @@ dependencies = [
 
 [[package]]
 name = "mtp-host"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
  "mtp-codec",
  "mtp-common",
@@ -1789,20 +1798,18 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "wtransport",
 ]
 
 [[package]]
 name = "mtp-native"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
  "async-trait",
  "mtp-codec",
  "mtp-common",
  "mtp-core",
  "mtp-crypto",
- "rand 0.10.3",
  "rcgen",
  "rustls",
  "rustls-native-certs",
@@ -1811,13 +1818,28 @@ dependencies = [
  "tracing",
  "wtransport",
  "x509-parser",
+]
+
+[[package]]
+name = "mtp-pipes"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
+dependencies = [
+ "mtp-codec",
+ "mtp-common",
+ "mtp-core",
+ "mtp-crypto",
+ "rand 0.10.3",
+ "tokio",
+ "tokio_with_wasm",
+ "tracing",
  "zeroize",
 ]
 
 [[package]]
 name = "mtp-type-map"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
  "serde",
  "serde_yaml",
@@ -1825,8 +1847,8 @@ dependencies = [
 
 [[package]]
 name = "mtp-webserver"
-version = "0.3.0"
-source = "git+https://git.methanium.net/Methanium/mtp.git?rev=bb0f682b735de5ebb36bb41dc699260578341828#bb0f682b735de5ebb36bb41dc699260578341828"
+version = "0.4.0"
+source = "git+https://git.methanium.net/Methanium/mtp.git?rev=abe39e0ea357b4516889e1502aa3356c623f7e63#abe39e0ea357b4516889e1502aa3356c623f7e63"
 dependencies = [
  "bytes",
  "h3",
@@ -3340,6 +3362,31 @@ dependencies = [
  "libc",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio_with_wasm"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67952a4025dc561465d61ba68d4d0043b81d94c0ef61673164f00b90a7e6d97f"
+dependencies = [
+ "hashbrown 0.16.1",
+ "js-sys",
+ "tokio",
+ "tokio_with_wasm_proc",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "tokio_with_wasm_proc"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82fea9ff016ae35c66c3f49e9af0e5b334f489c761e64b02ed2d46d9520bda95"
+dependencies = [
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
