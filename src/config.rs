@@ -195,7 +195,7 @@ impl Config {
             rho_max_anonymous_connections_per_ip,
             provisioning_session_ttl: Duration::from_secs(parse_positive_or_default(
                 "PROVISIONING_SESSION_TTL_SECONDS",
-                600,
+                3 * 60,
             )?),
             provisioning_max_sessions: parse_positive_or_default(
                 "PROVISIONING_MAX_SESSIONS",

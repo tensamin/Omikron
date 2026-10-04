@@ -431,6 +431,7 @@ impl ProvisioningConnection {
                 .bind(id, self.general.id(), account)?;
         }
         let reply = CommunicationValue::new(CommunicationType::ProvisioningCreated)
+            .add_typed_default(DataType::Timestamp, DataValue::UnsignedNumber(self.general.state.provisioning.remaining_seconds(id)?.into()))
             .with_id(request.id().ok_or("missing request ID")?)
             .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string()))
             .add_typed_default(
@@ -885,8 +886,8 @@ pub(crate) async fn handle_authenticated_login(
     if request.is_type(CommunicationType::ProvisioningBindAccount) {
         if request
             .get_data(DataType::UserId)
-            .and_then(DataValue::as_signed_number)
-            != Some(client.user_id.into())
+            .and_then(|value| value.as_signed_number().and_then(|id| u64::try_from(id).ok()).or_else(|| value.as_unsigned_number().and_then(|id| u64::try_from(id).ok())))
+            != Some(client.user_id)
         {
             return Err("claim does not match authenticated user");
         }

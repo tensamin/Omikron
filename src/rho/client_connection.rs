@@ -427,12 +427,12 @@ impl ClientConnection {
                         | CommunicationType::ProvisioningCancel
                 )
             ) {
-                if super::provisioning_connection::handle_authenticated_login(&self, &cv)
-                    .await
-                    .is_err()
+                if let Err(reason) = super::provisioning_connection::handle_authenticated_login(&self, &cv).await
                 {
-                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
-                        .await;
+                    log_err!(self.user_id as i64, PrintType::Client, "QR login rejected: {}", reason);
+                    self.sender.send(&CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                        .with_id(message_id)
+                        .add_typed_default(DataType::ErrorType, DataValue::Str(reason.into()))).await.ok();
                 }
                 return;
             }
