@@ -37,7 +37,7 @@ impl AnonymousClientConnection {
         Arc::new(Self {
             state: general.state.clone(),
             _mtp_connection: Some(general.mtp_connection.clone()),
-            user_id: user_id,
+            user_id,
 
             interested_users: Arc::new(RwLock::new(Vec::new())),
             is_open: Arc::new(RwLock::new(true)),
@@ -95,7 +95,7 @@ impl AnonymousClientConnection {
             return;
         }
         log_cv_out!(PrintType::Client, &cv);
-        if let Err(e) = self.sender.send(&cv).await {
+        if let Err(e) = self.sender.send(cv).await {
             log_out!(
                 self.user_id as i64,
                 PrintType::Client,
@@ -175,37 +175,38 @@ impl AnonymousClientConnection {
                     else {
                         continue;
                     };
-                    let mut json_invitee = Vec::new();
-                    let _ = json_invitee.push((
-                        DataType::UserId,
-                        call_invitee_cv
-                            .get_data(DataType::UserId)
-                            .cloned()
-                            .unwrap_or(DataValue::Null),
-                    ));
-                    let _ = json_invitee.push((
-                        DataType::Username,
-                        call_invitee_cv
-                            .get_data(DataType::Username)
-                            .cloned()
-                            .unwrap_or(DataValue::Null),
-                    ));
-                    let _ = json_invitee.push((
-                        DataType::Display,
-                        call_invitee_cv
-                            .get_data(DataType::Display)
-                            .cloned()
-                            .unwrap_or(DataValue::Null),
-                    ));
-                    let _ = json_invitee.push((
-                        DataType::Avatar,
-                        call_invitee_cv
-                            .get_data(DataType::Avatar)
-                            .cloned()
-                            .unwrap_or(DataValue::Null),
-                    ));
+                    let json_invitee = [
+                        (
+                            DataType::UserId,
+                            call_invitee_cv
+                                .get_data(DataType::UserId)
+                                .cloned()
+                                .unwrap_or(DataValue::Null),
+                        ),
+                        (
+                            DataType::Username,
+                            call_invitee_cv
+                                .get_data(DataType::Username)
+                                .cloned()
+                                .unwrap_or(DataValue::Null),
+                        ),
+                        (
+                            DataType::Display,
+                            call_invitee_cv
+                                .get_data(DataType::Display)
+                                .cloned()
+                                .unwrap_or(DataValue::Null),
+                        ),
+                        (
+                            DataType::Avatar,
+                            call_invitee_cv
+                                .get_data(DataType::Avatar)
+                                .cloned()
+                                .unwrap_or(DataValue::Null),
+                        ),
+                    ];
 
-                    let _ = invited.push(DataValue::Container(
+                    invited.push(DataValue::Container(
                         json_invitee
                             .iter()
                             .map(|(k, v)| (data_type_id(*k, &TypeMap::latest()), v.clone()))
@@ -218,14 +219,15 @@ impl AnonymousClientConnection {
                     Ok(None) | Err(_) => return,
                 };
 
-                let mut serialized = Vec::new();
-                let _ = serialized.push((DataType::CallId, DataValue::Str(call_id.to_string())));
-                let _ = serialized.push((DataType::CallInvited, DataValue::Array(invited.clone())));
-                let _ = serialized.push((DataType::CallMembers, DataValue::Array(invited)));
-                let _ = serialized.push((DataType::CallToken, DataValue::Str(token)));
+                let serialized = [
+                    (DataType::CallId, DataValue::Str(call_id.to_string())),
+                    (DataType::CallInvited, DataValue::Array(invited.clone())),
+                    (DataType::CallMembers, DataValue::Array(invited)),
+                    (DataType::CallToken, DataValue::Str(token)),
+                ];
                 self.clone()
                     .send_message(
-                        &&CommunicationValue::new(CommunicationType::IdentificationResponse)
+                        &CommunicationValue::new(CommunicationType::IdentificationResponse)
                             .with_id(message_id)
                             .add_typed_default(
                                 DataType::UserId,
@@ -296,8 +298,8 @@ impl AnonymousClientConnection {
                 return;
             }
 
-            if cv.is_type(CommunicationType::GetUserData) {
-                if let Some(anonymous) = {
+            if cv.is_type(CommunicationType::GetUserData)
+                && let Some(anonymous) = {
                     if let Some(user_id) = cv
                         .get_data(DataType::UserId)
                         .as_signed_number()
@@ -310,41 +312,37 @@ impl AnonymousClientConnection {
                     } else {
                         None
                     }
-                } {
-                    let response = CommunicationValue::new(CommunicationType::GetUserData)
-                        .with_id(message_id)
-                        .add_typed_default(
-                            DataType::Username,
-                            DataValue::Str(anonymous.get_user_name().await),
-                        )
-                        .add_typed_default(
-                            DataType::UserId,
-                            DataValue::SignedNumber(anonymous.user_id.into()),
-                        )
-                        .add_typed_default(
-                            DataType::Display,
-                            DataValue::Str(anonymous.get_display_name().await),
-                        )
-                        .add_typed_default(
-                            DataType::UserState,
-                            DataValue::Str("online".to_string()),
-                        )
-                        .add_typed_default(
-                            DataType::Avatar,
-                            DataValue::Str(anonymous.get_avatar().await),
-                        );
-
-                    self.send_message(&response).await;
-
-                    return;
                 }
+            {
+                let response = CommunicationValue::new(CommunicationType::GetUserData)
+                    .with_id(message_id)
+                    .add_typed_default(
+                        DataType::Username,
+                        DataValue::Str(anonymous.get_user_name().await),
+                    )
+                    .add_typed_default(
+                        DataType::UserId,
+                        DataValue::SignedNumber(anonymous.user_id.into()),
+                    )
+                    .add_typed_default(
+                        DataType::Display,
+                        DataValue::Str(anonymous.get_display_name().await),
+                    )
+                    .add_typed_default(DataType::UserState, DataValue::Str("online".to_string()))
+                    .add_typed_default(
+                        DataType::Avatar,
+                        DataValue::Str(anonymous.get_avatar().await),
+                    );
+
+                self.send_message(&response).await;
+
+                return;
             }
 
             if cv.is_type(CommunicationType::GetUserData)
                 || cv.is_type(CommunicationType::GetIotaData)
             {
                 self.handle_omega_forward(cv).await;
-                return;
             }
         });
     }
@@ -569,10 +567,10 @@ impl AnonymousClientConnection {
                 .await;
             return;
         };
-        if caller.has_admin() {
-            if let Some(target) = call.get_caller(user_id.unsigned_abs()).await {
-                target.set_timeout(untill).await;
-            }
+        if caller.has_admin()
+            && let Some(target) = call.get_caller(user_id.unsigned_abs()).await
+        {
+            target.set_timeout(untill).await;
         }
     }
     async fn handle_call_disconnect_user(self: Arc<Self>, cv: CommunicationValue) {
@@ -620,7 +618,7 @@ impl AnonymousClientConnection {
         }
         *is_open_guard = false;
 
-        let _ = self.sender.close();
+        self.sender.close();
     }
 
     #[allow(dead_code)]

@@ -43,13 +43,11 @@ pub fn load_file_buf(path: &str, name: &str) -> io::Result<BufReader<File>> {
     let file_path = dir.join(name);
 
     // Ensure the directory exists, create if necessary
-    if !dir.exists() {
-        if let Err(_) = fs::create_dir_all(&dir) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Directory creation failed",
-            ));
-        }
+    if !dir.exists() && fs::create_dir_all(&dir).is_err() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Directory creation failed",
+        ));
     }
 
     // Create the file if it doesn't exist
@@ -139,16 +137,16 @@ pub fn save_file(path: &str, name: &str, value: &str) {
     let dir = Path::new(&get_directory()).join(path);
     let file_path = dir.join(name);
 
-    if !dir.exists() {
-        if let Err(e) = fs::create_dir_all(&dir) {
-            log!(
-                0,
-                PrintType::General,
-                "[IMPORTANT] Couldn't create directories: {}",
-                e
-            );
-            return;
-        }
+    if !dir.exists()
+        && let Err(e) = fs::create_dir_all(&dir)
+    {
+        log!(
+            0,
+            PrintType::General,
+            "[IMPORTANT] Couldn't create directories: {}",
+            e
+        );
+        return;
     }
 
     if let Err(e) = fs::write(&file_path, value) {
@@ -167,10 +165,8 @@ pub fn get_children(path: &str) -> Vec<String> {
     let dir = Path::new(&get_directory()).join(path);
     let mut children = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                children.push(entry.file_name().to_string_lossy().to_string());
-            }
+        for entry in entries.flatten() {
+            children.push(entry.file_name().to_string_lossy().to_string());
         }
     }
     children

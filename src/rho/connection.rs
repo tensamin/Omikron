@@ -23,6 +23,10 @@ pub type MtpSender = WebMtpSender;
 pub type MtpReceiver = WebMtpReceiver;
 
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "describe the missing field in each validation error"
+)]
 pub enum FrameValidationError {
     #[error("message is missing an MTP id")]
     MissingId,
@@ -529,9 +533,7 @@ impl GeneralConnection {
         let client = ClientConnection::from_general(self.clone(), user_id).await;
         let rho = self.find_user_rho(user_id as i64).await;
         *self.rho_connection.write().await = rho.clone();
-        let Some(rho) = rho else {
-            return None;
-        };
+        let rho = rho?;
         rho.bind_user_id(user_id as i64).await;
         rho.add_client_connection(client.clone()).await;
         let iota_id = rho.get_iota_id().await as i64;

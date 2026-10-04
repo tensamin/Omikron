@@ -102,10 +102,10 @@ impl RhoManager {
 
     pub async fn remove_user_binding(&self, user_id: i64, iota_id: i64) {
         let rho = self.users.get(&user_id).map(|entry| entry.value().clone());
-        if let Some(rho) = rho {
-            if rho.get_iota_id().await as i64 == iota_id {
-                self.users.remove(&user_id);
-            }
+        if let Some(rho) = rho
+            && rho.get_iota_id().await as i64 == iota_id
+        {
+            self.users.remove(&user_id);
         }
     }
 

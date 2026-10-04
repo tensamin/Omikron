@@ -304,7 +304,7 @@ impl ProvisioningConnection {
                 }
             }
         }
-        let _ = self.sender.close();
+        self.sender.close();
         if let Ok(session) = self
             .general
             .state
@@ -378,7 +378,7 @@ impl ProvisioningConnection {
             .for_participant(self.general.id())
             .is_ok()
         {
-            return Err("connection already has a login session".into());
+            return Err("connection already has a login session");
         }
         if request.get_data(DataType::Username).is_some()
             && request.get_data(DataType::UserId).is_some()
@@ -431,7 +431,16 @@ impl ProvisioningConnection {
                 .bind(id, self.general.id(), account)?;
         }
         let reply = CommunicationValue::new(CommunicationType::ProvisioningCreated)
-            .add_typed_default(DataType::Timestamp, DataValue::UnsignedNumber(self.general.state.provisioning.remaining_seconds(id)?.into()))
+            .add_typed_default(
+                DataType::Timestamp,
+                DataValue::UnsignedNumber(
+                    self.general
+                        .state
+                        .provisioning
+                        .remaining_seconds(id)?
+                        .into(),
+                ),
+            )
             .with_id(request.id().ok_or("missing request ID")?)
             .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string()))
             .add_typed_default(
@@ -657,16 +666,16 @@ impl ProvisioningConnection {
             .state
             .provisioning
             .snapshot(id, self.general.id())?;
-        if session.method == ProvisioningMethod::QrContactCreated {
-            if let Some(sender) = session.owner.and_then(|peer| peer.sender.upgrade()) {
-                sender
-                    .send(
-                        &CommunicationValue::new(CommunicationType::QrProvisioningConfirm)
-                            .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string())),
-                    )
-                    .await
-                    .map_err(|_| "owner disconnected")?;
-            }
+        if session.method == ProvisioningMethod::QrContactCreated
+            && let Some(sender) = session.owner.and_then(|peer| peer.sender.upgrade())
+        {
+            sender
+                .send(
+                    &CommunicationValue::new(CommunicationType::QrProvisioningConfirm)
+                        .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string())),
+                )
+                .await
+                .map_err(|_| "owner disconnected")?;
         }
         if let Err(error) = self.send_success(request).await {
             self.terminate_forward(id, ProvisioningFailure::DeliveryFailed)
@@ -884,10 +893,16 @@ pub(crate) async fn handle_authenticated_login(
     }
     let id = ProvisioningConnection::session_id(request)?;
     if request.is_type(CommunicationType::ProvisioningBindAccount) {
-        if request
-            .get_data(DataType::UserId)
-            .and_then(|value| value.as_signed_number().and_then(|id| u64::try_from(id).ok()).or_else(|| value.as_unsigned_number().and_then(|id| u64::try_from(id).ok())))
-            != Some(client.user_id)
+        if request.get_data(DataType::UserId).and_then(|value| {
+            value
+                .as_signed_number()
+                .and_then(|id| u64::try_from(id).ok())
+                .or_else(|| {
+                    value
+                        .as_unsigned_number()
+                        .and_then(|id| u64::try_from(id).ok())
+                })
+        }) != Some(client.user_id)
         {
             return Err("claim does not match authenticated user");
         }

@@ -278,10 +278,10 @@ pub async fn clean_calls(
             ) {
                 continue;
             }
-            if let Some(db) = &manager.persistence {
-                if db.remove(id).is_err() {
-                    continue;
-                }
+            if let Some(db) = &manager.persistence
+                && db.remove(id).is_err()
+            {
+                continue;
             }
             notify_call_ended(rho, id, &group).await;
             manager.groups.remove(&id);
@@ -317,22 +317,21 @@ pub async fn clean_calls(
                 if manager.reconcile_participants(id, &[]).await.is_err() {
                     continue;
                 }
-                if let Some(db) = &manager.persistence {
-                    if let Ok(since) = db.empty_since(id, now) {
-                        if now - since >= 300_000 {
-                            if !matches!(
-                                manager.livekit.delete_room(id).await,
-                                Ok(()) | Err(CallError::RoomNotFound { .. })
-                            ) {
-                                continue;
-                            }
-                            if db.remove(id).is_err() {
-                                continue;
-                            }
-                            notify_call_ended(rho, id, &group).await;
-                            manager.groups.remove(&id);
-                        }
+                if let Some(db) = &manager.persistence
+                    && let Ok(since) = db.empty_since(id, now)
+                    && now - since >= 300_000
+                {
+                    if !matches!(
+                        manager.livekit.delete_room(id).await,
+                        Ok(()) | Err(CallError::RoomNotFound { .. })
+                    ) {
+                        continue;
                     }
+                    if db.remove(id).is_err() {
+                        continue;
+                    }
+                    notify_call_ended(rho, id, &group).await;
+                    manager.groups.remove(&id);
                 }
             }
         }

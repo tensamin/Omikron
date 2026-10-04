@@ -29,6 +29,10 @@ enum ClientStateSyncPhase {
     #[default]
     Idle,
     Requesting {
+        #[expect(
+            dead_code,
+            reason = "retain requesting device context until sync acknowledgement"
+        )]
         device_id: String,
     },
     AwaitingAck {
@@ -238,8 +242,8 @@ impl ClientConnection {
             is_open: Arc::new(RwLock::new(true)),
             sender: general.sender.clone(),
             receiver: general.receiver.clone(),
-            user_id: user_id,
-            session_id: general.session_id.read().await.clone(),
+            user_id,
+            session_id: *general.session_id.read().await,
             client_version: general.client_version.read().await.clone(),
             message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
             client_state_sync: Arc::new(Mutex::new(ClientStateSyncState::default())),
@@ -319,7 +323,7 @@ impl ClientConnection {
             return;
         }
         log_cv_out!(PrintType::Client, &cv);
-        let _ = self.sender.send(&cv).await;
+        let _ = self.sender.send(cv).await;
     }
 
     /// Routes all post-initial-state messages behind the ClientStateAck barrier.
@@ -427,12 +431,26 @@ impl ClientConnection {
                         | CommunicationType::ProvisioningCancel
                 )
             ) {
-                if let Err(reason) = super::provisioning_connection::handle_authenticated_login(&self, &cv).await
+                if let Err(reason) =
+                    super::provisioning_connection::handle_authenticated_login(&self, &cv).await
                 {
-                    log_err!(self.user_id as i64, PrintType::Client, "QR login rejected: {}", reason);
-                    self.sender.send(&CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                        .with_id(message_id)
-                        .add_typed_default(DataType::ErrorType, DataValue::Str(reason.into()))).await.ok();
+                    log_err!(
+                        self.user_id as i64,
+                        PrintType::Client,
+                        "QR login rejected: {}",
+                        reason
+                    );
+                    self.sender
+                        .send(
+                            &CommunicationValue::new(CommunicationType::ErrorInvalidData)
+                                .with_id(message_id)
+                                .add_typed_default(
+                                    DataType::ErrorType,
+                                    DataValue::Str(reason.into()),
+                                ),
+                        )
+                        .await
+                        .ok();
                 }
                 return;
             }
@@ -714,8 +732,8 @@ impl ClientConnection {
                 }
                 return;
             }
-            if cv.is_type(CommunicationType::GetUserData) {
-                if let Some(anonymous) = {
+            if cv.is_type(CommunicationType::GetUserData)
+                && let Some(anonymous) = {
                     if let Some(user_id) = cv
                         .get_data(DataType::UserId)
                         .as_signed_number()
@@ -728,34 +746,31 @@ impl ClientConnection {
                     } else {
                         None
                     }
-                } {
-                    let response = CommunicationValue::new(CommunicationType::GetUserData)
-                        .with_id(message_id)
-                        .add_typed_default(
-                            DataType::Username,
-                            DataValue::Str(anonymous.get_user_name().await),
-                        )
-                        .add_typed_default(
-                            DataType::UserId,
-                            DataValue::SignedNumber(anonymous.get_user_id().into()),
-                        )
-                        .add_typed_default(
-                            DataType::Display,
-                            DataValue::Str(anonymous.get_display_name().await),
-                        )
-                        .add_typed_default(
-                            DataType::Avatar,
-                            DataValue::Str(anonymous.get_avatar().await),
-                        )
-                        .add_typed_default(
-                            DataType::UserState,
-                            DataValue::Str("online".to_string()),
-                        );
-
-                    self.send_message(&response).await;
-
-                    return;
                 }
+            {
+                let response = CommunicationValue::new(CommunicationType::GetUserData)
+                    .with_id(message_id)
+                    .add_typed_default(
+                        DataType::Username,
+                        DataValue::Str(anonymous.get_user_name().await),
+                    )
+                    .add_typed_default(
+                        DataType::UserId,
+                        DataValue::SignedNumber(anonymous.get_user_id().into()),
+                    )
+                    .add_typed_default(
+                        DataType::Display,
+                        DataValue::Str(anonymous.get_display_name().await),
+                    )
+                    .add_typed_default(
+                        DataType::Avatar,
+                        DataValue::Str(anonymous.get_avatar().await),
+                    )
+                    .add_typed_default(DataType::UserState, DataValue::Str("online".to_string()));
+
+                self.send_message(&response).await;
+
+                return;
             }
 
             if cv.is_type(CommunicationType::AccountStateRequest) {
@@ -1995,28 +2010,47 @@ impl ClientConnection {
         *is_open_guard = false;
         self.foreground_requests.lock().await.clear();
 
-        let _ = self.sender.close();
+        self.sender.close();
     }
 
     /// Handle connection close
     pub async fn handle_close(self: Arc<Self>) {
-        if let Ok(session) = self.state.provisioning.for_participant(self.session_id) {
-            if let Some(sender) = session.contact.and_then(|peer| peer.sender.upgrade()) {
-                let _ = sender
-                    .send(
-                        &CommunicationValue::new(CommunicationType::ProvisioningCancel)
-                            .add_typed_default(
-                                DataType::Uuid,
-                                DataValue::Str(session.id.to_string()),
-                            ),
-                    )
-                    .await;
-            }
+        if let Ok(session) = self.state.provisioning.for_participant(self.session_id)
+            && let Some(sender) = session.contact.and_then(|peer| peer.sender.upgrade())
+        {
+            let _ = sender
+                .send(
+                    &CommunicationValue::new(CommunicationType::ProvisioningCancel)
+                        .add_typed_default(DataType::Uuid, DataValue::Str(session.id.to_string())),
+                )
+                .await;
         }
         self.state.provisioning.remove_participant(self.session_id);
         let user_id = self.get_user_id().await;
         if let Some(rho_conn) = self.state.rho.get_for_user(user_id as i64).await {
             rho_conn.close_client_connection(self.clone()).await;
+        }
+    }
+}
+
+// Implement Clone to make it easier to work with Arc<ClientConnection>
+impl Clone for ClientConnection {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            _mtp_connection: self._mtp_connection.clone(),
+            sender: Arc::clone(&self.sender),
+            receiver: Arc::clone(&self.receiver),
+            user_id: self.user_id,
+            session_id: self.session_id,
+            client_version: self.client_version.clone(),
+            pub_key: Arc::clone(&self.pub_key),
+            rho_connection: Arc::clone(&self.rho_connection),
+            is_open: Arc::clone(&self.is_open),
+            message_slots: Arc::clone(&self.message_slots),
+            client_state_sync: Arc::clone(&self.client_state_sync),
+            session_activity: Arc::clone(&self.session_activity),
+            foreground_requests: Arc::clone(&self.foreground_requests),
         }
     }
 }
@@ -2090,27 +2124,5 @@ mod tests {
             result.get_data(DataType::PresenceSnapshotComplete),
             Some(&DataValue::Bool(false))
         );
-    }
-}
-
-// Implement Clone to make it easier to work with Arc<ClientConnection>
-impl Clone for ClientConnection {
-    fn clone(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-            _mtp_connection: self._mtp_connection.clone(),
-            sender: Arc::clone(&self.sender),
-            receiver: Arc::clone(&self.receiver),
-            user_id: self.user_id,
-            session_id: self.session_id,
-            client_version: self.client_version.clone(),
-            pub_key: Arc::clone(&self.pub_key),
-            rho_connection: Arc::clone(&self.rho_connection),
-            is_open: Arc::clone(&self.is_open),
-            message_slots: Arc::clone(&self.message_slots),
-            client_state_sync: Arc::clone(&self.client_state_sync),
-            session_activity: Arc::clone(&self.session_activity),
-            foreground_requests: Arc::clone(&self.foreground_requests),
-        }
     }
 }

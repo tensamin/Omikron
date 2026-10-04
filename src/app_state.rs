@@ -5,11 +5,8 @@ use mtp::crypto::Keyring;
 use tokio::sync::Semaphore;
 
 use crate::{
-    calls::{call_manager::CallManager, call_util::LiveKitService},
-    config::Config,
-    omega::omega_connection::OmegaConnection,
-    provisioning::ProvisioningManager,
-    rho::rho_manager::RhoManager,
+    calls::call_manager::CallManager, config::Config, omega::omega_connection::OmegaConnection,
+    provisioning::ProvisioningManager, rho::rho_manager::RhoManager,
     services::call_state::CallStateAggregator,
 };
 
@@ -43,11 +40,6 @@ impl RhoConnectionLimits {
             active_by_ip: self.anonymous_by_ip.clone(),
         })
     }
-
-    #[cfg(test)]
-    fn anonymous_count_for_ip(&self, ip: IpAddr) -> usize {
-        self.anonymous_by_ip.get(&ip).map_or(0, |count| *count)
-    }
 }
 
 pub struct RhoIpConnectionPermit {
@@ -76,7 +68,6 @@ pub struct AppState {
     pub rho: Arc<RhoManager>,
     pub call_manager: Arc<CallManager>,
     pub call_state_aggregator: Arc<CallStateAggregator>,
-    pub livekit: Arc<LiveKitService>,
     pub rho_connection_limits: Arc<RhoConnectionLimits>,
     pub provisioning: Arc<ProvisioningManager>,
 }
@@ -88,7 +79,6 @@ impl AppState {
         omega: Arc<OmegaConnection>,
         rho: Arc<RhoManager>,
         call_manager: Arc<CallManager>,
-        livekit: Arc<LiveKitService>,
     ) -> Arc<Self> {
         let rho_connection_limits = Arc::new(RhoConnectionLimits::new(
             config.rho_max_connections,
@@ -108,7 +98,6 @@ impl AppState {
                 CallStateAggregator::new(call_manager.clone()).with_rho(rho.clone()),
             ),
             call_manager,
-            livekit,
             rho_connection_limits,
         })
     }

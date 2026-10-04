@@ -7,8 +7,8 @@ use std::sync::Arc;
 use crate::anonymous_clients::anonymous_client_connection::AnonymousClientConnection;
 
 static ANONYMOUS_USERS: Lazy<DashMap<u64, Arc<AnonymousClientConnection>>> =
-    Lazy::new(|| DashMap::new());
-static ANONYMOUS_USERNAMES: Lazy<DashMap<String, u64>> = Lazy::new(|| DashMap::new());
+    Lazy::new(DashMap::new);
+static ANONYMOUS_USERNAMES: Lazy<DashMap<String, u64>> = Lazy::new(DashMap::new);
 
 pub fn add_anonymous_user(connection: Arc<AnonymousClientConnection>) {
     ANONYMOUS_USERS.insert(connection.get_user_id(), connection);

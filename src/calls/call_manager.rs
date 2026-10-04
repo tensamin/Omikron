@@ -53,9 +53,6 @@ impl Default for CallManager {
     }
 }
 impl CallManager {
-    pub fn new(livekit: Arc<LiveKitService>) -> Self {
-        Self::new_with_owner(livekit, 0)
-    }
     pub fn new_with_owner(livekit: Arc<LiveKitService>, owner: u64) -> Self {
         Self::new_with_limits(livekit, owner, CallLimits::default())
     }
@@ -259,10 +256,10 @@ impl CallManager {
                 return Ok(token);
             }
         };
-        if let Some(until) = member.timeout_until_ms {
-            if until > Self::now_ms()? {
-                return Err(CallServiceError::TimedOut { until_ms: until });
-            }
+        if let Some(until) = member.timeout_until_ms
+            && until > Self::now_ms()?
+        {
+            return Err(CallServiceError::TimedOut { until_ms: until });
         }
         self.livekit
             .create_token(user, g.call_id, member.role == CallRole::Admin)
@@ -420,14 +417,13 @@ impl CallManager {
             (state.anonymous_joining, state.short_link.clone())
         };
         let result = group.set_anonymous_joining(enabled, omega).await?;
-        if let Some(db) = &self.persistence {
-            if db
+        if let Some(db) = &self.persistence
+            && db
                 .set_anonymous(id, enabled, result.as_deref().or(link.as_deref()))
                 .is_err()
-            {
-                let _ = group.set_anonymous_joining(previous, omega).await;
-                return Err(CallServiceError::DeliveryFailed);
-            }
+        {
+            let _ = group.set_anonymous_joining(previous, omega).await;
+            return Err(CallServiceError::DeliveryFailed);
         }
         Ok(result)
     }

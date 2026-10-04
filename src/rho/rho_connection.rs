@@ -63,14 +63,12 @@ fn local_delivery_result(attempted: usize, sent: usize) -> Result<usize, String>
 impl RhoConnection {
     /// Create a new RhoConnection
     pub async fn new(iota_connection: Arc<IotaConnection>, user_ids: Vec<i64>) -> Self {
-        let rho_connection = Self {
+        Self {
             iota_connection,
             user_ids: Arc::new(RwLock::new(user_ids.clone())),
             client_connections: DashMap::new(),
             foreground_queries: Mutex::new(HashMap::new()),
-        };
-
-        rho_connection
+        }
     }
 
     pub fn iota_id(&self) -> u64 {

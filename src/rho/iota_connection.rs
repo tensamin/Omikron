@@ -148,7 +148,7 @@ impl IotaConnection {
             user_ids: Arc::new(RwLock::new(Vec::new())),
             sender: general.sender.clone(),
             receiver: general.receiver.clone(),
-            iota_id: iota_id,
+            iota_id,
             client_version: general.client_version.read().await.clone(),
             waiting_tasks: DashMap::new(),
             next_response_id: AtomicU32::new(rand::random::<u32>().max(1)),
@@ -232,10 +232,10 @@ impl IotaConnection {
             }
         }
 
-        if manager_rho.is_none() {
-            if let Some(rho_conn) = self.get_rho_connection().await {
-                rho_conn.add_user_id(user_id).await;
-            }
+        if manager_rho.is_none()
+            && let Some(rho_conn) = self.get_rho_connection().await
+        {
+            rho_conn.add_user_id(user_id).await;
         }
     }
 
@@ -248,11 +248,7 @@ impl IotaConnection {
     /// Get RhoConnection if available
     pub async fn get_rho_connection(&self) -> Option<Arc<RhoConnection>> {
         let rho_ref = self.rho_connection.read().await;
-        if let Some(weak_ref) = rho_ref.as_ref() {
-            Some(weak_ref.clone())
-        } else {
-            None
-        }
+        rho_ref.as_ref().map(|weak_ref| weak_ref.clone())
     }
 
     async fn replace_state_subscription(
@@ -312,7 +308,7 @@ impl IotaConnection {
     /// Send a CommunicationValue to the Iota
     pub async fn send_message(&self, cv: &CommunicationValue) {
         log_cv_out!(PrintType::Iota, cv);
-        if let Err(e) = self.sender.send(&cv).await {
+        if let Err(e) = self.sender.send(cv).await {
             log_err!(
                 self.iota_id as i64,
                 PrintType::Iota,
@@ -422,10 +418,10 @@ impl IotaConnection {
         }
 
         let msg_id = message_id;
-        if let Some((_, task)) = self.waiting_tasks.remove(&msg_id) {
-            if (task)(msg_id, cv.clone()) {
-                return;
-            }
+        if let Some((_, task)) = self.waiting_tasks.remove(&msg_id)
+            && (task)(msg_id, cv.clone())
+        {
+            return;
         }
 
         if cv.is_type(CommunicationType::AccountStateSnapshot) {
@@ -515,10 +511,10 @@ impl IotaConnection {
                             .map(|kind| kind.to_string())
                             .unwrap_or_else(|| response_cv.get_type().to_string())
                     );
-                    if response_cv.is_type(CommunicationType::Success) {
-                        if let Some(user_id) = cv.get_data(DataType::UserId).as_number() {
-                            self.add_user_id(user_id as u64).await;
-                        }
+                    if response_cv.is_type(CommunicationType::Success)
+                        && let Some(user_id) = cv.get_data(DataType::UserId).as_number()
+                    {
+                        self.add_user_id(user_id as u64).await;
                     }
                     self.send_message(&response_cv).await;
                 }
@@ -639,7 +635,7 @@ impl IotaConnection {
 
     #[allow(dead_code)]
     pub(crate) async fn close(&self) {
-        let _ = self.sender.close();
+        self.sender.close();
     }
 
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
@@ -902,7 +898,7 @@ impl IotaConnection {
 
                     invites
                         .entry(member_id as i64)
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(DataValue::container_from_map(&contact_call_map));
                 }
             }
@@ -927,15 +923,13 @@ impl IotaConnection {
 
                         if let Some(DataValue::SignedNumber(id)) =
                             user_map.get(&data_type_id(DataType::UserId, &tm))
+                            && let Some(call_list) = invites.get(&(*id as i64))
+                            && !call_list.is_empty()
                         {
-                            if let Some(call_list) = invites.get(&(*id as i64))
-                                && !call_list.is_empty()
-                            {
-                                user_map.insert(
-                                    data_type_id(DataType::Calls, &tm),
-                                    DataValue::Array(call_list.clone()),
-                                );
-                            }
+                            user_map.insert(
+                                data_type_id(DataType::Calls, &tm),
+                                DataValue::Array(call_list.clone()),
+                            );
                         }
 
                         enriched.push(DataValue::container_from_map(&user_map));
@@ -999,20 +993,18 @@ impl IotaConnection {
         let mut augmented_calls = false;
         let mut original_calls = None;
         for (key, value) in typed_data {
-            if key == Some(DataType::Contacts) {
-                if let Some(contacts) = value.as_array() {
-                    let (contacts, global_calls) = self
-                        .state
-                        .call_state_aggregator
-                        .augment_contacts(user_id, contacts.clone())
-                        .await;
-                    augmented_calls = true;
-                    output =
-                        output.add_typed_default(DataType::Contacts, DataValue::Array(contacts));
-                    output =
-                        output.add_typed_default(DataType::Calls, DataValue::Array(global_calls));
-                    continue;
-                }
+            if key == Some(DataType::Contacts)
+                && let Some(contacts) = value.as_array()
+            {
+                let (contacts, global_calls) = self
+                    .state
+                    .call_state_aggregator
+                    .augment_contacts(user_id, contacts.clone())
+                    .await;
+                augmented_calls = true;
+                output = output.add_typed_default(DataType::Contacts, DataValue::Array(contacts));
+                output = output.add_typed_default(DataType::Calls, DataValue::Array(global_calls));
+                continue;
             }
             // The Iota snapshot always carries an empty Calls array; the
             // augmented value above is authoritative. Re-adding the original
@@ -1025,10 +1017,8 @@ impl IotaConnection {
                 output = output.add_typed_default(data_type, value.clone());
             }
         }
-        if !augmented_calls {
-            if let Some(calls) = original_calls {
-                output = output.add_typed_default(DataType::Calls, calls);
-            }
+        if !augmented_calls && let Some(calls) = original_calls {
+            output = output.add_typed_default(DataType::Calls, calls);
         }
         output
     }

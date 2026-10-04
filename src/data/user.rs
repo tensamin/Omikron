@@ -14,9 +14,6 @@ pub enum UserStatus {
 }
 #[allow(unused)]
 impl UserStatus {
-    pub fn to_string(&self) -> String {
-        format!("{:?}", self)
-    }
     pub fn from_client_preference(s: &str) -> Option<Self> {
         match s {
             "user_online" => Some(Self::user_online),
@@ -37,6 +34,12 @@ impl UserStatus {
 
     pub fn from_str(s: &str) -> Option<Self> {
         Self::from_client_preference(s)
+    }
+}
+
+impl std::fmt::Display for UserStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
     }
 }
 

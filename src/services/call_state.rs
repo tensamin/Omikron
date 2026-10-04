@@ -127,7 +127,7 @@ impl CallStateAggregator {
             {
                 call_map.insert(
                     data_type_id(DataType::Timeout, &tm),
-                    DataValue::SignedNumber((timeout as i64).into()),
+                    DataValue::SignedNumber(timeout.into()),
                 );
             }
             if call_self

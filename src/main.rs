@@ -37,7 +37,7 @@ use crate::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if let Err(_) = default_provider().install_default() {
+    if default_provider().install_default().is_err() {
         return Err("Error loading Provider".into());
     }
     dotenv().ok();
@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     livekit
         .clone()
         .garbage_collect_calls(call_manager.clone(), rho.clone());
-    let state = AppState::new(config.clone(), keyring, omega, rho, call_manager, livekit);
+    let state = AppState::new(config.clone(), keyring, omega, rho, call_manager);
     let (shutdown, _) = watch::channel(false);
     let server = start(state, shutdown.subscribe());
     tokio::pin!(server);

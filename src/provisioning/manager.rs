@@ -23,8 +23,14 @@ pub struct ProvisioningManager {
 impl ProvisioningManager {
     pub fn remaining_seconds(&self, id: Uuid) -> Result<u64, ProvisioningError> {
         let sessions = self.sessions.lock().unwrap();
-        let session = sessions.by_id.get(&id).ok_or(ProvisioningError::UnknownSession)?;
-        Ok(self.ttl.saturating_sub(session.created_at.elapsed()).as_secs())
+        let session = sessions
+            .by_id
+            .get(&id)
+            .ok_or(ProvisioningError::UnknownSession)?;
+        Ok(self
+            .ttl
+            .saturating_sub(session.created_at.elapsed())
+            .as_secs())
     }
     fn require_active_locked<'a>(
         &self,
@@ -70,6 +76,7 @@ impl ProvisioningManager {
         sessions.by_participant.retain(|_, id| active.contains(id));
     }
 
+    #[cfg(test)]
     pub fn create(
         &self,
         method: ProvisioningMethod,

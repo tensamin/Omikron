@@ -199,9 +199,7 @@ impl CallGroup {
             );
         }
     }
-    pub async fn get_short_link(&self) -> Option<String> {
-        self.state.read().await.short_link.clone()
-    }
+    #[cfg(test)]
     pub async fn invite(&self, from: u64, to: u64) -> Result<(), CallServiceError> {
         self.invite_with_storage(from, to, None).await
     }
@@ -244,6 +242,7 @@ impl CallGroup {
         );
         Ok(())
     }
+    #[cfg(test)]
     pub async fn accept_invite(&self, id: u64) -> Result<CallMember, CallServiceError> {
         let mut s = self.state.write().await;
         s.pending_invites.retain(|_, invite| {
@@ -324,12 +323,11 @@ impl CallGroup {
                 Some(Duration::from_secs(20)),
             )
             .await
+            && let Some(link) = r.get_data(DataType::Link).as_str()
         {
-            if let Some(link) = r.get_data(DataType::Link).as_str() {
-                let link = link.to_string();
-                self.state.write().await.short_link = Some(link.clone());
-                return Ok(Some(link));
-            }
+            let link = link.to_string();
+            self.state.write().await.short_link = Some(link.clone());
+            return Ok(Some(link));
         }
         Ok(None)
     }

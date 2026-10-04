@@ -685,8 +685,8 @@ impl OmegaConnection {
             for client_conn in rho.get_client_connections().await {
                 let type_map = mtp::codec::TypeMap::latest();
                 let user_id = DataValue::SignedNumber(client_conn.get_user_id().await.into());
-                let session_id = DataValue::SignedNumber((client_conn.session_id as i128).into());
-                let iota_id = DataValue::SignedNumber((rho.get_iota_id().await as i128).into());
+                let session_id = DataValue::SignedNumber(client_conn.session_id as i128);
+                let iota_id = DataValue::SignedNumber(rho.get_iota_id().await as i128);
                 let peer_capabilities = self.peer_capabilities.read().await.clone();
                 if peer_capabilities.session_snapshot_v1 {
                     connected_sessions.push(DataValue::Container(vec![
@@ -1220,10 +1220,10 @@ impl OmegaConnection {
             AuthIdentityKind::Client => Some(self.offline_auth.client_max_age),
             AuthIdentityKind::Iota => self.offline_auth.iota_max_age,
         }?;
-        if let Some(key) = self.authenticated_key_cache.get(&identity) {
-            if cached_at_is_fresh(SystemTime::now(), key.cached_at, max_age) {
-                return Some(key.public_key.clone());
-            }
+        if let Some(key) = self.authenticated_key_cache.get(&identity)
+            && cached_at_is_fresh(SystemTime::now(), key.cached_at, max_age)
+        {
+            return Some(key.public_key.clone());
         }
         self.authenticated_key_cache.remove(&identity);
 
@@ -1242,7 +1242,7 @@ impl OmegaConnection {
             self.invalidate_authenticated_key(identity);
             return None;
         }
-        let key = load_public_key_bundle(&authenticated_key_path(identity)).ok()?;
+        let key = load_public_key_bundle(authenticated_key_path(identity)).ok()?;
         self.authenticated_key_cache.insert(
             identity,
             CachedAuthenticatedKey {
@@ -1260,16 +1260,16 @@ impl OmegaConnection {
     ) {
         self.missing_key_cache.remove(&identity);
         let path = authenticated_key_path(identity);
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                log_err!(
-                    identity.id as i64,
-                    PrintType::General,
-                    "Create authenticated key cache directory failed: {}",
-                    error
-                );
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            log_err!(
+                identity.id as i64,
+                PrintType::General,
+                "Create authenticated key cache directory failed: {}",
+                error
+            );
+            return;
         }
         if let Err(error) = save_public_key_bundle(&public_key, &path) {
             log_err!(

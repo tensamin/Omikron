@@ -213,9 +213,7 @@ impl RegistrationConnection {
                 if response.get_data(DataType::InvitationState).as_str() == Some("redeemed") =>
             {
                 let mut pending_guard = self.pending.lock().await;
-                let Some(pending) = pending_guard.as_mut() else {
-                    return None;
-                };
+                let pending = pending_guard.as_mut()?;
                 let challenge = rand::random::<u64>().max(1);
                 pending.challenge = Some(challenge);
                 let response = response.add_typed_default(
