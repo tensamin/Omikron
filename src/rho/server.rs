@@ -9,7 +9,7 @@ use crate::{
     log, log_err,
     omega::{AuthIdentity, AuthIdentityKind, omega_connection::OmegaConnection},
     rho::connection::{ConnectionKind, GeneralConnection, OptionalDataValueCompat},
-    util::{file_util::load_file_vec, logger::PrintType},
+    util::logger::PrintType,
 };
 use http::{Method, StatusCode};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
@@ -227,11 +227,12 @@ pub async fn start(
     state: Arc<AppState>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let cert_pem = load_file_vec("certs", "cert.pem")
-        .map_err(|error| format!("load certs/cert.pem: {error}"))?;
-
-    let key_pem = load_file_vec("certs", "key.pem")
-        .map_err(|error| format!("load certs/key.pem: {error}"))?;
+    let cert_file = std::env::var("TLS_CERT_FILE").unwrap_or_else(|_| "certs/cert.pem".into());
+    let cert_pem = std::fs::read(&cert_file)
+        .map_err(|error| format!("load TLS certificate {cert_file}: {error}"))?;
+    let key_file = std::env::var("TLS_KEY_FILE").unwrap_or_else(|_| "certs/key.pem".into());
+    let key_pem = std::fs::read(&key_file)
+        .map_err(|error| format!("load TLS private key {key_file}: {error}"))?;
 
     let host_config = HostConfig::new(
         state.config.bind_address,

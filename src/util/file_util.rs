@@ -125,13 +125,6 @@ pub fn load_file(path: &str, name: &str) -> String {
     content
 }
 
-pub fn load_file_vec(path: &str, name: &str) -> Result<Vec<u8>, std::io::Error> {
-    let dir = Path::new(&get_directory()).join(path);
-    let file_path = dir.join(name);
-
-    std::fs::read(file_path)
-}
-
 #[allow(dead_code)]
 pub fn save_file(path: &str, name: &str, value: &str) {
     let dir = Path::new(&get_directory()).join(path);
