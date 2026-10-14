@@ -48,16 +48,16 @@
       "locked": {
         "lastModified": 1790572556,
         "narHash": "sha256-ugNZR2Be9N9UjG0aVN8Yrk4hYOVC2edjtC9xBhbW35w=",
-        "ref": "main",
+        "owner": "TensaminDev",
+        "repo": "MTP-Type-Maps",
         "rev": "4f18c7a0d9b04d38a77fbb011c4f0b21c25bf7bf",
-        "revCount": 28,
-        "type": "git",
-        "url": "ssh://git@methanium.net/tensamin/mtp-type-maps"
+        "type": "github"
       },
       "original": {
+        "owner": "TensaminDev",
         "ref": "main",
-        "type": "git",
-        "url": "ssh://git@methanium.net/tensamin/mtp-type-maps"
+        "repo": "MTP-Type-Maps",
+        "type": "github"
       }
     }
   },

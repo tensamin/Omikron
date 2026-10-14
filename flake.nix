@@ -7,7 +7,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     type-maps = {
-      url = "git+ssh://git@methanium.net/tensamin/mtp-type-maps?ref=main";
+      url = "github:TensaminDev/MTP-Type-Maps/main";
       flake = false;
     };
   };
@@ -117,7 +117,7 @@
               pname = "omikron";
               version = "0.1.0";
               src = source;
-              hash = "sha256-Z9b2aa2OnBn6yf05YantL6HHwbMe4shJDy9Phro/b00=";
+              hash = "sha256-ptnCExsQTDqqTWszu+TAhWkz98vVRBUBAt7qsK99Tes=";
             };
           };
           container = self.lib.mkContainer {
