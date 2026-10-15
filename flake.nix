@@ -117,7 +117,7 @@
               pname = "omikron";
               version = "0.1.0";
               src = source;
-              hash = "sha256-ptnCExsQTDqqTWszu+TAhWkz98vVRBUBAt7qsK99Tes=";
+              hash = "sha256-gIdEGVZHcMVqjZOtVtKdLiKyubzUuAlxCn85nNjlS7w=";
             };
           };
           container = self.lib.mkContainer {

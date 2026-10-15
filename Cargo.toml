@@ -5,14 +5,14 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2"
-mtp = { git = "https://github.com/MethaniumDev/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247", features = [
+mtp = { git = "https://github.com/nonanium/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247", features = [
     "web-server",
     "client",
     "crypto",
     "files",
     "raw",
 ] }
-mtp-native = { git = "https://github.com/MethaniumDev/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247" }
+mtp-native = { git = "https://github.com/nonanium/MTP.git", rev = "ad489265deacadd6de52ed2129d071803a0e7247" }
 
 ansi_term = "0.12.1"
 uuid = { version = "1.24.0", features = ["v4"] }
