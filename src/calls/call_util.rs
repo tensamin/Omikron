@@ -18,11 +18,32 @@ const LIVEKIT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct LiveKitService {
     config: Option<LiveKitConfig>,
+    mutation_journal_path: std::path::PathBuf,
+}
+
+struct LiveKitMutation {
+    journal: crate::omega::MutationJournal,
+    operation_id: String,
+    call_id: Uuid,
+}
+
+impl LiveKitMutation {
+    fn complete(self) -> Result<(), CallError> {
+        self.journal
+            .resolve_record(&self.operation_id, br#"{"outcome":"completed"}"#)
+            .map_err(|detail| CallError::MutationRecovery {
+                call_id: self.call_id,
+                detail,
+            })
+    }
 }
 
 impl LiveKitService {
     pub fn new(config: Option<LiveKitConfig>) -> Self {
-        Self { config }
+        Self {
+            config,
+            mutation_journal_path: crate::omega::mutation_journal_path(),
+        }
     }
 
     fn livekit_config(&self) -> Result<&LiveKitConfig, CallError> {
@@ -38,11 +59,38 @@ impl LiveKitService {
         ))
     }
 
+    fn mutation(
+        &self,
+        call_id: Uuid,
+        operation: &str,
+        arguments: serde_json::Value,
+    ) -> Result<LiveKitMutation, CallError> {
+        let hostname = &self.livekit_config()?.hostname;
+        let prepare = || -> Result<_, String> {
+            let journal = crate::omega::MutationJournal::open(&self.mutation_journal_path)?;
+            let request = serde_json::to_vec(&serde_json::json!({
+                "service": "livekit", "hostname": hostname, "call_id": call_id.to_string(),
+                "operation": operation,
+                "user_id": arguments.get("user_id").and_then(serde_json::Value::as_u64),
+                "arguments_fingerprint": mtp::crypto::sha256(&serde_json::to_vec(&arguments).map_err(|error| error.to_string())?),
+            }))
+            .map_err(|error| error.to_string())?;
+            let operation_id = journal.begin_record(&request)?;
+            Ok(LiveKitMutation {
+                journal,
+                operation_id,
+                call_id,
+            })
+        };
+        prepare().map_err(|detail| CallError::MutationRecovery { call_id, detail })
+    }
+
     pub async fn create_room(&self, call_id: Uuid) -> Result<(), CallError> {
+        let client = self.room_client()?;
+        let mutation = self.mutation(call_id, "create_room", serde_json::json!({}))?;
         tokio::time::timeout(
             LIVEKIT_REQUEST_TIMEOUT,
-            self.room_client()?
-                .create_room(&call_id.to_string(), CreateRoomOptions::default()),
+            client.create_room(&call_id.to_string(), CreateRoomOptions::default()),
         )
         .await
         .map_err(|_| CallError::RequestTimedOut { call_id })?
@@ -50,7 +98,7 @@ impl LiveKitService {
             call_id,
             detail: error.to_string(),
         })?;
-        Ok(())
+        mutation.complete()
     }
 
     pub fn create_token(
@@ -94,10 +142,15 @@ impl LiveKitService {
     }
 
     pub async fn remove_participant(&self, call_id: Uuid, user_id: u64) -> Result<(), CallError> {
-        tokio::time::timeout(
+        let client = self.room_client()?;
+        let mutation = self.mutation(
+            call_id,
+            "remove_participant",
+            serde_json::json!({"user_id": user_id}),
+        )?;
+        let result = tokio::time::timeout(
             LIVEKIT_REQUEST_TIMEOUT,
-            self.room_client()?
-                .remove_participant(&call_id.to_string(), &user_id.to_string()),
+            client.remove_participant(&call_id.to_string(), &user_id.to_string()),
         )
         .await
         .map_err(|_| CallError::RequestTimedOut { call_id })?
@@ -112,8 +165,11 @@ impl LiveKitService {
                     detail,
                 }
             }
-        })?;
-        Ok(())
+        });
+        if result.is_ok() || matches!(result, Err(CallError::RoomNotFound { .. })) {
+            mutation.complete()?;
+        }
+        result.map(|_| ())
     }
 
     pub async fn participant_ids(&self, call_id: Uuid) -> Result<Vec<u64>, CallError> {
@@ -138,9 +194,11 @@ impl LiveKitService {
     }
 
     pub async fn delete_room(&self, call_id: Uuid) -> Result<(), CallError> {
-        tokio::time::timeout(
+        let client = self.room_client()?;
+        let mutation = self.mutation(call_id, "delete_room", serde_json::json!({}))?;
+        let result = tokio::time::timeout(
             LIVEKIT_REQUEST_TIMEOUT,
-            self.room_client()?.delete_room(&call_id.to_string()),
+            client.delete_room(&call_id.to_string()),
         )
         .await
         .map_err(|_| CallError::RequestTimedOut { call_id })?
@@ -151,8 +209,11 @@ impl LiveKitService {
             } else {
                 CallError::RoomCreationFailed { call_id, detail }
             }
-        })?;
-        Ok(())
+        });
+        if result.is_ok() || matches!(result, Err(CallError::RoomNotFound { .. })) {
+            mutation.complete()?;
+        }
+        result.map(|_| ())
     }
 
     #[allow(dead_code)]
@@ -166,10 +227,15 @@ impl LiveKitService {
         call_id: Uuid,
         metadata: String,
     ) -> Result<(), CallError> {
+        let client = self.room_client()?;
+        let mutation = self.mutation(
+            call_id,
+            "set_room_metadata",
+            serde_json::json!({"metadata": metadata}),
+        )?;
         tokio::time::timeout(
             LIVEKIT_REQUEST_TIMEOUT,
-            self.room_client()?
-                .update_room_metadata(&call_id.to_string(), &metadata),
+            client.update_room_metadata(&call_id.to_string(), &metadata),
         )
         .await
         .map_err(|_| CallError::RequestTimedOut { call_id })?
@@ -177,7 +243,7 @@ impl LiveKitService {
             call_id,
             detail: error.to_string(),
         })?;
-        Ok(())
+        mutation.complete()
     }
 
     #[allow(dead_code)]
@@ -185,17 +251,27 @@ impl LiveKitService {
         self: Arc<Self>,
         manager: Arc<CallManager>,
         rho: Arc<crate::rho::rho_manager::RhoManager>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
-        tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
             loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait_for(|stop| *stop) => return,
+                    _ = interval.tick() => {},
+                }
+                // Once admitted, finish this mutation-bearing cycle even if
+                // shutdown starts. The process drain observes it under its budget.
                 match self.room_client() {
                     Ok(room_service) => clean_calls(&manager, room_service, &rho).await,
                     Err(CallError::NotConfigured) => return,
                     Err(error) => log_err!(0, PrintType::Call, "Call cleanup skipped: {error}"),
                 }
-                tokio::time::sleep(Duration::from_secs(2)).await;
             }
         });
+        drop(crate::rho::tasks::supervise(tasks));
     }
 }
 
@@ -278,13 +354,17 @@ pub async fn clean_calls(
             ) {
                 continue;
             }
-            if let Some(db) = &manager.persistence
-                && db.remove(id).is_err()
             {
-                continue;
+                let mut state = group.state.write().await;
+                if let Some(db) = &manager.persistence
+                    && db.remove(id).is_err()
+                {
+                    continue;
+                }
+                state.ending = true;
+                manager.groups.remove(&id);
             }
             notify_call_ended(rho, id, &group).await;
-            manager.groups.remove(&id);
             continue;
         }
 
@@ -327,11 +407,15 @@ pub async fn clean_calls(
                     ) {
                         continue;
                     }
-                    if db.remove(id).is_err() {
-                        continue;
+                    {
+                        let mut state = group.state.write().await;
+                        if db.remove(id).is_err() {
+                            continue;
+                        }
+                        state.ending = true;
+                        manager.groups.remove(&id);
                     }
                     notify_call_ended(rho, id, &group).await;
-                    manager.groups.remove(&id);
                 }
             }
         }

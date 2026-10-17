@@ -9,7 +9,7 @@ use crate::anonymous_clients::anonymous_manager::{self, generate_username};
 use crate::app_state::AppState;
 use crate::calls::call_group::call_invite_secret_from_cv;
 use crate::rho::connection::{
-    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
+    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueExt, RequiredCommunicationFields,
     positive_data_i64,
 };
 use crate::util::data_type_id;
@@ -29,6 +29,7 @@ pub struct AnonymousClientConnection {
     pub display_name: Arc<RwLock<String>>,
     pub avatar: Arc<RwLock<String>>,
     message_slots: Arc<tokio::sync::Semaphore>,
+    tasks: Arc<crate::rho::tasks::MessageTasks>,
 }
 
 impl AnonymousClientConnection {
@@ -47,17 +48,24 @@ impl AnonymousClientConnection {
             display_name: Arc::new(RwLock::new(username)),
             avatar: Arc::new(RwLock::new(String::new())),
             message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
+            tasks: Arc::new(crate::rho::tasks::MessageTasks::new(
+                general.shutdown.subscribe(),
+                general.state.config.message_drain,
+            )),
         })
     }
-    pub fn start(self: Arc<Self>) {
+    pub async fn run(self: Arc<Self>) {
         anonymous_manager::add_anonymous_user(self.clone());
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            while let Ok(cv) = self_clone.receiver.receive().await {
-                self_clone.clone().handle_message(cv).await;
-            }
-            self_clone.handle_close().await;
-        });
+        while let Some(Ok(cv)) = self
+            .tasks
+            .while_connected(&self.receiver, self.receiver.receive())
+            .await
+        {
+            self.clone().handle_message(cv).await;
+        }
+        self.tasks.drain().await;
+        crate::rho::tasks::finish_cleanup(self.state.config.cleanup_timeout, self.handle_close())
+            .await;
     }
 
     /// Get the user ID
@@ -107,10 +115,17 @@ impl AnonymousClientConnection {
 
     /// Handle incoming message from client
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
-        let Ok(permit) = self.message_slots.clone().acquire_owned().await else {
+        let Some(Ok(permit)) = self
+            .tasks
+            .while_connected(&self.receiver, self.message_slots.clone().acquire_owned())
+            .await
+        else {
             return;
         };
-        tokio::spawn(async move {
+        let tasks = self.tasks.clone();
+        let sender = self.sender.clone();
+        let user_id = self.user_id;
+        if let Err(error) = tasks.spawn(async move {
             let _permit = permit;
             let message_id = match cv.require_id() {
                 Ok(message_id) => message_id,
@@ -344,11 +359,22 @@ impl AnonymousClientConnection {
             {
                 self.handle_omega_forward(cv).await;
             }
-        });
+        }) {
+            log_out!(
+                user_id as i64,
+                PrintType::Client,
+                "Message task submission failed: {}",
+                error
+            );
+            sender.close();
+        }
     }
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
         let client_for_closure = self.clone();
-        tokio::spawn(async move {
+        let tasks = self.tasks.clone();
+        let sender = self.sender.clone();
+        let user_id = self.user_id;
+        if let Err(error) = tasks.spawn_cancellable(async move {
             let response_cv = self
                 .state
                 .omega
@@ -358,7 +384,15 @@ impl AnonymousClientConnection {
             if let Ok(response_cv) = response_cv {
                 client_for_closure.send_message(&response_cv).await;
             }
-        });
+        }) {
+            log_out!(
+                user_id as i64,
+                PrintType::Client,
+                "Omega forward task submission failed: {}",
+                error
+            );
+            sender.close();
+        }
     }
 
     /// Handle call invite
@@ -429,9 +463,16 @@ impl AnonymousClientConnection {
 
                 let omega_conn = self.state.omega.clone();
                 // Send fire-and-forget, don't await to avoid blocking
-                tokio::spawn(async move {
+                if let Err(error) = self.tasks.spawn_cancellable(async move {
                     let _ = omega_conn.send_message(&push_cv).await;
-                });
+                }) {
+                    log_out!(
+                        self.user_id as i64,
+                        PrintType::Client,
+                        "Call invite push task submission failed: {}",
+                        error
+                    );
+                }
 
                 let error_cv = CommunicationValue::new(CommunicationType::ErrorNotFound)
                     .with_id(message_id)
@@ -673,6 +714,7 @@ impl Clone for AnonymousClientConnection {
             display_name: Arc::clone(&self.display_name),
             avatar: Arc::clone(&self.avatar),
             message_slots: Arc::clone(&self.message_slots),
+            tasks: Arc::clone(&self.tasks),
         }
     }
 }

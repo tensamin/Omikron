@@ -2,7 +2,7 @@ use super::capabilities::PeerCapabilities;
 use crate::{
     config::{Config, OfflineAuthPolicy, TransportConfig},
     log_cv_in, log_cv_out, log_err, log_in, log_out,
-    rho::connection::{OptionalDataValueCompat, RequiredMtpFields},
+    rho::connection::{OptionalDataValueExt, RequiredCommunicationFields},
     rho::relay_router,
     rho::rho_manager::RhoManager,
     util::{data_type_id, logger::PrintType},
@@ -19,10 +19,7 @@ use mtp_native::ConnectionHandle;
 use rand::RngExt;
 use std::{
     collections::VecDeque,
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -206,35 +203,11 @@ fn parse_omega_capability_response(value: &CommunicationValue) -> Result<PeerCap
 // Waiting Task System
 // ============================================================================
 
-pub struct WaitingTask {
-    pub original_id: u32,
-    pub sender: oneshot::Sender<CommunicationValue>,
-    pub inserted_at: Instant,
-}
-
-fn allocate_omega_request_id(
-    next_request_id: &AtomicU32,
-    waiting_tasks: &DashMap<u32, WaitingTask>,
-) -> u32 {
-    loop {
-        let candidate = next_request_id.fetch_add(1, Ordering::Relaxed);
-        if candidate != 0 && !waiting_tasks.contains_key(&candidate) {
-            return candidate;
-        }
-    }
-}
-
-fn complete_waiting_task(
-    waiting_tasks: &DashMap<u32, WaitingTask>,
-    omega_id: u32,
-    response: CommunicationValue,
-) -> bool {
-    let Some((_, task)) = waiting_tasks.remove(&omega_id) else {
-        return false;
-    };
-    let _ = task.sender.send(response.with_id(task.original_id));
-    true
-}
+#[cfg(test)]
+type TestRequest = (
+    CommunicationValue,
+    oneshot::Sender<Result<CommunicationValue, String>>,
+);
 
 struct CircuitBreaker {
     consecutive_failures: u32,
@@ -267,9 +240,7 @@ pub fn start_task_cleanup_loop(omega: Arc<OmegaConnection>) {
     tokio::spawn(async move {
         loop {
             sleep(TASK_CLEANUP_INTERVAL).await;
-            omega
-                .waiting_tasks
-                .retain(|_, v| v.inserted_at.elapsed() < TASK_MAX_AGE);
+            omega.waiting_tasks.retain_fresh(TASK_MAX_AGE);
         }
     });
 }
@@ -329,6 +300,8 @@ pub struct OmegaConnection {
     offline_auth: OfflineAuthPolicy,
     pub connection_id: Uuid,
     shutdown_tx: Arc<Mutex<Option<watch::Sender<bool>>>>,
+    draining: std::sync::atomic::AtomicBool,
+    mutation_journal_path: std::path::PathBuf,
     // Track if we should reconnect on close
     reconnect_on_close: Arc<RwLock<bool>>,
     request_slots: tokio::sync::Semaphore,
@@ -338,12 +311,13 @@ pub struct OmegaConnection {
     rho: Arc<RhoManager>,
     authenticated_key_cache: DashMap<AuthIdentity, CachedAuthenticatedKey>,
     missing_key_cache: DashMap<AuthIdentity, Instant>,
-    waiting_tasks: DashMap<u32, WaitingTask>,
-    next_request_id: AtomicU32,
+    waiting_tasks: tau::ResponseCorrelator,
     session_presence: DashMap<(i64, i64), SessionPresenceState>,
     presence_delivery_locks: DashMap<(i64, i64), Arc<Mutex<()>>>,
     initial_presence_barriers: DashMap<(i64, i64), Arc<Mutex<InitialPresenceBarrier>>>,
     peer_capabilities: Arc<RwLock<PeerCapabilities>>,
+    #[cfg(test)]
+    test_requests: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<TestRequest>>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -408,6 +382,50 @@ struct InitialPresenceBarrier {
 }
 
 impl OmegaConnection {
+    pub(crate) fn begin_shutdown(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    async fn apply_route_update(self: &Arc<Self>, value: &CommunicationValue) -> bool {
+        let user = deleted_user_id(value);
+        let iota = value
+            .is_type(CommunicationType::DeleteIota)
+            .then(|| signed_positive_iota_id(value))
+            .flatten();
+        let membership = iota_user_snapshot(value);
+        if user.is_none() && iota.is_none() && membership.is_none() {
+            return false;
+        }
+        if self.draining.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        // Authority mutations survive cancellation of the transport read loop.
+        let omega = self.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            if let Some(user_id) = user {
+                omega.rho.invalidate_user(user_id).await;
+                omega.invalidate_authenticated_key(AuthIdentity {
+                    kind: AuthIdentityKind::Client,
+                    id: user_id as u64,
+                });
+            } else if let Some(iota_id) = iota {
+                if let Some(rho) = omega.rho.get_by_iota(iota_id).await {
+                    rho.close_deleted_iota_connection().await;
+                }
+                omega.invalidate_authenticated_key(AuthIdentity {
+                    kind: AuthIdentityKind::Iota,
+                    id: iota_id as u64,
+                });
+            } else if let Some((iota_id, users)) = membership {
+                omega.rho.replace_users_for_iota(iota_id, users).await;
+            }
+        });
+        let _ = crate::rho::tasks::supervise(tasks).await;
+        true
+    }
+
     pub fn omikron_id(&self) -> u64 {
         self.omikron_id
     }
@@ -432,6 +450,8 @@ impl OmegaConnection {
             offline_auth: config.offline_auth.clone(),
             connection_id: Uuid::new_v4(),
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+            draining: std::sync::atomic::AtomicBool::new(false),
+            mutation_journal_path: super::mutation_journal_path(),
             reconnect_on_close: Arc::new(RwLock::new(true)),
             request_slots: tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS),
             circuit_breaker: Mutex::new(CircuitBreaker {
@@ -443,12 +463,13 @@ impl OmegaConnection {
             rho,
             authenticated_key_cache: DashMap::new(),
             missing_key_cache: DashMap::new(),
-            waiting_tasks: DashMap::new(),
-            next_request_id: AtomicU32::new(1),
+            waiting_tasks: tau::ResponseCorrelator::new(),
             session_presence: DashMap::new(),
             presence_delivery_locks: DashMap::new(),
             initial_presence_barriers: DashMap::new(),
             peer_capabilities: Arc::new(RwLock::new(PeerCapabilities::default())),
+            #[cfg(test)]
+            test_requests: std::sync::Mutex::new(None),
         }
     }
 
@@ -829,30 +850,7 @@ impl OmegaConnection {
                                 continue;
                             }
 
-                            if let Some(user_id) = deleted_user_id(&cv) {
-                                self.rho.invalidate_user(user_id).await;
-                                self.invalidate_authenticated_key(AuthIdentity {
-                                    kind: AuthIdentityKind::Client,
-                                    id: user_id as u64,
-                                });
-                                continue;
-                            }
-
-                            if cv.is_type(CommunicationType::DeleteIota)
-                                && let Some(iota_id) = signed_positive_iota_id(&cv)
-                            {
-                                if let Some(rho) = self.rho.get_by_iota(iota_id).await {
-                                    rho.close_deleted_iota_connection().await;
-                                }
-                                self.invalidate_authenticated_key(AuthIdentity {
-                                    kind: AuthIdentityKind::Iota,
-                                    id: iota_id as u64,
-                                });
-                                continue;
-                            }
-
-                            if let Some((iota_id, user_ids)) = iota_user_snapshot(&cv) {
-                                self.rho.replace_users_for_iota(iota_id, user_ids).await;
+                            if self.apply_route_update(&cv).await {
                                 continue;
                             }
 
@@ -866,26 +864,12 @@ impl OmegaConnection {
                                             "Rejected malformed relay: {}",
                                             error
                                         );
-                                        let response =
-                                            CommunicationValue::new(CommunicationType::ErrorInvalidData)
-                                                .without_id();
-                                        let _ = self.send_message_result(&response).await;
-                                        continue;
-                                    }
-                                };
-                                let destination_iota = match cv.require_receiver() {
-                                    Ok(destination_iota) => destination_iota,
-                                    Err(error) => {
-                                        log_err!(
-                                            self.omikron_id as i64,
-                                            PrintType::Omega,
-                                            "Rejected malformed relay: {}",
-                                            error
-                                        );
-                                        let response = CommunicationValue::new(
+                                        let latest = mtp::codec::TypeMap::latest();
+                                        let response = tau::error_response(
+                                            &cv,
                                             CommunicationType::ErrorInvalidData,
-                                        )
-                                        .with_id(request_id);
+                                            cv.type_map().unwrap_or(&latest),
+                                        );
                                         let _ = self.send_message_result(&response).await;
                                         continue;
                                     }
@@ -896,8 +880,7 @@ impl OmegaConnection {
                                         log_err!(
                                             self.omikron_id as i64,
                                             PrintType::Omega,
-                                            "Relay routing failed for destination Iota {}: {}",
-                                            destination_iota,
+                                            "Relay routing failed: {}",
                                             error
                                         );
                                         CommunicationValue::new(
@@ -929,7 +912,7 @@ impl OmegaConnection {
                                     continue;
                                 }
                             };
-                            if complete_waiting_task(&self.waiting_tasks, msg_id, cv.clone()) {
+                            if self.waiting_tasks.complete(msg_id, cv.clone()) {
                                 continue;
                             }
 
@@ -1105,6 +1088,115 @@ impl OmegaConnection {
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
+        let budget = timeout_duration.unwrap_or(Duration::from_secs(10));
+        tokio::time::timeout(budget, self.await_response_bounded(cv, budget))
+            .await
+            .map_err(|_| {
+                "Omega total request budget exceeded; mutation outcome may be uncertain".to_string()
+            })?
+    }
+
+    pub(crate) fn redemption_publication(
+        &self,
+        request: &CommunicationValue,
+        stage: &str,
+    ) -> Result<Option<String>, String> {
+        let journal = super::MutationJournal::open(&self.mutation_journal_path)?;
+        let id = journal.lookup_redemption(request)?;
+        if let Some(id) = &id {
+            journal.mark_publication(id, stage)?;
+        }
+        Ok(id)
+    }
+
+    pub(crate) fn finish_redemption_publication(&self, id: &str) -> Result<(), String> {
+        super::MutationJournal::open(&self.mutation_journal_path)?.mark_publication(id, "activated")
+    }
+
+    async fn reconcile_redemption(
+        &self,
+        request: &CommunicationValue,
+    ) -> Result<CommunicationValue, String> {
+        let invitation = request
+            .get_data(DataType::InvitationId)
+            .as_number()
+            .filter(|id| *id > 0)
+            .ok_or("redemption has no invitation target")?;
+        let iota = request
+            .get_data(DataType::IotaId)
+            .as_number()
+            .filter(|id| *id > 0)
+            .ok_or("redemption has no Iota target")?;
+        let key = request
+            .get_data(DataType::PublicKey)
+            .as_str()
+            .and_then(|key| mtp::crypto::PublicKeyBundle::from_base64(key).ok())
+            .ok_or("redemption has no valid public key")?;
+        let status_request = CommunicationValue::new(CommunicationType::GetUserInvitationStatus)
+            .add_typed_default(DataType::InvitationId, DataValue::SignedNumber(invitation))
+            .add_typed_default(DataType::IotaId, DataValue::SignedNumber(iota));
+        let status =
+            Box::pin(self.await_response(&status_request, Some(Duration::from_secs(10)))).await?;
+        if !status.is_type(CommunicationType::GetUserInvitationStatus)
+            || status.get_data(DataType::InvitationId).as_number() != Some(invitation)
+            || status.get_data(DataType::IotaId).as_number() != Some(iota)
+            || !matches!(
+                status.get_data(DataType::InvitationState).as_str(),
+                Some("provisioning" | "redeemed")
+            )
+        {
+            return Err(
+                "redemption remains uncertain; authoritative status does not prove completion"
+                    .into(),
+            );
+        }
+        let user = status
+            .get_data(DataType::UserId)
+            .as_number()
+            .and_then(|user| u64::try_from(user).ok())
+            .filter(|user| *user > 0)
+            .ok_or("authoritative redemption status has no user")?;
+        let lookup = CommunicationValue::new(CommunicationType::GetUserData)
+            .with_sender(self.omikron_id)
+            .add_typed_default(DataType::UserId, DataValue::UnsignedNumber(user.into()));
+        let account = Box::pin(self.await_response(&lookup, Some(Duration::from_secs(10)))).await?;
+        let registered_key = account
+            .get_data(DataType::PublicKey)
+            .as_str()
+            .and_then(|value| mtp::crypto::PublicKeyBundle::from_base64(value).ok())
+            .ok_or("authoritative redemption account has no public key")?;
+        if !account.is_type(CommunicationType::GetUserData)
+            || account.get_data(DataType::UserId).as_number() != Some(user.into())
+            || key.try_as_bytes().map_err(|error| error.to_string())?
+                != registered_key
+                    .try_as_bytes()
+                    .map_err(|error| error.to_string())?
+        {
+            return Err(
+                "authoritative redemption account does not match the intended public key".into(),
+            );
+        }
+        let mut response = CommunicationValue::new(CommunicationType::RedeemUserInvitation)
+            .with_id(request.require_id().map_err(|error| error.to_string())?);
+        for kind in [
+            DataType::InvitationId,
+            DataType::IotaId,
+            DataType::UserId,
+            DataType::InvitationState,
+            DataType::InvitationRevision,
+        ] {
+            if let Some(value) = status.get_data(kind) {
+                response = response.add_typed_default(kind, value.clone());
+            }
+        }
+        Ok(response)
+    }
+
+    async fn await_response_bounded(
+        &self,
+        cv: &CommunicationValue,
+        budget: Duration,
+    ) -> Result<CommunicationValue, String> {
         let _permit = self
             .request_slots
             .acquire()
@@ -1115,7 +1207,7 @@ impl OmegaConnection {
             return Err("Omega circuit breaker is open".to_string());
         }
 
-        let result = self.await_response_inner(cv, timeout_duration).await;
+        let result = self.await_response_inner(cv, Some(budget)).await;
         let mut breaker = self.circuit_breaker.lock().await;
         if result.is_ok() {
             breaker.record_success();
@@ -1133,23 +1225,134 @@ impl OmegaConnection {
         let original_id = cv
             .require_id()
             .map_err(|error| format!("request is missing correlation id: {error}"))?;
-        self.await_connection(timeout_duration).await?;
+        #[cfg(test)]
+        let scripted = self.test_requests.lock().unwrap().clone();
+        #[cfg(test)]
+        let wait_for_connection = scripted.is_none();
+        #[cfg(not(test))]
+        let wait_for_connection = true;
+        if wait_for_connection {
+            self.await_connection(timeout_duration).await?;
+        }
 
-        let omega_id = allocate_omega_request_id(&self.next_request_id, &self.waiting_tasks);
-        let outbound = cv.clone().with_id(omega_id);
+        // Omega uses the request type for data responses, and explicit Success
+        // for acknowledgements. These mappings belong to the Omega consumer.
+        let request_type = cv
+            .get_comm_type_enum()
+            .ok_or("unmapped Omega request type")?;
+        let allowed_success = match request_type {
+            CommunicationType::UserConnected
+            | CommunicationType::IotaConnected
+            | CommunicationType::StateSubscribe
+            | CommunicationType::SyncClientIotaStatus
+            | CommunicationType::DeleteUser
+            | CommunicationType::DeleteIota
+            | CommunicationType::UserDisconnected
+            | CommunicationType::IotaDisconnected
+            | CommunicationType::ClientChanged
+            | CommunicationType::ChangeUserData
+            | CommunicationType::CompleteRegisterUser
+            | CommunicationType::RevokeUserInvitation
+            | CommunicationType::AttachUserComplete
+            | CommunicationType::DeleteUserCredentialComplete
+            | CommunicationType::EraseHostedUserDataAck
+            | CommunicationType::AcknowledgeIotaUserProvision
+            | CommunicationType::ReleaseUserFromIota
+            | CommunicationType::Relay => vec![CommunicationType::Success],
+            CommunicationType::AttachUserBegin => vec![CommunicationType::AttachUserChallenge],
+            CommunicationType::DeleteUserCredentialBegin => {
+                vec![CommunicationType::DeleteUserCredentialChallenge]
+            }
+            CommunicationType::GetUserData
+            | CommunicationType::GetIotaData
+            | CommunicationType::GetRegister
+            | CommunicationType::CompleteRegisterIota
+            | CommunicationType::CreateUserInvitation
+            | CommunicationType::ListUserInvitations
+            | CommunicationType::RedeemUserInvitation
+            | CommunicationType::GetUserInvitationStatus
+            | CommunicationType::ShortenLink
+            | CommunicationType::GetNotifications
+            | CommunicationType::ReadNotification
+            | CommunicationType::PushNotification
+            | CommunicationType::GetStates => vec![request_type],
+            _ => Vec::new(),
+        };
+
         let (tx, rx) = oneshot::channel();
+        // Responses are remapped to the requester's original id on delivery.
+        let pending = self
+            .waiting_tasks
+            .reserve_checked(
+                move |response| {
+                    let _ = tx.send(response.with_id(original_id));
+                    true
+                },
+                tau::ResponseExpectation {
+                    allowed_success,
+                    allowed_errors: tau::PROTOCOL_ERROR_TYPES.to_vec(),
+                },
+            )
+            .map_err(|error| format!("no Omega request id available: {error}"))?;
+        // A cancelled requester must not leave a response callback behind.
+        let omega_id = pending.id();
 
-        self.waiting_tasks.insert(
-            omega_id,
-            WaitingTask {
-                original_id,
-                sender: tx,
-                inserted_at: Instant::now(),
-            },
-        );
+        let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
+        let deadline = tokio::time::Instant::now() + timeout;
 
-        if let Err(error) = self.try_send_message(&outbound).await {
-            self.waiting_tasks.remove(&omega_id);
+        let outbound = cv.clone().with_id(omega_id);
+        // Preparation failures cannot have mutated Omega. Persist the intent only
+        // once the connection and response waiter are ready, before any send.
+        let journal = if super::reconciliation::requires_reconciliation(cv) {
+            let journal =
+                super::reconciliation::MutationJournal::open(&self.mutation_journal_path)?;
+            let existing = if cv.is_type(CommunicationType::RedeemUserInvitation) {
+                journal.lookup_redemption(cv)?
+            } else {
+                journal.lookup_attempt(
+                    cv,
+                    "omega",
+                    cv.is_type(CommunicationType::CompleteRegisterIota),
+                )?
+            };
+            let id = match existing {
+                Some(id) if cv.is_type(CommunicationType::RedeemUserInvitation) => {
+                    let response = self.reconcile_redemption(cv).await?;
+                    journal.resolve(&id, &response)?;
+                    return Ok(response);
+                }
+                // Omega serializes exact public-key get-or-create and returns
+                // the same Iota ID. This is the only direct mutation retry.
+                Some(id) if cv.is_type(CommunicationType::CompleteRegisterIota) => id,
+                Some(id) => {
+                    return Err(format!(
+                        "Remote operation {id} remains uncertain; authoritative reconciliation required"
+                    ));
+                }
+                None => journal.begin(cv, "omega", None)?,
+            };
+            Some((journal, id))
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Some(requests) = scripted {
+            let (response, receive) = oneshot::channel();
+            requests
+                .send((cv.clone(), response))
+                .map_err(|_| "test Omega stopped".to_string())?;
+            let response = receive
+                .await
+                .map_err(|_| "test Omega response cancelled".to_string())??;
+            if let Some((journal, id)) = &journal {
+                journal.resolve(id, &response)?;
+            }
+            return Ok(response);
+        }
+        if let Err(error) = tokio::time::timeout_at(deadline, self.try_send_message(&outbound))
+            .await
+            .map_err(|_| "Request timed out".to_string())?
+        {
             return Err(format!("failed to send request: {error}"));
         }
         log_out!(
@@ -1164,16 +1367,22 @@ impl OmegaConnection {
                 .unwrap_or_else(|| outbound.get_type().to_string())
         );
 
-        let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
-
-        match tokio::time::timeout(timeout, rx).await {
+        let result = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(response_cv)) => Ok(response_cv),
             Ok(Err(_)) => Err("Channel closed".to_string()),
-            Err(_) => {
-                self.waiting_tasks.remove(&omega_id);
-                Err("Request timed out".to_string())
-            }
+            Err(_) => Err("Request timed out".to_string()),
+        };
+        if let (Some((journal, id)), Ok(response)) = (&journal, &result) {
+            journal.resolve(id, response)?;
         }
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_requests(&self) -> tokio::sync::mpsc::UnboundedReceiver<TestRequest> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *self.test_requests.lock().unwrap() = Some(sender);
+        receiver
     }
 
     #[allow(dead_code)]
@@ -1363,11 +1572,14 @@ impl OmegaConnection {
         result
     }
 
-    pub async fn client_disconnected(&self, user_id: i64, session_id: i64) -> Result<(), String> {
+    pub(crate) fn invalidate_client_presence(&self, user_id: i64, session_id: i64) {
         self.session_presence.remove(&(user_id, session_id));
         self.presence_delivery_locks.remove(&(user_id, session_id));
         self.initial_presence_barriers
             .remove(&(user_id, session_id));
+    }
+
+    pub async fn client_disconnected(&self, user_id: i64, session_id: i64) -> Result<(), String> {
         let cv = CommunicationValue::new(CommunicationType::UserDisconnected)
             .add_typed_default(DataType::UserId, DataValue::SignedNumber(user_id.into()))
             .add_typed_default(
@@ -1930,11 +2142,88 @@ impl OmegaConnection {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn iota_registration_retries_reuse_the_same_durable_attempt_for_exact_key() {
+        let state = crate::rho::test_support::state();
+        let mut requests = state.omega.test_requests();
+        let request = mtp::codec::CommunicationValue::new(
+            mtp::codec::CommunicationType::CompleteRegisterIota,
+        )
+        .add_typed_default(
+            mtp::codec::DataType::PublicKey,
+            mtp::codec::DataValue::Str(
+                mtp::crypto::Keyring::generate()
+                    .public_key_bundle()
+                    .try_to_base64()
+                    .unwrap(),
+            ),
+        );
+        // Retry both an uncertain reply and a recorded reply lost to the caller.
+        for (attempt, success) in [false, true, true].into_iter().enumerate() {
+            let task = tokio::spawn({
+                let omega = state.omega.clone();
+                let request = request.clone().with_id(100 + attempt as u32);
+                async move {
+                    omega
+                        .await_response(&request, Some(std::time::Duration::from_secs(2)))
+                        .await
+                }
+            });
+            let (outbound, response) = requests.recv().await.unwrap();
+            assert_eq!(
+                outbound.get_data(mtp::codec::DataType::PublicKey),
+                request.get_data(mtp::codec::DataType::PublicKey)
+            );
+            if success {
+                response
+                    .send(Ok(outbound.add_typed_default(
+                        mtp::codec::DataType::IotaId,
+                        mtp::codec::DataValue::SignedNumber(2),
+                    )))
+                    .unwrap();
+                assert!(task.await.unwrap().is_ok());
+            } else {
+                response
+                    .send(Err("reply lost after get-or-create".into()))
+                    .unwrap();
+                assert!(task.await.unwrap().is_err());
+            }
+        }
+        let db = rusqlite::Connection::open(&state.omega.mutation_journal_path).unwrap();
+        let count: usize = db
+            .query_row("SELECT count(*) FROM omega_mutations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let journal =
+            crate::omega::MutationJournal::open(&state.omega.mutation_journal_path).unwrap();
+        assert_eq!(journal.unresolved().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn total_request_budget_includes_a_full_request_queue() {
+        let state = crate::rho::test_support::state();
+        let _slots = state
+            .omega
+            .request_slots
+            .acquire_many(super::MAX_CONCURRENT_REQUESTS as u32)
+            .await
+            .unwrap();
+        let request =
+            mtp::codec::CommunicationValue::new(mtp::codec::CommunicationType::GetUserData);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state
+                .omega
+                .await_response(&request, Some(std::time::Duration::from_millis(5))),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().contains("total request budget"));
+    }
     use super::{
         AuthIdentity, AuthIdentityKind, CachedAuthenticatedKey, ConnectionOutcome,
-        MAX_RECONNECT_DELAY, PeerCapabilities, RECONNECT_DELAY, WaitingTask,
-        allocate_omega_request_id, authenticated_key_path, cached_at_is_fresh,
-        client_changed_target, complete_waiting_task, iota_activation_snapshot, iota_user_snapshot,
+        MAX_RECONNECT_DELAY, PeerCapabilities, RECONNECT_DELAY, authenticated_key_path,
+        cached_at_is_fresh, client_changed_target, iota_activation_snapshot, iota_user_snapshot,
         omega_transport_policy, parse_omega_capability_response, reconnect_base_after_outcome,
         reconnect_delay_with_jitter, signed_positive_iota_id,
     };
@@ -1942,11 +2231,7 @@ mod tests {
     use dashmap::DashMap;
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
     use mtp::crypto::Keyring;
-    use std::{
-        sync::atomic::{AtomicU32, Ordering},
-        time::{Duration, SystemTime},
-    };
-    use tokio::{sync::oneshot, time::Instant};
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn omega_transport_policy_uses_configured_message_limits() {
@@ -1961,40 +2246,35 @@ mod tests {
 
     #[tokio::test]
     async fn transport_ids_keep_matching_local_request_ids_separate() {
-        let waiting_tasks = DashMap::new();
-        let next_request_id = AtomicU32::new(0);
-        let (first_tx, first_rx) = oneshot::channel();
-        let first_omega_id = allocate_omega_request_id(&next_request_id, &waiting_tasks);
-        waiting_tasks.insert(
-            first_omega_id,
-            WaitingTask {
-                original_id: 42,
-                sender: first_tx,
-                inserted_at: Instant::now(),
-            },
-        );
-        next_request_id.store(first_omega_id, Ordering::Relaxed);
-        let (second_tx, second_rx) = oneshot::channel();
-        let second_omega_id = allocate_omega_request_id(&next_request_id, &waiting_tasks);
-        waiting_tasks.insert(
-            second_omega_id,
-            WaitingTask {
-                original_id: 42,
-                sender: second_tx,
-                inserted_at: Instant::now(),
-            },
-        );
+        let waiting_tasks = tau::ResponseCorrelator::new();
+        let respond = |sender: tokio::sync::oneshot::Sender<CommunicationValue>| {
+            move |response: CommunicationValue| {
+                let _ = sender.send(response);
+                true
+            }
+        };
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let first_omega_id = waiting_tasks
+            .reserve(respond(first_tx))
+            .expect("first correlation id");
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        let second_omega_id = waiting_tasks
+            .reserve(respond(second_tx))
+            .expect("second correlation id");
 
-        assert_ne!(first_omega_id, second_omega_id);
-        assert!(complete_waiting_task(
-            &waiting_tasks,
-            second_omega_id,
-            CommunicationValue::new(CommunicationType::Success).with_id(second_omega_id),
+        assert_ne!(first_omega_id.id(), second_omega_id.id());
+        assert_ne!(first_omega_id.id(), 0);
+        assert!(waiting_tasks.complete(
+            second_omega_id.id(),
+            CommunicationValue::new(CommunicationType::Success),
         ));
-        assert!(complete_waiting_task(
-            &waiting_tasks,
-            first_omega_id,
-            CommunicationValue::new(CommunicationType::ErrorInternal).with_id(first_omega_id),
+        assert!(waiting_tasks.complete(
+            first_omega_id.id(),
+            CommunicationValue::new(CommunicationType::ErrorInternal),
+        ));
+        assert!(!waiting_tasks.complete(
+            first_omega_id.id(),
+            CommunicationValue::new(CommunicationType::Success)
         ));
 
         let Ok(first) = first_rx.await else {
@@ -2003,9 +2283,7 @@ mod tests {
         let Ok(second) = second_rx.await else {
             panic!("second response channel closed");
         };
-        assert_eq!(first.id(), Some(42));
         assert!(first.is_type(CommunicationType::ErrorInternal));
-        assert_eq!(second.id(), Some(42));
         assert!(second.is_type(CommunicationType::Success));
     }
 

@@ -16,6 +16,13 @@ use crate::provisioning::session::{
 const MAX_KEY_LENGTH: usize = 16 * 1024;
 const MAX_USERNAME_LENGTH: usize = 15;
 
+async fn bounded_send(sender: &MtpSender, value: &CommunicationValue) -> Result<(), &'static str> {
+    tokio::time::timeout(Duration::from_secs(10), sender.send(value))
+        .await
+        .map_err(|_| "provisioning delivery timed out")?
+        .map_err(|_| "provisioning delivery failed")
+}
+
 #[derive(Debug)]
 enum ProvisioningOperationError {
     Replyable(&'static str),
@@ -154,13 +161,14 @@ impl ProvisioningConnection {
             terminated.contact
         };
         if let Some(sender) = peer.and_then(|participant| participant.sender.upgrade()) {
-            let _ = sender
-                .send(
-                    &CommunicationValue::new(CommunicationType::ProvisioningCancel)
-                        .with_id(rand::random::<u32>().max(1))
-                        .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string())),
-                )
-                .await;
+            let notification = CommunicationValue::new(CommunicationType::ProvisioningCancel)
+                .with_id(rand::random::<u32>().max(1))
+                .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string()));
+            let _ = tokio::time::timeout(
+                self.general.state.config.message_drain,
+                sender.send(&notification),
+            )
+            .await;
         }
     }
 
@@ -214,14 +222,20 @@ impl ProvisioningConnection {
     }
 
     pub async fn start(self: Arc<Self>) {
-        while let Ok(request) = self.receiver.receive().await {
+        let tasks = super::tasks::MessageTasks::new(
+            self.general.shutdown.subscribe(),
+            self.general.state.config.message_drain,
+        );
+        while let Some(Ok(request)) = tasks
+            .while_connected(&self.receiver, self.receiver.receive())
+            .await
+        {
             let Some(id) = request.id() else {
-                let _ = self
-                    .sender
-                    .send(
-                        &CommunicationValue::new(CommunicationType::ErrorInvalidData).without_id(),
-                    )
-                    .await;
+                let _ = bounded_send(
+                    &self.sender,
+                    &CommunicationValue::new(CommunicationType::ErrorInvalidData).without_id(),
+                )
+                .await;
                 continue;
             };
             let error_kind = if matches!(
@@ -236,41 +250,49 @@ impl ProvisioningConnection {
                 CommunicationType::ErrorInvalidData
             };
             if !Self::valid_fields(&request) {
-                let _ = self
-                    .sender
-                    .send(&CommunicationValue::new(error_kind).with_id(id))
-                    .await;
+                let _ = bounded_send(
+                    &self.sender,
+                    &CommunicationValue::new(error_kind).with_id(id),
+                )
+                .await;
                 continue;
             }
-            let result: Result<(), ProvisioningOperationError> = match request.get_comm_type_enum()
-            {
-                Some(CommunicationType::ProvisioningCreate) => {
-                    self.create(&request).await.map_err(Into::into)
-                }
-                Some(CommunicationType::ProvisioningJoin) => self.join(&request).await,
-                Some(CommunicationType::ProvisioningBindAccount) => self.bind(&request).await,
-                Some(CommunicationType::QrProvisioningConfirm) => {
-                    self.confirm(&request).await.map_err(Into::into)
-                }
-                Some(CommunicationType::ProvisioningCredential) => {
-                    self.relay_credential(&request).await.map_err(Into::into)
-                }
-                Some(CommunicationType::ProvisioningComplete) => {
-                    self.complete(&request).await.map_err(Into::into)
-                }
-                Some(CommunicationType::ProvisioningCancel) => {
-                    self.cancel(&request).await.map_err(Into::into)
-                }
-                Some(CommunicationType::PasswordProvisioningStart) => {
-                    self.password_start(&request).await.map_err(Into::into)
-                }
-                Some(CommunicationType::PasswordProvisioningFinish) => {
-                    self.password_finish(&request).await.map_err(Into::into)
-                }
-                _ => Err(ProvisioningOperationError::Replyable(
-                    "operation not allowed on provisioning connection",
-                )),
-            };
+            // Binding and upstream credential operations are not disposable.
+            // Local session termination runs after observing their results.
+            let result = async {
+                let result: Result<(), ProvisioningOperationError> = match request
+                    .get_comm_type_enum()
+                {
+                    Some(CommunicationType::ProvisioningCreate) => {
+                        self.create(&request).await.map_err(Into::into)
+                    }
+                    Some(CommunicationType::ProvisioningJoin) => self.join(&request).await,
+                    Some(CommunicationType::ProvisioningBindAccount) => self.bind(&request).await,
+                    Some(CommunicationType::QrProvisioningConfirm) => {
+                        self.confirm(&request).await.map_err(Into::into)
+                    }
+                    Some(CommunicationType::ProvisioningCredential) => {
+                        self.relay_credential(&request).await.map_err(Into::into)
+                    }
+                    Some(CommunicationType::ProvisioningComplete) => {
+                        self.complete(&request).await.map_err(Into::into)
+                    }
+                    Some(CommunicationType::ProvisioningCancel) => {
+                        self.cancel(&request).await.map_err(Into::into)
+                    }
+                    Some(CommunicationType::PasswordProvisioningStart) => {
+                        self.password_start(&request).await.map_err(Into::into)
+                    }
+                    Some(CommunicationType::PasswordProvisioningFinish) => {
+                        self.password_finish(&request).await.map_err(Into::into)
+                    }
+                    _ => Err(ProvisioningOperationError::Replyable(
+                        "operation not allowed on provisioning connection",
+                    )),
+                };
+                result
+            }
+            .await;
             match result {
                 Ok(())
                     if matches!(
@@ -292,7 +314,7 @@ impl ProvisioningConnection {
                         message
                     );
                     let error = CommunicationValue::new(error_kind).with_id(id);
-                    let _ = self.sender.send(&error).await;
+                    let _ = bounded_send(&self.sender, &error).await;
                 }
                 Err(ProvisioningOperationError::NoFurtherReply(message)) => {
                     crate::log_err!(
@@ -311,8 +333,11 @@ impl ProvisioningConnection {
             .provisioning
             .for_participant(self.general.id())
         {
-            self.terminate_forward(session.id, ProvisioningFailure::PeerDisconnected)
-                .await;
+            let _ = tokio::time::timeout(
+                self.general.state.config.cleanup_timeout,
+                self.terminate_forward(session.id, ProvisioningFailure::PeerDisconnected),
+            )
+            .await;
         }
         self.general
             .state
@@ -455,7 +480,7 @@ impl ProvisioningConnection {
                 DataType::ProvisioningRole,
                 DataValue::Str(role.as_str().into()),
             );
-        if self.sender.send(&reply).await.is_err() {
+        if bounded_send(&self.sender, &reply).await.is_err() {
             self.terminate_forward(id, ProvisioningFailure::DeliveryFailed)
                 .await;
             return Err("send failed");
@@ -519,8 +544,8 @@ impl ProvisioningConnection {
         let delivery = deliver_peer_then_reply(
             event_to_peer,
             reply_to_joiner,
-            |message| async move { peer_sender.send(&message).await.is_ok() },
-            |message| async move { self.sender.send(&message).await.is_ok() },
+            |message| async move { bounded_send(&peer_sender, &message).await.is_ok() },
+            |message| async move { bounded_send(&self.sender, &message).await.is_ok() },
         )
         .await;
         if let Err(failure) = delivery {
@@ -638,8 +663,8 @@ impl ProvisioningConnection {
         let delivery = deliver_peer_then_reply(
             event_to_contact,
             reply_to_owner,
-            |message| async move { contact.send(&message).await.is_ok() },
-            |message| async move { self.sender.send(&message).await.is_ok() },
+            |message| async move { bounded_send(&contact, &message).await.is_ok() },
+            |message| async move { bounded_send(&self.sender, &message).await.is_ok() },
         )
         .await;
         if let Err(failure) = delivery {
@@ -669,13 +694,13 @@ impl ProvisioningConnection {
         if session.method == ProvisioningMethod::QrContactCreated
             && let Some(sender) = session.owner.and_then(|peer| peer.sender.upgrade())
         {
-            sender
-                .send(
-                    &CommunicationValue::new(CommunicationType::QrProvisioningConfirm)
-                        .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string())),
-                )
-                .await
-                .map_err(|_| "owner disconnected")?;
+            bounded_send(
+                &sender,
+                &CommunicationValue::new(CommunicationType::QrProvisioningConfirm)
+                    .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string())),
+            )
+            .await
+            .map_err(|_| "owner disconnected")?;
         }
         if let Err(error) = self.send_success(request).await {
             self.terminate_forward(id, ProvisioningFailure::DeliveryFailed)
@@ -698,7 +723,7 @@ impl ProvisioningConnection {
             .provisioning
             .delivered(session.id, self.general.id())
             .map_err(|_| "session expired")?;
-        if contact.send(request).await.is_err() {
+        if bounded_send(&contact, request).await.is_err() {
             self.terminate_forward(session.id, ProvisioningFailure::DeliveryFailed)
                 .await;
             return Err("credential delivery failed");
@@ -714,12 +739,12 @@ impl ProvisioningConnection {
             .provisioning
             .complete(id, self.general.id())?;
         if let Some(owner) = owner.and_then(|owner| owner.sender.upgrade()) {
-            let _ = owner
-                .send(
-                    &CommunicationValue::new(CommunicationType::ProvisioningComplete)
-                        .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string())),
-                )
-                .await;
+            let _ = bounded_send(
+                &owner,
+                &CommunicationValue::new(CommunicationType::ProvisioningComplete)
+                    .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string())),
+            )
+            .await;
         }
         self.send_success(request).await
     }
@@ -738,13 +763,13 @@ impl ProvisioningConnection {
     }
 
     async fn send_success(&self, request: &CommunicationValue) -> Result<(), &'static str> {
-        self.sender
-            .send(
-                &CommunicationValue::new(CommunicationType::Success)
-                    .with_id(request.id().ok_or("missing request ID")?),
-            )
-            .await
-            .map_err(|_| "send failed")
+        bounded_send(
+            &self.sender,
+            &CommunicationValue::new(CommunicationType::Success)
+                .with_id(request.id().ok_or("missing request ID")?),
+        )
+        .await
+        .map_err(|_| "send failed")
     }
 
     async fn password_start(&self, request: &CommunicationValue) -> Result<(), &'static str> {
@@ -783,7 +808,7 @@ impl ProvisioningConnection {
                 .await;
             return Err("invalid Iota KE2");
         }
-        if self.sender.send(&response).await.is_err() {
+        if bounded_send(&self.sender, &response).await.is_err() {
             self.terminate_forward(id, ProvisioningFailure::DeliveryFailed)
                 .await;
             return Err("send failed");
@@ -826,7 +851,7 @@ impl ProvisioningConnection {
             .provisioning
             .password_delivered(id, self.general.id())
             .map_err(|_| "session expired")?;
-        if self.sender.send(&response).await.is_err() {
+        if bounded_send(&self.sender, &response).await.is_err() {
             self.terminate_forward(id, ProvisioningFailure::DeliveryFailed)
                 .await;
             return Err("send failed");
@@ -889,7 +914,7 @@ pub(crate) async fn handle_authenticated_login(
             .and_then(|peer| peer.sender.upgrade())
             .ok_or("contact disconnected")?;
         manager.delivered(session.id, participant_id)?;
-        return contact.send(request).await.map_err(|_| "delivery failed");
+        return bounded_send(&contact, request).await;
     }
     let id = ProvisioningConnection::session_id(request)?;
     if request.is_type(CommunicationType::ProvisioningBindAccount) {
@@ -965,8 +990,8 @@ pub(crate) async fn handle_authenticated_login(
         if deliver_peer_then_reply(
             event,
             reply,
-            |event| async move { sender.send(&event).await.is_ok() },
-            |reply| async move { client.sender.send(&reply).await.is_ok() },
+            |event| async move { bounded_send(&sender, &event).await.is_ok() },
+            |reply| async move { bounded_send(&client.sender, &reply).await.is_ok() },
         )
         .await
         .is_err()
@@ -982,24 +1007,23 @@ pub(crate) async fn handle_authenticated_login(
         let session = manager.snapshot(id, participant_id)?;
         manager.remove_participant(participant_id);
         if let Some(sender) = session.contact.and_then(|peer| peer.sender.upgrade()) {
-            let _ = sender
-                .send(
-                    &CommunicationValue::new(CommunicationType::ProvisioningCancel)
-                        .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string())),
-                )
-                .await;
+            let _ = bounded_send(
+                &sender,
+                &CommunicationValue::new(CommunicationType::ProvisioningCancel)
+                    .add_typed_default(DataType::Uuid, DataValue::Str(id.to_string())),
+            )
+            .await;
         }
     } else {
         return Err("invalid QR operation");
     }
-    client
-        .sender
-        .send(
-            &CommunicationValue::new(CommunicationType::Success)
-                .with_id(request.id().ok_or("missing request ID")?),
-        )
-        .await
-        .map_err(|_| "reply failed")
+    bounded_send(
+        &client.sender,
+        &CommunicationValue::new(CommunicationType::Success)
+            .with_id(request.id().ok_or("missing request ID")?),
+    )
+    .await
+    .map_err(|_| "reply failed")
 }
 
 fn build_password_iota_request(
@@ -1045,7 +1069,7 @@ mod tests {
         ProvisioningMethod, ProvisioningParticipant, ProvisioningRole, ProvisioningState,
         ResolvedAccount,
     };
-    use crate::rho::connection::OptionalDataValueCompat;
+    use crate::rho::connection::OptionalDataValueExt;
     use mtp::crypto::Keyring;
     use mtp::{codec::ProtectedMessageBuilder, crypto::DualSigner};
     use std::{sync::Weak, time::Instant};

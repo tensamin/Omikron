@@ -6,37 +6,7 @@ use std::{
 };
 
 use mtp::crypto::{Keyring, PublicKeyBundle};
-use mtp::files::{
-    FileError, load_keyring_raw, load_public_key_bundle, save_keyring_raw, save_public_key_bundle,
-};
-
-#[cfg(unix)]
-fn verify_private_keyring(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if !metadata.file_type().is_file()
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != unsafe { libc::geteuid() }
-    {
-        return Err(std::io::Error::new(
-            ErrorKind::PermissionDenied,
-            "keyring must be a regular owner-only file owned by the service user",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn verify_private_keyring(_: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        ErrorKind::Unsupported,
-        "keyring permissions cannot be verified on this platform",
-    ))
-}
+use mtp::files::{FileError, load_public_key_bundle, save_public_key_bundle};
 
 pub const KEYRING_PATH: &str = "./omikron.mk";
 pub const PUBLIC_KEY_PATH: &str = "./omikron.mpkb";
@@ -50,20 +20,24 @@ pub fn load_or_create_keyring(
     let keyring_path = keyring_path.as_ref();
     let public_key_path = public_key_path.as_ref();
 
-    verify_private_keyring(keyring_path).map_err(|error| {
-        format!(
-            "unable to load existing Omikron identity from {}: {error}",
-            keyring_path.display()
-        )
-    })?;
-    let keyring = match load_keyring_raw(keyring_path) {
-        Ok(keyring) => keyring,
-        Err(FileError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+    let keyring = match tau::load_private_keyring(keyring_path) {
+        Ok(Some(keyring)) => keyring,
+        Ok(None) => {
             let keyring = Keyring::generate();
-            save_keyring_raw(&keyring, keyring_path).map_err(|error| {
-                format!("unable to persist Omikron keyring at {keyring_path:?}: {error}")
-            })?;
-            persist_public_bundle(&keyring.public_key_bundle(), public_key_path)?;
+            match tau::create_private_keyring(&keyring, keyring_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    return load_or_create_keyring(keyring_path, public_key_path);
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "unable to persist Omikron keyring at {keyring_path:?}: {error}"
+                    ));
+                }
+            }
+            persist_public_bundle(&keyring.public_key_bundle(), public_key_path).map_err(
+                |error| format!("unable to persist Omikron keyring at {keyring_path:?}: {error}"),
+            )?;
             eprintln!("Generated new keyring at {}", keyring_path.display());
             return Ok(keyring);
         }
@@ -146,6 +120,7 @@ fn temporary_path(path: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mtp::files::{load_keyring_raw, save_keyring_raw};
     use std::{
         env, fs,
         time::{SystemTime, UNIX_EPOCH},

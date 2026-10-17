@@ -56,6 +56,9 @@ pub struct OfflineAuthPolicy {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
+    pub message_drain: Duration,
+    pub cleanup_timeout: Duration,
+    pub wait_on_incomplete_shutdown: bool,
     pub rho_port: u16,
     pub bind_address: IpAddr,
     pub omega_host: String,
@@ -169,6 +172,24 @@ impl Config {
         }
 
         Ok(Self {
+            message_drain: Duration::from_secs(parse_positive_or_default(
+                "MESSAGE_DRAIN_SECONDS",
+                2,
+            )?),
+            cleanup_timeout: Duration::from_secs(parse_positive_or_default(
+                "CLEANUP_TIMEOUT_SECONDS",
+                25,
+            )?),
+            wait_on_incomplete_shutdown: env::var("WAIT_ON_INCOMPLETE_SHUTDOWN")
+                .ok()
+                .map(|value| {
+                    value.trim().parse().map_err(|_| ConfigError::InvalidValue {
+                        name: "WAIT_ON_INCOMPLETE_SHUTDOWN",
+                        kind: "boolean, true or false",
+                    })
+                })
+                .transpose()?
+                .unwrap_or(false),
             rho_port,
             bind_address,
             omega_host,

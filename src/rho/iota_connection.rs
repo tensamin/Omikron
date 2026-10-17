@@ -6,12 +6,11 @@ use crate::log_err;
 use crate::log_in;
 use crate::log_out;
 use crate::rho::connection::{
-    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
+    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueExt, RequiredCommunicationFields,
 };
-use crate::rho::relay_router::{self, RelaySource};
+use crate::rho::relay_router;
 use crate::util::data_type_id;
 use crate::util::logger::PrintType;
-use dashmap::{DashMap, mapref::entry::Entry};
 use mtp::codec::CommunicationType;
 use mtp::codec::CommunicationValue;
 use mtp::codec::DataType;
@@ -20,10 +19,8 @@ use mtp::codec::DataValue;
 use mtp::codec::TypeMap;
 use mtp::crypto::KemPublicKey;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
-use tokio::sync::mpsc;
 
 use super::rho_connection::RhoConnection;
 
@@ -64,33 +61,6 @@ pub(crate) fn contact_snapshot(value: &CommunicationValue) -> Option<(i64, i64, 
     Some((user_id, 0, contact_ids))
 }
 
-type ResponseTask = Box<dyn FnOnce(u32, CommunicationValue) -> bool + Send + Sync>;
-
-#[cfg(test)]
-fn reserve_response_id_with<F>(
-    waiting_tasks: &DashMap<u32, ResponseTask>,
-    mut candidate: F,
-    task: ResponseTask,
-) -> u32
-where
-    F: FnMut() -> u32,
-{
-    let mut task = Some(task);
-    loop {
-        let id = candidate();
-        if id == 0 {
-            continue;
-        }
-        match waiting_tasks.entry(id) {
-            Entry::Occupied(_) => {}
-            Entry::Vacant(entry) => {
-                entry.insert(task.take().expect("task inserted once"));
-                return id;
-            }
-        }
-    }
-}
-
 fn registration_request(value: &CommunicationValue, iota_id: u64) -> CommunicationValue {
     value
         .clone()
@@ -127,64 +97,103 @@ pub struct IotaConnection {
     pub state: Arc<AppState>,
     _mtp_connection: Option<Arc<mtp::webserver::WebMTPConnection>>,
     pub iota_id: u64,
+    /// Derived only from the MTP-authenticated transport key, never its numeric ID.
+    pub(crate) node_id: Option<relay_router::IotaNodeId>,
     pub client_version: String,
     pub sender: Arc<MtpSender>,
     pub receiver: Arc<MtpReceiver>,
-    pub user_ids: Arc<RwLock<Vec<u64>>>,
+    pub(super) user_ids: Arc<RwLock<std::collections::HashSet<i64>>>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
-    pub waiting_tasks: DashMap<u32, ResponseTask>,
-    next_response_id: AtomicU32,
+    pub waiting_tasks: tau::ResponseCorrelator,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     message_slots: Arc<tokio::sync::Semaphore>,
+    tasks: super::tasks::MessageTasks,
+    mutation_journal_path: std::path::PathBuf,
 }
 
 impl IotaConnection {
     pub async fn from_general(general: Arc<GeneralConnection>, iota_id: u64) -> Arc<Self> {
+        let node_id = if general.connection_kind() == super::connection::ConnectionKind::Iota
+            && general.mtp_connection.auth_state == mtp::host::AuthState::Authenticated
+        {
+            general
+                .mtp_connection
+                .client_public_key
+                .as_ref()
+                .and_then(|key| relay_router::IotaNodeId::from_public_keys(key).ok())
+        } else {
+            None
+        };
         Arc::new(Self {
             state: general.state.clone(),
             _mtp_connection: Some(general.mtp_connection.clone()),
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: general.rho_connection.clone(),
-            user_ids: Arc::new(RwLock::new(Vec::new())),
+            user_ids: Arc::new(RwLock::new(std::collections::HashSet::new())),
             sender: general.sender.clone(),
             receiver: general.receiver.clone(),
             iota_id,
+            node_id,
             client_version: general.client_version.read().await.clone(),
-            waiting_tasks: DashMap::new(),
-            next_response_id: AtomicU32::new(rand::random::<u32>().max(1)),
+            waiting_tasks: tau::ResponseCorrelator::with_next_id(rand::random::<u32>().max(1)),
             message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
+            tasks: super::tasks::MessageTasks::new(
+                general.shutdown.subscribe(),
+                general.state.config.message_drain,
+            ),
+            mutation_journal_path: crate::omega::mutation_journal_path(),
         })
     }
-    pub fn start(self: Arc<Self>) {
+    pub async fn run(self: Arc<Self>) {
         let self_clone = self.clone();
-        tokio::spawn(async move {
-            loop {
-                match self_clone.receiver.receive().await {
-                    Ok(cv) => {
-                        let Ok(permit) = self_clone.message_slots.clone().acquire_owned().await
-                        else {
-                            break;
-                        };
-                        let connection = self_clone.clone();
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            connection.handle_message_inner(cv).await;
-                        });
-                    }
-                    Err(error) => {
+        loop {
+            match self_clone
+                .tasks
+                .while_connected(&self_clone.receiver, self_clone.receiver.receive())
+                .await
+            {
+                Some(Ok(cv)) => {
+                    let Some(Ok(permit)) = self_clone
+                        .tasks
+                        .while_connected(
+                            &self_clone.receiver,
+                            self_clone.message_slots.clone().acquire_owned(),
+                        )
+                        .await
+                    else {
+                        break;
+                    };
+                    let connection = self_clone.clone();
+                    if let Err(error) = self_clone.tasks.spawn(async move {
+                        let _permit = permit;
+                        connection.handle_message_inner(cv).await;
+                    }) {
                         log_err!(
                             self_clone.iota_id as i64,
                             PrintType::Iota,
-                            "Iota receive loop ended: {}; transport close reason: {:?}",
-                            error,
-                            self_clone.receiver.close_reason()
+                            "Iota message submission failed: {}",
+                            error
                         );
+                        self_clone.sender.close();
                         break;
                     }
                 }
+                Some(Err(error)) => {
+                    log_err!(
+                        self_clone.iota_id as i64,
+                        PrintType::Iota,
+                        "Iota receive loop ended: {}; transport close reason: {:?}",
+                        error,
+                        self_clone.receiver.close_reason()
+                    );
+                    break;
+                }
+                None => break,
             }
-            self_clone.handle_close().await;
-        });
+        }
+        self_clone.waiting_tasks.close();
+        self_clone.tasks.drain().await;
+        self_clone.handle_close().await;
     }
 
     /// Get the Iota ID
@@ -199,44 +208,28 @@ impl IotaConnection {
     }
 
     /// Get the user IDs
+    #[cfg(test)]
     pub async fn get_user_ids(&self) -> Vec<u64> {
-        self.user_ids.read().await.clone()
-    }
-
-    /// Replace all users linked to this iota and synchronize the attached rho mapping.
-    pub async fn set_user_ids(&self, user_ids: Vec<u64>) {
-        {
-            let mut guard = self.user_ids.write().await;
-            *guard = user_ids.clone();
-        }
-
-        if let Some(rho_conn) = self.get_rho_connection().await {
-            let user_ids_i64: Vec<i64> = user_ids.into_iter().map(|u| u as i64).collect();
-            rho_conn.set_user_ids(user_ids_i64).await;
-        }
+        let mut users: Vec<_> = self
+            .user_ids
+            .read()
+            .await
+            .iter()
+            .filter_map(|id| u64::try_from(*id).ok())
+            .collect();
+        users.sort_unstable();
+        users
     }
 
     pub async fn add_user_id(&self, user_id: u64) {
         let Ok(user_id) = i64::try_from(user_id) else {
             return;
         };
-        let manager_rho = self
+        let _ = self
             .state
             .rho
             .bind_user_to_iota(user_id, self.iota_id as i64)
             .await;
-        {
-            let mut guard = self.user_ids.write().await;
-            if !guard.contains(&(user_id as u64)) {
-                guard.push(user_id as u64);
-            }
-        }
-
-        if manager_rho.is_none()
-            && let Some(rho_conn) = self.get_rho_connection().await
-        {
-            rho_conn.add_user_id(user_id).await;
-        }
     }
 
     /// Set the RhoConnection reference
@@ -281,7 +274,7 @@ impl IotaConnection {
         contact_ids: Vec<i64>,
     ) {
         let connection = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.tasks.spawn_cancellable(async move {
             log_in!(
                 connection.iota_id as i64,
                 PrintType::Omega,
@@ -302,7 +295,15 @@ impl IotaConnection {
                     error
                 );
             }
-        });
+        }) {
+            log_err!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Presence task submission failed: {}",
+                error
+            );
+            self.sender.close();
+        }
     }
 
     /// Send a CommunicationValue to the Iota
@@ -327,6 +328,19 @@ impl IotaConnection {
     }
 
     async fn handle_message_inner(self: Arc<Self>, cv: CommunicationValue) {
+        let current = self.get_rho_connection().await.is_some_and(|rho| {
+            std::ptr::eq(rho.get_iota_connection().as_ref(), self.as_ref())
+                && self.state.rho.is_current_rho(&rho)
+        });
+        if !current {
+            log_err!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Rejected message from replaced or unpublished Iota connection"
+            );
+            self.sender.close();
+            return;
+        }
         let message_id = match cv.require_id() {
             Ok(message_id) => message_id,
             Err(error) => {
@@ -336,41 +350,38 @@ impl IotaConnection {
                     "Rejected malformed message: {}",
                     error
                 );
-                let response =
-                    CommunicationValue::new(CommunicationType::ErrorInvalidData).without_id();
+                let latest = TypeMap::latest();
+                let response = tau::error_response(
+                    &cv,
+                    CommunicationType::ErrorInvalidData,
+                    cv.type_map().unwrap_or(&latest),
+                );
                 self.send_message(&response).await;
                 return;
             }
         };
+        if matches!(
+            relay_router::message_security_class(&cv),
+            relay_router::MessageSecurityClass::Unsupported
+        ) {
+            // Correlated replies have their own request-specific type policy.
+            if self.waiting_tasks.complete(message_id, cv.clone()) {
+                return;
+            }
+            self.send_error_response(message_id, CommunicationType::ErrorInvalidData, None)
+                .await;
+            return;
+        }
         if cv.is_type(CommunicationType::Relay) {
-            let wire_receiver = match cv.require_receiver() {
-                Ok(next_hop) => next_hop,
-                Err(error) => {
-                    log_err!(
-                        self.iota_id as i64,
-                        PrintType::Iota,
-                        "Rejected malformed relay: {}",
-                        error
-                    );
-                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData, None)
-                        .await;
-                    return;
-                }
-            };
-            let route_target = relay_router::RouteTarget::from_wire_id(wire_receiver);
             let response = match relay_router::route_relay(
                 &self.state,
-                RelaySource::Iota {
-                    iota_id: self.iota_id,
-                },
+                &self,
                 relay_router::ensure_relay_frame_id(cv),
             )
             .await
             {
                 Ok(response) => response.with_id(message_id),
-                Err(error) => {
-                    relay_router::relay_route_error_response(message_id, route_target, &error)
-                }
+                Err(error) => relay_router::relay_route_error_response(message_id, None, &error),
             };
             self.send_message(&response).await;
             return;
@@ -418,9 +429,13 @@ impl IotaConnection {
         }
 
         let msg_id = message_id;
-        if let Some((_, task)) = self.waiting_tasks.remove(&msg_id)
-            && (task)(msg_id, cv.clone())
-        {
+        if self.waiting_tasks.complete(msg_id, cv.clone()) {
+            return;
+        }
+
+        if relay_router::is_relay_receipt_page(&cv) {
+            // Account receipt pages are only released by their authenticated
+            // request owner after its current-generation checks.
             return;
         }
 
@@ -728,7 +743,10 @@ impl IotaConnection {
         };
 
         // Authority check: user must be linked to this Iota
-        if !self.get_user_ids().await.contains(&user_id) {
+        if !i64::try_from(user_id)
+            .ok()
+            .is_some_and(|user| self.state.rho.owns_iota_user(user, self))
+        {
             log_err!(
                 self.iota_id as i64,
                 PrintType::Iota,
@@ -1024,7 +1042,7 @@ impl IotaConnection {
     }
 
     pub async fn handle_close(&self) {
-        self.waiting_tasks.clear();
+        self.waiting_tasks.close();
         log_out!(
             self.iota_id as i64,
             PrintType::Iota,
@@ -1036,47 +1054,120 @@ impl IotaConnection {
         }
     }
 
-    fn reserve_response_id(&self, task: ResponseTask) -> u32 {
-        let mut task = Some(task);
-        loop {
-            let candidate = self.next_response_id.fetch_add(1, Ordering::Relaxed);
-            if candidate == 0 {
-                continue;
-            }
-            match self.waiting_tasks.entry(candidate) {
-                Entry::Occupied(_) => {}
-                Entry::Vacant(entry) => {
-                    entry.insert(task.take().expect("response task inserted once"));
-                    return candidate;
-                }
-            }
-        }
-    }
-
     pub async fn await_response(
         self: Arc<Self>,
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
-        let external_id = cv
-            .require_id()
-            .map_err(|error| format!("request is missing correlation ID: {error}"))?;
-        let (tx, mut rx) = mpsc::channel(1);
-        let internal_id = self.reserve_response_id(Box::new(move |_, response| {
-            tokio::spawn(async move {
-                let _ = tx.send(response).await;
-            });
-            true
-        }));
-        self.send_message(&cv.clone().with_id(internal_id)).await;
+        let receipt_page = relay_router::is_relay_receipt_page(cv);
+        let expected = cv
+            .type_map()
+            .and_then(|map| map.comm_enum_id(cv.get_type().0));
         let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
-        let result = tokio::time::timeout(timeout, rx.recv()).await;
-        self.waiting_tasks.remove(&internal_id);
-        match result {
-            Ok(Some(response)) => Ok(response.with_id(external_id)),
-            Ok(None) => Err("Iota response channel closed".into()),
-            Err(_) => Err("Iota request timed out".into()),
+        // Read-only forwards can stop without remote reconciliation. Unknown
+        // operations default to a durable uncertain intent, never automatic replay.
+        let read_only = matches!(
+            expected,
+            Some(
+                CommunicationType::RelayReceiptPage
+                    | CommunicationType::AccountStateRequest
+                    | CommunicationType::GetChatSecret
+                    | CommunicationType::MessageGet
+                    | CommunicationType::MessagesGet
+                    | CommunicationType::SyncedSettingGet
+                    | CommunicationType::SyncedSettingsList
+                    | CommunicationType::UserBlobGet
+                    | CommunicationType::UserBlobList
+                    | CommunicationType::UserAssetUploadStatus
+                    | CommunicationType::UserAssetGetChunk
+                    | CommunicationType::UserAssetList
+                    | CommunicationType::BlockedUsersGet
+                    | CommunicationType::ReceiptPolicyGet
+                    | CommunicationType::MessageStoragePolicyGet
+                    | CommunicationType::PasswordEnrollmentStatus
+                    | CommunicationType::CallEnvelopeGet
+            )
+        );
+        let journal = if read_only {
+            None
+        } else {
+            let journal = crate::omega::MutationJournal::open(&self.mutation_journal_path)?;
+            let generation = self
+                .state
+                .rho
+                .get_by_iota(self.iota_id as i64)
+                .await
+                .and_then(|rho| {
+                    cv.sender()
+                        .and_then(|user| self.state.rho.user_route_generation(user as i64, &rho))
+                });
+            let scope = format!("iota:{}", self.iota_id);
+            let id = journal.begin(cv, &scope, generation)?;
+            Some((journal, id))
+        };
+        let result = self
+            .waiting_tasks
+            .exchange(
+                cv,
+                timeout,
+                move |response| {
+                    if receipt_page && relay_router::is_relay_receipt_page(response) {
+                        return true;
+                    }
+                    let actual = response
+                        .type_map()
+                        .and_then(|map| map.comm_enum_id(response.get_type().0));
+                    actual.is_some() && actual == expected
+                        || actual.is_some_and(tau::is_protocol_error)
+                        || actual == Some(CommunicationType::Success)
+                            && matches!(
+                                expected,
+                                Some(
+                                    CommunicationType::Relay
+                                        | CommunicationType::AccountStateApplied
+                                        | CommunicationType::CallEnvelopeStore
+                                        | CommunicationType::CallContactAccept
+                                        | CommunicationType::MessageEdit
+                                        | CommunicationType::MessageReactionAdd
+                                        | CommunicationType::MessageReactionRemove
+                                        | CommunicationType::MessageDeleteLive
+                                        | CommunicationType::PasswordEnrollmentFinish
+                                )
+                            )
+                        || matches!(
+                            (expected, actual),
+                            (
+                                Some(CommunicationType::AccountStateRequest),
+                                Some(CommunicationType::AccountStateSnapshot)
+                            ) | (
+                                Some(CommunicationType::GetChatSecret),
+                                Some(CommunicationType::ChatSecretResponse)
+                            ) | (
+                                Some(CommunicationType::TAuthAuthorize),
+                                Some(CommunicationType::TAuthAuthorizationResult)
+                            ) | (
+                                Some(CommunicationType::TAuthExchangeCode),
+                                Some(CommunicationType::TAuthExchangeCodeResponse)
+                            ) | (
+                                Some(CommunicationType::PasswordEnrollmentStart),
+                                Some(CommunicationType::PasswordEnrollmentResponse)
+                            ) | (
+                                Some(CommunicationType::PasswordProvisioningStart),
+                                Some(CommunicationType::PasswordProvisioningResponse)
+                            )
+                        )
+                },
+                |outbound| {
+                    let sender = &self.sender;
+                    async move { sender.send(&outbound).await }
+                },
+            )
+            .await
+            .map_err(|error| error.to_string());
+        if let (Some((journal, id)), Ok(response)) = (&journal, &result) {
+            journal.resolve(id, response)?;
         }
+        result
     }
 }
 
@@ -1092,12 +1183,109 @@ impl std::fmt::Debug for IotaConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        contact_snapshot, is_iota_omega_management_operation, registration_request,
-        reserve_response_id_with,
-    };
+    #[tokio::test]
+    async fn timed_out_forward_retains_intent_and_rejects_transport_id_retry() {
+        use crate::rho::{
+            connection::{GeneralConnection, admission_engine},
+            test_support,
+        };
+        let state = test_support::state();
+        let (host, peer, transport) = test_support::guest("anonymous").await;
+        let general = GeneralConnection::admit(transport, state, &admission_engine()).unwrap();
+        let iota = super::IotaConnection::from_general(general, 2).await;
+        let request = CommunicationValue::new(CommunicationType::SyncedSettingSet)
+            .with_sender(7)
+            .add_typed_default(
+                DataType::OpaqueMessage,
+                DataValue::Bytes(b"private-setting".to_vec()),
+            );
+        let task = tokio::spawn({
+            let iota = iota.clone();
+            let request = request.clone();
+            async move {
+                iota.await_response(&request, Some(std::time::Duration::from_millis(50)))
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), peer.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(task.await.unwrap().is_err());
+        let journal = crate::omega::MutationJournal::open(&iota.mutation_journal_path).unwrap();
+        assert_eq!(journal.unresolved().unwrap(), 1);
+        let retry = iota
+            .clone()
+            .await_response(
+                &request.with_id(123),
+                Some(std::time::Duration::from_millis(50)),
+            )
+            .await;
+        assert!(retry.unwrap_err().contains("uncertain outcome"));
+        assert_eq!(journal.unresolved().unwrap(), 1);
+        drop(journal);
+        std::fs::remove_file(&iota.mutation_journal_path).unwrap();
+        peer.sender.close().await;
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn receipt_page_response_is_correlated_and_rejects_assignment_aba() {
+        use crate::rho::{
+            connection::{GeneralConnection, admission_engine},
+            rho_connection::RhoConnection,
+            test_support,
+        };
+        use mtp::codec::{CommunicationType, CommunicationValue};
+        use std::{sync::Arc, time::Duration};
+
+        let state = test_support::state();
+        let (host, peer, transport) = test_support::guest("anonymous").await;
+        let general =
+            GeneralConnection::admit(transport, state.clone(), &admission_engine()).unwrap();
+        let iota = super::IotaConnection::from_general(general, 2).await;
+        let rho = Arc::new(RhoConnection::new(iota.clone(), vec![7]).await);
+        state.rho.add(rho.clone()).await;
+        let mut bytes = CommunicationValue::new(CommunicationType::Success)
+            .with_id(99)
+            .with_sender(7)
+            .to_bytes()
+            .unwrap();
+        bytes[4..6].copy_from_slice(&225u16.to_be_bytes());
+        let page = CommunicationValue::from_bytes(&bytes).unwrap();
+        for reassign in [false, true] {
+            let task = tokio::spawn({
+                let rho = rho.clone();
+                let page = page.clone();
+                async move { rho.await_peer_control(&page).await }
+            });
+            let outbound = tokio::time::timeout(Duration::from_secs(2), peer.receive())
+                .await
+                .unwrap()
+                .unwrap();
+            if reassign {
+                state.rho.invalidate_user(7).await;
+                state.rho.bind_user_to_iota(7, 2).await.unwrap();
+            }
+            assert!(
+                iota.waiting_tasks
+                    .complete(outbound.id().unwrap(), outbound)
+            );
+            let result = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            if reassign {
+                assert!(result.unwrap_err().contains("route changed"));
+            } else {
+                assert_eq!(result.unwrap().id(), Some(99));
+            }
+        }
+        peer.sender.close().await;
+        host.shutdown().await;
+    }
+    use super::{contact_snapshot, is_iota_omega_management_operation, registration_request};
     use crate::util::data_type_id;
-    use dashmap::DashMap;
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 
     fn snapshot(user_ids: DataValue) -> CommunicationValue {
@@ -1109,69 +1297,60 @@ mod tests {
 
     #[test]
     fn response_id_allocator_skips_collisions_and_zero() {
-        let waiting = DashMap::new();
-        waiting.insert(42, Box::new(|_, _| true) as super::ResponseTask);
-        let mut candidates = [0, 42, 42, 73].into_iter();
-        let id = reserve_response_id_with(
-            &waiting,
-            || candidates.next().unwrap(),
-            Box::new(|_, _| true),
-        );
-        assert_eq!(id, 73);
-        assert!(waiting.contains_key(&42));
-        assert!(waiting.contains_key(&73));
-        assert!(!waiting.contains_key(&0));
+        let waiting = tau::ResponseCorrelator::new();
+        let occupied = waiting.reserve(|_| true).expect("registered");
+        let id = waiting.reserve(|_| true).expect("allocated id");
+
+        assert_ne!(id.id(), 0);
+        assert_ne!(id.id(), occupied.id());
+        assert!(waiting.complete(
+            occupied.id(),
+            CommunicationValue::new(CommunicationType::Success)
+        ));
+        assert!(waiting.complete(id.id(), CommunicationValue::new(CommunicationType::Success)));
+        assert!(waiting.is_empty());
     }
 
     #[test]
     fn clearing_waiters_on_disconnect_closes_response_channels() {
-        let waiting = DashMap::new();
+        let waiting = tau::ResponseCorrelator::new();
         let (sender, receiver) = std::sync::mpsc::channel::<CommunicationValue>();
-        reserve_response_id_with(
-            &waiting,
-            || 17,
-            Box::new(move |_, response| {
+        let _pending = waiting
+            .reserve(move |response| {
                 sender.send(response).unwrap();
                 true
-            }),
-        );
+            })
+            .expect("internal id");
         waiting.clear();
         assert!(receiver.recv().is_err());
     }
 
     #[test]
     fn same_external_ids_have_distinct_internal_correlations() {
-        let waiting = DashMap::new();
-        let mut candidates = [100, 100, 101].into_iter();
+        let waiting = tau::ResponseCorrelator::new();
         let external_id = 42;
         let (first_tx, first_rx) = std::sync::mpsc::channel();
         let (second_tx, second_rx) = std::sync::mpsc::channel();
-        let first = reserve_response_id_with(
-            &waiting,
-            || candidates.next().unwrap(),
-            Box::new(move |_, response| {
+        let first = waiting
+            .reserve(move |response| {
                 first_tx.send(response.with_id(external_id)).unwrap();
                 true
-            }),
-        );
-        let second = reserve_response_id_with(
-            &waiting,
-            || candidates.next().unwrap(),
-            Box::new(move |_, response| {
+            })
+            .expect("first internal id");
+        let second = waiting
+            .reserve(move |response| {
                 second_tx.send(response.with_id(external_id)).unwrap();
                 true
-            }),
-        );
-        assert_ne!(first, second);
-        let (_, second_task) = waiting.remove(&second).unwrap();
-        assert!(second_task(
-            second,
-            CommunicationValue::new(CommunicationType::Success).with_id(second)
+            })
+            .expect("second internal id");
+        assert_ne!(first.id(), second.id());
+        assert!(waiting.complete(
+            second.id(),
+            CommunicationValue::new(CommunicationType::Success).with_id(second.id())
         ));
-        let (_, first_task) = waiting.remove(&first).unwrap();
-        assert!(first_task(
-            first,
-            CommunicationValue::new(CommunicationType::ErrorInvalidData).with_id(first)
+        assert!(waiting.complete(
+            first.id(),
+            CommunicationValue::new(CommunicationType::ErrorInvalidData).with_id(first.id())
         ));
         let first_response = first_rx.recv().unwrap();
         let second_response = second_rx.recv().unwrap();

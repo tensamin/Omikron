@@ -168,15 +168,21 @@ impl CallManager {
             .activate(&group, user)
             .map_err(|_| CallServiceError::DeliveryFailed)?
         {
-            let _ = self.livekit.delete_room(id).await;
+            // A concurrent activation may already own this room. Rejection
+            // must not delete a successfully committed call's external state.
             return Err(CallServiceError::NotFound);
         }
+        // Persistence and local publication commit without an intervening await.
+        // Metadata delivery cannot roll back an already activated call.
+        self.groups.insert(id, group.clone());
         if let Err(error) = group.update_metadata().await {
-            let _ = self.livekit.delete_room(id).await;
-            let _ = db.remove(id);
-            return Err(error.into());
+            crate::log_err!(
+                0,
+                PrintType::Call,
+                "Call metadata delivery failed after activation: {}",
+                error
+            );
         }
-        self.groups.insert(id, group);
         self.get_call_token(user, id).await
     }
     pub async fn get_call(&self, id: Uuid) -> Option<Arc<CallGroup>> {
@@ -412,20 +418,9 @@ impl CallManager {
         omega: &crate::omega::omega_connection::OmegaConnection,
     ) -> Result<Option<String>, CallServiceError> {
         let group = self.get_call(id).await.ok_or(CallServiceError::NotFound)?;
-        let (previous, link) = {
-            let state = group.state.read().await;
-            (state.anonymous_joining, state.short_link.clone())
-        };
-        let result = group.set_anonymous_joining(enabled, omega).await?;
-        if let Some(db) = &self.persistence
-            && db
-                .set_anonymous(id, enabled, result.as_deref().or(link.as_deref()))
-                .is_err()
-        {
-            let _ = group.set_anonymous_joining(previous, omega).await;
-            return Err(CallServiceError::DeliveryFailed);
-        }
-        Ok(result)
+        group
+            .set_anonymous_joining(enabled, omega, self.persistence.as_deref())
+            .await
     }
     pub async fn disconnect_user(
         &self,
@@ -453,11 +448,12 @@ impl CallManager {
                 .all(|participant| *participant == target)
             {
                 self.delete_room(id).await?;
+                let mut state = g.state.write().await;
                 if let Some(db) = &self.persistence {
                     db.remove(id)
                         .map_err(|_| CallServiceError::DeliveryFailed)?;
                 }
-                g.mark_ending().await;
+                state.ending = true;
                 self.groups.remove(&id);
                 return Ok(());
             }
@@ -511,13 +507,17 @@ impl CallManager {
             Ok(()) | Err(CallError::RoomNotFound { .. }) => {}
             Err(error) => return Err(error.into()),
         }
-        if let Some(db) = &self.persistence {
-            db.revoke(id, target)
-                .map_err(|_| CallServiceError::DeliveryFailed)?;
+        {
+            let mut state = g.state.write().await;
+            if !state.members.contains_key(&target) {
+                return Err(CallServiceError::InvalidUser);
+            }
+            if let Some(db) = &self.persistence {
+                db.revoke(id, target)
+                    .map_err(|_| CallServiceError::DeliveryFailed)?;
+            }
+            state.members.remove(&target);
         }
-        g.revoke(target)
-            .await
-            .ok_or(CallServiceError::InvalidUser)?;
         g.update_metadata().await?;
         Ok(())
     }
@@ -556,11 +556,12 @@ impl CallManager {
             return Err(CallServiceError::NotAuthorized);
         }
         self.delete_room(id).await?;
+        let mut state = g.state.write().await;
         if let Some(db) = &self.persistence {
             db.remove(id)
                 .map_err(|_| CallServiceError::DeliveryFailed)?;
         }
-        g.mark_ending().await;
+        state.ending = true;
         self.groups.remove(&id);
         log_event!(
             0,

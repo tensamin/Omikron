@@ -3,7 +3,7 @@ use crate::{
     calls::{call_util::LiveKitService, caller::Caller, error::CallError},
     config::CallLimits,
     omega::omega_connection::OmegaConnection,
-    rho::connection::OptionalDataValueCompat,
+    rho::connection::OptionalDataValueExt,
     util::data_type_id,
 };
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
@@ -289,47 +289,58 @@ impl CallGroup {
                 call_id: self.call_id,
                 detail: e.to_string(),
             })?;
+        drop(s);
         self.livekit.set_room_metadata(self.call_id, value).await
     }
     pub async fn set_anonymous_joining(
         &self,
         enable: bool,
         omega: &OmegaConnection,
-    ) -> Result<Option<String>, CallError> {
-        let previous = {
+        persistence: Option<&crate::calls::persistence::CallPersistence>,
+    ) -> Result<Option<String>, CallServiceError> {
+        // Link lookup is cancellable preparation, before any local mutation.
+        let mut prepared_link = self.state.read().await.short_link.clone();
+        if enable && prepared_link.is_none() {
+            let link = format!(
+                "https://app.tensamin.net/call/anonymous?call_id={}&omikron_id={}",
+                self.call_id, self.owner_omikron_id
+            );
+            if let Ok(r) = omega
+                .await_response(
+                    &CommunicationValue::new(CommunicationType::ShortenLink)
+                        .add_typed_default(DataType::Link, DataValue::Str(link)),
+                    Some(Duration::from_secs(20)),
+                )
+                .await
+                && let Some(link) = r.get_data(DataType::Link).as_str()
+            {
+                let link = link.to_string();
+                prepared_link = Some(link);
+            }
+        }
+        let result = {
             let mut state = self.state.write().await;
-            let previous = state.anonymous_joining;
+            if state.ending {
+                return Err(CallServiceError::NotFound);
+            }
+            let link = state.short_link.clone().or(prepared_link);
+            if let Some(db) = persistence {
+                db.set_anonymous(self.call_id, enable, link.as_deref())
+                    .map_err(|_| CallServiceError::DeliveryFailed)?;
+            }
             state.anonymous_joining = enable;
-            previous
+            state.short_link = link.clone();
+            enable.then_some(link).flatten()
         };
         if let Err(error) = self.update_metadata().await {
-            self.state.write().await.anonymous_joining = previous;
-            return Err(error);
+            crate::log_err!(
+                0,
+                crate::util::logger::PrintType::Call,
+                "Call metadata delivery failed after settings commit: {}",
+                error
+            );
         }
-        if !enable {
-            return Ok(None);
-        }
-        if let Some(link) = self.state.read().await.short_link.clone() {
-            return Ok(Some(link));
-        }
-        let link = format!(
-            "https://app.tensamin.net/call/anonymous?call_id={}&omikron_id={}",
-            self.call_id, self.owner_omikron_id
-        );
-        if let Ok(r) = omega
-            .await_response(
-                &CommunicationValue::new(CommunicationType::ShortenLink)
-                    .add_typed_default(DataType::Link, DataValue::Str(link)),
-                Some(Duration::from_secs(20)),
-            )
-            .await
-            && let Some(link) = r.get_data(DataType::Link).as_str()
-        {
-            let link = link.to_string();
-            self.state.write().await.short_link = Some(link.clone());
-            return Ok(Some(link));
-        }
-        Ok(None)
+        Ok(result)
     }
     pub async fn create_anonymous_token(&self, user: u64) -> Result<Option<String>, CallError> {
         if self.is_anonymous().await {
@@ -339,9 +350,6 @@ impl CallGroup {
         } else {
             Ok(None)
         }
-    }
-    pub async fn mark_ending(&self) {
-        self.state.write().await.ending = true;
     }
 }
 

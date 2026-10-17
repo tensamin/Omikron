@@ -97,25 +97,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )),
     );
     call_manager.restore().await?;
+    let (shutdown, _) = watch::channel(false);
     livekit
         .clone()
-        .garbage_collect_calls(call_manager.clone(), rho.clone());
-    let state = AppState::new(config.clone(), keyring, omega, rho, call_manager);
-    let (shutdown, _) = watch::channel(false);
+        .garbage_collect_calls(call_manager.clone(), rho.clone(), shutdown.subscribe());
+    let state = AppState::new(config.clone(), keyring, omega.clone(), rho, call_manager);
     let server = start(state, shutdown.subscribe());
     tokio::pin!(server);
-    tokio::select! {
-        result = &mut server => {
-            result.map_err(|error| format!("Rho listener terminated: {error}"))?;
-            return Err("Rho listener stopped unexpectedly".into());
-        }
+    let stopped = tokio::select! {
+        result = &mut server => Some(result),
         result = tokio::signal::ctrl_c() => {
             result.map_err(|error| format!("Unable to wait for shutdown signal: {error}"))?;
-            let _ = shutdown.send(true);
-            server
-                .await
-                .map_err(|error| format!("Rho listener shutdown failed: {error}"))?;
+            None
         }
+    };
+    omega.begin_shutdown();
+    let _ = shutdown.send(true);
+    let deadline = tokio::time::Instant::now() + config.message_drain + config.cleanup_timeout;
+    let unexpected_stop = stopped.is_some();
+    let listener = match stopped {
+        Some(result) => Ok(result),
+        None => tokio::time::timeout_at(deadline, &mut server).await,
+    };
+    let report = rho::tasks::drain_process_operations(
+        deadline.saturating_duration_since(tokio::time::Instant::now()),
+    )
+    .await;
+    log!(0, PrintType::General, "Shutdown operations: {report:?}");
+    let incomplete = listener.is_err() || !report.is_complete();
+    if incomplete {
+        log_err!(
+            0,
+            PrintType::General,
+            "Incomplete shutdown: {report:?}; wait_on_incomplete_shutdown={}",
+            config.wait_on_incomplete_shutdown
+        );
+        if !config.wait_on_incomplete_shutdown {
+            return Err(format!(
+                "Incomplete shutdown: {report:?}; remote intents require reconciliation; precommit preparation and postcommit delivery may stop"
+            )
+            .into());
+        }
+    }
+    // An operator can opt into waiting beyond the report deadline.
+    let listener = match listener {
+        Ok(result) => result,
+        Err(_) => (&mut server).await,
+    };
+    let final_report = rho::tasks::finish_process_operations().await;
+    listener.map_err(|error| format!("Rho listener shutdown failed: {error}"))?;
+    if incomplete || !final_report.is_complete() {
+        return Err(format!(
+            "Incomplete shutdown: initial={report:?}; final={final_report:?}; unresolved durable operations require reconciliation"
+        )
+        .into());
+    }
+    if unexpected_stop {
+        return Err("Rho listener stopped unexpectedly".into());
     }
     Ok(())
 }

@@ -4,10 +4,10 @@ use crate::calls::{call_group::call_invite_secret_from_cv, call_manager::CallSer
 use crate::data::user::UserStatus;
 use crate::omega::omega_connection::{AuthIdentity, AuthIdentityKind, InitialPresenceError};
 use crate::rho::connection::{
-    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
+    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueExt, RequiredCommunicationFields,
     positive_data_i64,
 };
-use crate::rho::relay_router::{self, RelaySource};
+use crate::rho::relay_router;
 use crate::rho::rho_connection::RhoConnection;
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err, log_out};
@@ -156,11 +156,12 @@ pub struct ClientConnection {
     pub receiver: Arc<MtpReceiver>,
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
-    is_open: Arc<RwLock<bool>>,
+    pub(super) is_open: Arc<RwLock<bool>>,
     message_slots: Arc<tokio::sync::Semaphore>,
+    tasks: Arc<super::tasks::MessageTasks>,
     client_state_sync: Arc<Mutex<ClientStateSyncState>>,
     session_activity: Arc<RwLock<SessionActivity>>,
-    foreground_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
+    pub(super) foreground_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
 }
 
 impl ClientConnection {
@@ -246,6 +247,10 @@ impl ClientConnection {
             session_id: *general.session_id.read().await,
             client_version: general.client_version.read().await.clone(),
             message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
+            tasks: Arc::new(super::tasks::MessageTasks::new(
+                general.shutdown.subscribe(),
+                general.state.config.message_drain,
+            )),
             client_state_sync: Arc::new(Mutex::new(ClientStateSyncState::default())),
             session_activity: Arc::new(RwLock::new(SessionActivity::default())),
             foreground_requests: Arc::new(Mutex::new(HashMap::new())),
@@ -254,6 +259,37 @@ impl ClientConnection {
 
     pub async fn session_activity(&self) -> SessionActivity {
         self.session_activity.read().await.clone()
+    }
+
+    pub(crate) fn notify_connected(self: &Arc<Self>, iota_id: u64) {
+        let client = self.clone();
+        if let Err(error) = self.tasks.spawn(async move {
+            if let Err(error) = client
+                .state
+                .omega
+                .user_connected(
+                    client.user_id as i64,
+                    client.session_id as i64,
+                    iota_id as i64,
+                )
+                .await
+            {
+                log_err!(
+                    client.user_id as i64,
+                    PrintType::Client,
+                    "Client activation notification failed: {}",
+                    error
+                );
+            }
+        }) {
+            log_err!(
+                self.user_id as i64,
+                PrintType::Client,
+                "Client activation notification rejected: {}",
+                error
+            );
+            self.sender.close();
+        }
     }
 
     pub async fn foreground(&self) -> bool {
@@ -272,24 +308,35 @@ impl ClientConnection {
         self.foreground_requests.lock().await.remove(&id);
         foreground
     }
-    pub fn start(self: Arc<Self>) {
-        let self_clone = self.clone();
-        tokio::spawn(async move {
-            while let Ok(cv) = self_clone.receiver.receive().await {
-                self_clone.clone().handle_message(cv).await;
-            }
-            self_clone.handle_close().await;
-        });
-
+    pub async fn run(self: Arc<Self>) {
         let self_clone2 = self.clone();
-        tokio::spawn(async move {
+        if let Err(error) = self.tasks.spawn_cancellable(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
             if self_clone2.get_rho_connection().await.is_none() {
                 self_clone2
                     .send_error_response(0, CommunicationType::ErrorNoIota)
                     .await;
             }
-        });
+        }) {
+            log_err!(
+                self.user_id as i64,
+                PrintType::Client,
+                "Client route check rejected: {}",
+                error
+            );
+            self.close().await;
+        }
+        while let Some(Ok(cv)) = self
+            .tasks
+            .while_connected(&self.receiver, self.receiver.receive())
+            .await
+        {
+            self.clone().handle_message(cv).await;
+        }
+        self.tasks.drain().await;
+        self.close().await;
+        self.reset_client_state_sync().await;
+        self.clone().handle_close().await;
     }
 
     /// Get the user ID
@@ -299,17 +346,9 @@ impl ClientConnection {
 
     /// Get RhoConnection if available
     pub async fn get_rho_connection(&self) -> Option<Arc<RhoConnection>> {
-        self.rho_connection.read().await.clone()
-    }
-
-    pub async fn set_rho_connection(&self, rho_connection: Arc<RhoConnection>) {
-        *self.rho_connection.write().await = Some(rho_connection);
-    }
-
-    /// A membership snapshot can remove an account from an Iota while keeping
-    /// its authenticated Omega connection alive.
-    pub async fn clear_rho_connection(&self) {
-        *self.rho_connection.write().await = None;
+        let rho = self.rho_connection.read().await.clone()?;
+        let current = self.state.rho.get_for_user(self.user_id as i64).await?;
+        Arc::ptr_eq(&rho, &current).then_some(rho)
     }
 
     /// Send a CommunicationValue to the client
@@ -398,11 +437,23 @@ impl ClientConnection {
 
     /// Handle incoming message from client
     pub async fn handle_message(self: Arc<Self>, cv: CommunicationValue) {
-        let Ok(permit) = self.message_slots.clone().acquire_owned().await else {
+        if !*self.is_open.read().await {
+            return;
+        }
+        let Some(Ok(permit)) = self
+            .tasks
+            .while_connected(&self.receiver, self.message_slots.clone().acquire_owned())
+            .await
+        else {
             return;
         };
-        tokio::spawn(async move {
+        let tasks = self.tasks.clone();
+        let connection = self.clone();
+        if let Err(error) = tasks.spawn(async move {
             let _permit = permit;
+            if !*self.is_open.read().await {
+                return;
+            }
             let message_id = match cv.require_id() {
                 Ok(message_id) => message_id,
                 Err(error) => {
@@ -419,6 +470,12 @@ impl ClientConnection {
                 }
             };
             log_cv_in!(PrintType::Client, cv);
+
+            if cv.is_type(CommunicationType::RegisteringClientAuthenticate) {
+                self.send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
+                    .await;
+                return;
+            }
 
             let mut cv = cv;
 
@@ -456,55 +513,9 @@ impl ClientConnection {
             }
 
             if cv.is_type(CommunicationType::Relay) {
-                let next_hop = match cv.require_receiver() {
-                    Ok(next_hop) => next_hop,
-                    Err(error) => {
-                        log_err!(
-                            self.user_id as i64,
-                            PrintType::Client,
-                            "Rejected malformed relay: {}",
-                            error
-                        );
-                        self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
-                            .await;
-                        return;
-                    }
-                };
-                cv = relay_router::ensure_relay_frame_id(cv);
-                let result = match self.get_rho_connection().await {
-                    Some(rho) => {
-                        relay_router::route_relay(
-                            &self.state,
-                            RelaySource::Client {
-                                iota_id: rho.get_iota_id().await,
-                            },
-                            cv,
-                        )
-                        .await
-                    }
-                    None => {
-                        crate::log_event!(
-                            0,
-                            PrintType::Omikron,
-                            crate::util::logger::LogLevel::Warn,
-                            "relay.route_failed",
-                            "message_id={} source=client user_id={} target_iota_id={} error=destination_iota_not_local",
-                            message_id,
-                            self.user_id,
-                            next_hop
-                        );
-                        Err(relay_router::RelayRouteError::DestinationIotaNotLocal)
-                    }
-                };
-                let response = match result {
-                    Ok(response) => response.with_id(message_id),
-                    Err(error) => relay_router::relay_route_error_response(
-                        message_id,
-                        relay_router::RouteTarget::from_wire_id(next_hop),
-                        &error,
-                    ),
-                };
-                self.send_message(&response).await;
+                // Client authentication does not establish a canonical Iota source.
+                self.send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
+                    .await;
                 return;
             }
 
@@ -518,6 +529,7 @@ impl ClientConnection {
             if matches!(
                 relay_router::message_security_class(&cv),
                 relay_router::MessageSecurityClass::RelayOnly
+                    | relay_router::MessageSecurityClass::Unsupported
             ) {
                 self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
                     .await;
@@ -568,11 +580,40 @@ impl ClientConnection {
                         .await;
                     return;
                 };
-                match rho
-                    .await_peer_control(&authenticated_peer_control_request(&cv, self.user_id))
-                    .await
-                {
-                    Ok(response) => self.send_message(&response).await,
+                let generation = self
+                    .state
+                    .rho
+                    .user_route_generation(self.user_id as i64, &rho);
+                if generation.is_none() || !rho.owns_client(&self) {
+                    return;
+                }
+                let mut request = authenticated_peer_control_request(&cv, self.user_id);
+                if relay_router::is_relay_receipt_page(&request) {
+                    request.remove_data(DataType::SessionId);
+                    request = request.add_typed_default(
+                        DataType::SessionId,
+                        DataValue::UnsignedNumber(self.session_id.into()),
+                    );
+                }
+                match rho.await_peer_control(&request).await {
+                    Ok(response) => {
+                        // Assignment publication needs this write lock. Keep the
+                        // authorization check valid through account-data delivery.
+                        let _route = self.rho_connection.read().await;
+                        // Reassignment away and back must not release an old page or
+                        // snapshot, nor may a replaced session receive account data.
+                        if self
+                            .state
+                            .rho
+                            .user_route_generation(self.user_id as i64, &rho)
+                            == generation
+                            && rho.owns_client(&self)
+                            && (!relay_router::is_relay_receipt_page(&response)
+                                || response.receiver() == Some(self.user_id))
+                        {
+                            self.clone().send_message(&response).await;
+                        }
+                    }
                     Err(_) => {
                         self.send_error_response(message_id, CommunicationType::ErrorInternal)
                             .await;
@@ -814,6 +855,14 @@ impl ClientConnection {
                         .await;
                     return;
                 };
+                let generation = self
+                    .state
+                    .rho
+                    .user_route_generation(self.user_id as i64, &rho);
+                if generation.is_none() || !rho.owns_client(&self) {
+                    self.reset_client_state_sync().await;
+                    return;
+                }
                 let mut request = cv.clone();
                 request.remove_data(DataType::SessionId);
                 request.remove_data(DataType::DeviceClass);
@@ -850,6 +899,17 @@ impl ClientConnection {
                                 return;
                             }
                         };
+                        let _route = self.rho_connection.read().await;
+                        if self
+                            .state
+                            .rho
+                            .user_route_generation(self.user_id as i64, &rho)
+                            != generation
+                            || !rho.owns_client(&self)
+                        {
+                            self.reset_client_state_sync().await;
+                            return;
+                        }
                         self.client_state_sync.lock().await.phase =
                             ClientStateSyncPhase::AwaitingAck {
                                 device_id: String::new(),
@@ -1078,7 +1138,15 @@ impl ClientConnection {
             );
             self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
                 .await;
-        });
+        }) {
+            log_err!(
+                connection.user_id as i64,
+                PrintType::Client,
+                "Client message task rejected: {}",
+                error
+            );
+            connection.close().await;
+        }
     }
     async fn handle_omega_forward(self: Arc<Self>, cv: CommunicationValue) {
         let Ok(request_id) = cv.require_id() else {
@@ -1570,10 +1638,10 @@ impl ClientConnection {
             );
 
         let response = CommunicationValue::new(CommunicationType::Success).with_id(message_id);
-        self.send_message(&response).await;
+        self.clone().send_message(&response).await;
 
         // The invitation is durable. A stalled client must not delay the sender's acknowledgement.
-        tokio::spawn(async move {
+        if let Err(error) = self.tasks.spawn_cancellable(async move {
             match tokio::time::timeout(
                 Duration::from_secs(8),
                 target_rho.send_to_local_user(receiver_id.unsigned_abs(), &forward),
@@ -1601,7 +1669,14 @@ impl ClientConnection {
                     receiver_id
                 ),
             }
-        });
+        }) {
+            log_err!(
+                self.user_id as i64,
+                PrintType::Client,
+                "Call invitation delivery task rejected: {}",
+                error
+            );
+        }
     }
 
     /// Handle get call request
@@ -2004,32 +2079,58 @@ impl ClientConnection {
     /// Close the connection
     pub async fn close(&self) {
         let mut is_open_guard = self.is_open.write().await;
+        let mut requests = self.foreground_requests.lock().await;
         if !*is_open_guard {
             return;
         }
         *is_open_guard = false;
-        self.foreground_requests.lock().await.clear();
+        requests.clear();
 
         self.sender.close();
     }
 
     /// Handle connection close
     pub async fn handle_close(self: Arc<Self>) {
-        if let Ok(session) = self.state.provisioning.for_participant(self.session_id)
+        let provisioning = self
+            .state
+            .provisioning
+            .for_participant(self.session_id)
+            .ok();
+        let route = self.rho_connection.read().await.clone();
+        if let Some(rho_conn) = route {
+            if !rho_conn.close_client_connection(self.clone()).await {
+                return;
+            }
+        } else {
+            let _mutation = self.state.rho.mutation_guard().await;
+            if self.state.rho.has_replacement_client(&self) {
+                return;
+            }
+            self.cleanup_local();
+        }
+        if let Some(session) = provisioning
             && let Some(sender) = session.contact.and_then(|peer| peer.sender.upgrade())
         {
-            let _ = sender
-                .send(
-                    &CommunicationValue::new(CommunicationType::ProvisioningCancel)
-                        .add_typed_default(DataType::Uuid, DataValue::Str(session.id.to_string())),
-                )
-                .await;
+            super::tasks::finish_cleanup(self.state.config.cleanup_timeout, async {
+                let _ = sender
+                    .send(
+                        &CommunicationValue::new(CommunicationType::ProvisioningCancel)
+                            .add_typed_default(
+                                DataType::Uuid,
+                                DataValue::Str(session.id.to_string()),
+                            ),
+                    )
+                    .await;
+            })
+            .await;
         }
+    }
+
+    pub(crate) fn cleanup_local(&self) {
+        self.state
+            .omega
+            .invalidate_client_presence(self.user_id as i64, self.session_id as i64);
         self.state.provisioning.remove_participant(self.session_id);
-        let user_id = self.get_user_id().await;
-        if let Some(rho_conn) = self.state.rho.get_for_user(user_id as i64).await {
-            rho_conn.close_client_connection(self.clone()).await;
-        }
     }
 }
 
@@ -2048,6 +2149,7 @@ impl Clone for ClientConnection {
             rho_connection: Arc::clone(&self.rho_connection),
             is_open: Arc::clone(&self.is_open),
             message_slots: Arc::clone(&self.message_slots),
+            tasks: Arc::clone(&self.tasks),
             client_state_sync: Arc::clone(&self.client_state_sync),
             session_activity: Arc::clone(&self.session_activity),
             foreground_requests: Arc::clone(&self.foreground_requests),
@@ -2062,6 +2164,160 @@ mod tests {
         merge_initial_presence_snapshot,
     };
     use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
+
+    #[tokio::test]
+    async fn local_cleanup_outlives_notification_budget_without_omega() {
+        use crate::{
+            provisioning::session::{
+                ProvisioningMethod, ProvisioningParticipant, ProvisioningRole,
+            },
+            rho::{
+                connection::{GeneralConnection, admission_engine},
+                iota_connection::IotaConnection,
+                rho_connection::RhoConnection,
+                test_support,
+            },
+        };
+        use std::{sync::Arc, time::Duration};
+
+        let mut state = test_support::state();
+        Arc::get_mut(&mut state).unwrap().config.cleanup_timeout = Duration::from_millis(10);
+        assert!(!state.omega.is_ready().await);
+        let (host, peer, transport) = test_support::guest("anonymous").await;
+        let general =
+            GeneralConnection::admit(transport, state.clone(), &admission_engine()).unwrap();
+        *general.session_id.write().await = 42;
+        let rho = Arc::new(
+            RhoConnection::new(
+                IotaConnection::from_general(general.clone(), 2).await,
+                vec![7],
+            )
+            .await,
+        );
+        state.rho.add(rho.clone()).await;
+        *general.rho_connection.write().await = Some(rho.clone());
+        let client = super::ClientConnection::from_general(general, 7).await;
+        rho.add_client_connection(client.clone()).await;
+        state
+            .provisioning
+            .create(
+                ProvisioningMethod::QrOwnerCreated,
+                ProvisioningParticipant {
+                    id: client.session_id,
+                    role: ProvisioningRole::Owner,
+                    temporary_public_key: mtp::crypto::Keyring::generate().public_key_bundle(),
+                    sender: Arc::downgrade(&client.sender),
+                },
+            )
+            .unwrap();
+
+        let mutation = state.rho.mutation_guard().await;
+        let cleanup = tokio::spawn(client.clone().handle_close());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!cleanup.is_finished());
+        assert!(state.provisioning.for_participant(42).is_ok());
+        drop(mutation);
+        tokio::time::timeout(Duration::from_secs(2), cleanup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rho.get_client_connection(7, 42).await.is_none());
+        assert!(state.provisioning.for_participant(42).is_err());
+        // Disconnecting a device must preserve its account's Iota assignment.
+        assert!(state.rho.get_for_user(7).await.is_some());
+        peer.sender.close().await;
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn disconnected_client_bounds_drain_and_preserves_pending_mutations() {
+        use crate::rho::{
+            connection::{GeneralConnection, admission_engine},
+            test_support,
+        };
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::Duration,
+        };
+        for finish_during_drain in [false, true] {
+            let state = test_support::state();
+            let (host, peer, accepted) = test_support::guest("anonymous").await;
+            let general =
+                GeneralConnection::admit(accepted, state.clone(), &admission_engine()).unwrap();
+            let connection = super::ClientConnection::from_general(general.clone(), 7).await;
+            let writes = Arc::new(AtomicUsize::new(0));
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let (finish, blocked) = tokio::sync::oneshot::channel();
+            let (alive, mut cancelled) = tokio::sync::oneshot::channel::<()>();
+            let (completed, completion) = tokio::sync::oneshot::channel();
+            connection
+                .tasks
+                .spawn({
+                    let writes = writes.clone();
+                    async move {
+                        let _alive = alive;
+                        started.send(()).unwrap();
+                        let _ = blocked.await;
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        completed.send(()).unwrap();
+                    }
+                })
+                .unwrap();
+            let global = state
+                .rho_connection_limits
+                .all
+                .clone()
+                .try_acquire_owned()
+                .unwrap();
+            let guest = state
+                .rho_connection_limits
+                .anonymous
+                .clone()
+                .try_acquire_owned()
+                .unwrap();
+            let handlers = connection.tasks.clone();
+            let task = tokio::spawn(async move {
+                let _permits = (global, guest);
+                connection.run().await;
+            });
+            ready.await.unwrap();
+            peer.sender.close().await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(!task.is_finished());
+            assert_eq!(state.rho_connection_limits.all.available_permits(), 1);
+            assert_eq!(state.rho_connection_limits.anonymous.available_permits(), 0);
+            let pending_mutation = if finish_during_drain {
+                finish.send(()).unwrap();
+                None
+            } else {
+                handlers.drain_expired.notified().await;
+                Some(finish)
+            };
+            tokio::time::timeout(Duration::from_secs(4), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(state.rho_connection_limits.all.available_permits(), 2);
+            assert_eq!(state.rho_connection_limits.anonymous.available_permits(), 1);
+            if let Some(finish) = pending_mutation {
+                assert!(matches!(
+                    cancelled.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+                assert_eq!(writes.load(Ordering::SeqCst), 0);
+                finish.send(()).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(4), completion)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(writes.load(Ordering::SeqCst), 1);
+            host.shutdown().await;
+        }
+    }
 
     #[test]
     fn peer_control_requests_replace_a_client_supplied_sender() {

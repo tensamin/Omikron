@@ -6,351 +6,247 @@ use std::{
     time::Duration,
 };
 
-use mtp::codec::{
-    CommunicationType, CommunicationValue, DataType, DataValue, RelayError, forward_relay_frame,
-};
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 use thiserror::Error;
 
-use crate::{
-    app_state::AppState, omega::omega_connection::OmegaConnection, rho::rho_manager::RhoManager,
-};
+use crate::{app_state::AppState, rho::rho_manager::RhoManager};
 
-const TARGET_KIND_MASK: u64 = 0xC000_0000_0000_0000;
-const TARGET_ID_MASK: u64 = (1_u64 << 48) - 1;
-const USER_TARGET_KIND: u64 = 0x4000_0000_0000_0000;
-const IOTA_TARGET_KIND: u64 = 0x8000_0000_0000_0000;
+pub use tau::{MessageSecurityClass, RouteTarget};
+
 static NEXT_RELAY_FRAME_ID: AtomicU32 = AtomicU32::new(1);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RouteTarget {
-    User(u64),
-    Iota(u64),
-}
+/// Full public-key fingerprint. Numeric MTP IDs and hints are not route keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IotaNodeId(String);
 
-impl RouteTarget {
-    #[allow(dead_code)]
-    pub fn wire_id(self) -> Option<u64> {
-        let (kind, id) = match self {
-            Self::User(id) => (USER_TARGET_KIND, id),
-            Self::Iota(id) => (IOTA_TARGET_KIND, id),
-        };
-        (id > 0 && id <= TARGET_ID_MASK).then_some(kind | id)
+impl IotaNodeId {
+    pub fn new(value: &str) -> Result<Self, RelayRouteError> {
+        let fingerprint = value
+            .strip_prefix("iota:v1:")
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or(RelayRouteError::InvalidEnvelope)?;
+        Ok(Self(format!(
+            "iota:v1:{}",
+            fingerprint.to_ascii_lowercase()
+        )))
     }
 
-    pub fn from_wire_id(value: u64) -> Option<Self> {
-        let id = value & TARGET_ID_MASK;
-        if id == 0 || value & !(TARGET_KIND_MASK | TARGET_ID_MASK) != 0 {
-            return None;
-        }
-
-        match value & TARGET_KIND_MASK {
-            USER_TARGET_KIND => Some(Self::User(id)),
-            IOTA_TARGET_KIND => Some(Self::Iota(id)),
-            _ => None,
-        }
-    }
-
-    pub const fn id(self) -> u64 {
-        match self {
-            Self::User(id) | Self::Iota(id) => id,
-        }
+    pub(crate) fn from_public_keys(
+        keys: &mtp::crypto::PublicKeyBundle,
+    ) -> Result<Self, RelayRouteError> {
+        let bytes = keys
+            .try_as_bytes()
+            .map_err(|_| RelayRouteError::UnverifiedIota)?;
+        let fingerprint = mtp::crypto::sha256(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Self::new(&format!("iota:v1:{fingerprint}"))
     }
 }
 
-impl std::fmt::Display for RouteTarget {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::User(id) => write!(formatter, "User({id})"),
-            Self::Iota(id) => write!(formatter, "Iota({id})"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelaySource {
-    Client { iota_id: u64 },
-    Iota { iota_id: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageSecurityClass {
-    RelayOnly,
-    AuthenticatedPeerControl,
-    AuthenticatedLocalRequest,
-}
-
+/// Hosted client control policy is independent of the opaque V2 relay content.
 pub fn message_security_class(frame: &CommunicationValue) -> MessageSecurityClass {
-    const RELAY_ONLY_TYPES: &[CommunicationType] = &[
-        CommunicationType::MessageSend,
-        CommunicationType::MessageLive,
-        CommunicationType::MessageState,
-        CommunicationType::MessageEdit,
-        CommunicationType::MessageEditLive,
-        CommunicationType::MessageReactionAdd,
-        CommunicationType::MessageReactionRemove,
-        CommunicationType::MessageReactionLive,
-        CommunicationType::MessageDelete,
-        CommunicationType::MessageDeleteLive,
-        CommunicationType::MessageOtherIota,
-        CommunicationType::SetChatSecret,
-        CommunicationType::SendChat,
-        CommunicationType::SettingsSave,
-        CommunicationType::GlobalSettingsSave,
-        CommunicationType::AddConversation,
-        CommunicationType::AddCommunity,
-        CommunicationType::RemoveCommunity,
-    ];
-
-    if RELAY_ONLY_TYPES.iter().any(|kind| frame.is_type(*kind)) {
-        MessageSecurityClass::RelayOnly
-    } else if frame.is_type(CommunicationType::GetChatSecret)
-        || frame.is_type(CommunicationType::MessageGet)
-        || frame.is_type(CommunicationType::MessagesGet)
-        || frame.is_type(CommunicationType::SyncedSettingSet)
-        || frame.is_type(CommunicationType::SyncedSettingGet)
-        || frame.is_type(CommunicationType::SyncedSettingDelete)
-        || frame.is_type(CommunicationType::SyncedSettingsList)
-        || frame.is_type(CommunicationType::UserBlobPut)
-        || frame.is_type(CommunicationType::UserBlobGet)
-        || frame.is_type(CommunicationType::UserBlobDelete)
-        || frame.is_type(CommunicationType::UserBlobList)
-        || frame.is_type(CommunicationType::UserAssetUploadStart)
-        || frame.is_type(CommunicationType::UserAssetUploadChunk)
-        || frame.is_type(CommunicationType::UserAssetUploadStatus)
-        || frame.is_type(CommunicationType::UserAssetUploadCommit)
-        || frame.is_type(CommunicationType::UserAssetUploadAbort)
-        || frame.is_type(CommunicationType::UserAssetGetChunk)
-        || frame.is_type(CommunicationType::UserAssetList)
-        || frame.is_type(CommunicationType::UserAssetDelete)
-        || frame.is_type(CommunicationType::UserBlock)
-        || frame.is_type(CommunicationType::UserUnblock)
-        || frame.is_type(CommunicationType::BlockedUsersGet)
-        || frame.is_type(CommunicationType::ReceiptPolicyGet)
-        || frame.is_type(CommunicationType::ReceiptPolicySet)
-        || frame.is_type(CommunicationType::MessageStoragePolicyGet)
-        || frame.is_type(CommunicationType::MessageStoragePolicySet)
-        || frame.is_type(CommunicationType::ReadNotification)
-    {
-        MessageSecurityClass::AuthenticatedPeerControl
-    } else {
-        MessageSecurityClass::AuthenticatedLocalRequest
+    if is_relay_receipt_page(frame) {
+        return MessageSecurityClass::AuthenticatedPeerControl;
     }
+    const PEER_CONTROL_TYPES: &[CommunicationType] = &[
+        CommunicationType::GetChatSecret,
+        CommunicationType::MessageGet,
+        CommunicationType::MessagesGet,
+        CommunicationType::SyncedSettingSet,
+        CommunicationType::SyncedSettingGet,
+        CommunicationType::SyncedSettingDelete,
+        CommunicationType::SyncedSettingsList,
+        CommunicationType::UserBlobPut,
+        CommunicationType::UserBlobGet,
+        CommunicationType::UserBlobDelete,
+        CommunicationType::UserBlobList,
+        CommunicationType::UserAssetUploadStart,
+        CommunicationType::UserAssetUploadChunk,
+        CommunicationType::UserAssetUploadStatus,
+        CommunicationType::UserAssetUploadCommit,
+        CommunicationType::UserAssetUploadAbort,
+        CommunicationType::UserAssetGetChunk,
+        CommunicationType::UserAssetList,
+        CommunicationType::UserAssetDelete,
+        CommunicationType::UserBlock,
+        CommunicationType::UserUnblock,
+        CommunicationType::BlockedUsersGet,
+        CommunicationType::ReceiptPolicyGet,
+        CommunicationType::ReceiptPolicySet,
+        CommunicationType::MessageStoragePolicyGet,
+        CommunicationType::MessageStoragePolicySet,
+        CommunicationType::ReadNotification,
+    ];
+    const LOCAL_REQUEST_TYPES: &[CommunicationType] = &[
+        CommunicationType::Relay,
+        CommunicationType::SessionActivitySet,
+        CommunicationType::ClientChanged,
+        CommunicationType::CallReserve,
+        CommunicationType::CallActivate,
+        CommunicationType::CallInvite,
+        CommunicationType::CallToken,
+        CommunicationType::CallData,
+        CommunicationType::CallDisconnectUser,
+        CommunicationType::CallTimeoutUser,
+        CommunicationType::CallSetAnonymousJoining,
+        CommunicationType::EndCall,
+        CommunicationType::PasswordEnrollmentStart,
+        CommunicationType::PasswordEnrollmentFinish,
+        CommunicationType::PasswordEnrollmentStatus,
+        CommunicationType::PasswordEnrollmentDisable,
+        CommunicationType::TAuthAuthorize,
+        CommunicationType::TAuthGrantList,
+        CommunicationType::TAuthGrantRevoke,
+        CommunicationType::TAuthGrantMetadataSet,
+        CommunicationType::GetUserData,
+        CommunicationType::GetIotaData,
+        CommunicationType::ChangeUserData,
+        CommunicationType::DeleteUser,
+        CommunicationType::GetNotifications,
+        CommunicationType::AccountStateRequest,
+        CommunicationType::AccountStateApplied,
+        CommunicationType::SettingsLoad,
+        CommunicationType::SettingsList,
+        CommunicationType::GlobalSettingsLoad,
+        CommunicationType::ChatSecretForward,
+        CommunicationType::SyncedSettingChanged,
+        CommunicationType::UserBlobChanged,
+        CommunicationType::UserAssetChanged,
+        CommunicationType::BlockedUsersChanged,
+        CommunicationType::ReceiptPolicyChanged,
+        CommunicationType::MessageStoragePolicyChanged,
+        CommunicationType::PushNotification,
+        CommunicationType::AccountStateSnapshot,
+        CommunicationType::StateSubscribe,
+        CommunicationType::GetChats,
+        CommunicationType::CompleteRegisterUser,
+        CommunicationType::DeleteIota,
+        CommunicationType::AttachUserBegin,
+        CommunicationType::AttachUserComplete,
+        CommunicationType::ReleaseUserFromIota,
+        CommunicationType::DeleteUserCredentialBegin,
+        CommunicationType::DeleteUserCredentialComplete,
+        CommunicationType::EraseHostedUserDataAck,
+        CommunicationType::AcknowledgeIotaUserProvision,
+        CommunicationType::CreateUserInvitation,
+        CommunicationType::ListUserInvitations,
+        CommunicationType::RevokeUserInvitation,
+        CommunicationType::GetRegister,
+    ];
+    tau::message_security_class_with(frame, PEER_CONTROL_TYPES, LOCAL_REQUEST_TYPES)
+}
+
+pub(crate) fn is_relay_receipt_page(frame: &CommunicationValue) -> bool {
+    frame.is_type(CommunicationType::RelayReceiptPage)
 }
 
 #[derive(Debug, Error)]
 pub enum RelayRouteError {
-    #[error("relay has no next-hop receiver")]
-    MissingReceiver,
-    #[error("relay has invalid route target {0}")]
-    InvalidRouteTarget(u64),
-    #[error("client relay destination {actual} is not its associated Iota {expected}")]
-    InvalidClientRoute { expected: u64, actual: u64 },
+    #[error("expected a V2 relay with a canonical destination")]
+    InvalidEnvelope,
+    #[error("relay requires a current Iota with a verified MTP public key")]
+    UnverifiedIota,
     #[error("relay destination Iota is not connected to this Omikron")]
     DestinationIotaNotLocal,
-    #[error("source Iota {source_iota_id} cannot deliver to user {user_id}")]
-    UnauthorizedUserRoute { source_iota_id: u64, user_id: u64 },
-    #[error("relay destination client is offline")]
-    ClientOffline,
     #[error("relay route resolves back to its source Iota")]
     RouteLoop,
     #[error("relay send failed: {0}")]
     Send(String),
-    #[error(transparent)]
-    Relay(#[from] RelayError),
 }
 
 pub fn error_response_type(error: &RelayRouteError) -> CommunicationType {
     match error {
-        RelayRouteError::UnauthorizedUserRoute { .. } => CommunicationType::ErrorNotAuthenticated,
-        RelayRouteError::DestinationIotaNotLocal | RelayRouteError::ClientOffline => {
-            CommunicationType::ErrorNoIota
-        }
+        RelayRouteError::UnverifiedIota => CommunicationType::ErrorNotAuthenticated,
+        RelayRouteError::DestinationIotaNotLocal => CommunicationType::ErrorNoIota,
         RelayRouteError::Send(_) => CommunicationType::ErrorInternal,
-        RelayRouteError::MissingReceiver
-        | RelayRouteError::InvalidRouteTarget(_)
-        | RelayRouteError::InvalidClientRoute { .. }
-        | RelayRouteError::RouteLoop
-        | RelayRouteError::Relay(_) => CommunicationType::ErrorInvalidData,
+        _ => CommunicationType::ErrorInvalidData,
     }
 }
 
 pub fn relay_route_error_response(
     message_id: u32,
-    target: Option<RouteTarget>,
+    _target: Option<RouteTarget>,
     error: &RelayRouteError,
 ) -> CommunicationValue {
-    let mut response = CommunicationValue::new(error_response_type(error)).with_id(message_id);
-    match (error, target) {
-        (RelayRouteError::ClientOffline, Some(RouteTarget::User(user_id))) => {
-            response = response
-                .add_typed_default(DataType::ErrorType, DataValue::Str("client_offline".into()))
-                .add_typed_default(DataType::UserId, DataValue::UnsignedNumber(user_id.into()));
-        }
-        (RelayRouteError::DestinationIotaNotLocal, Some(RouteTarget::Iota(iota_id))) => {
-            response = response
-                .add_typed_default(
-                    DataType::ErrorType,
-                    DataValue::Str("destination_iota_not_local".into()),
-                )
-                .add_typed_default(DataType::IotaId, DataValue::UnsignedNumber(iota_id.into()));
-        }
-        _ => {}
-    }
-    response
+    CommunicationValue::new(error_response_type(error)).with_id(message_id)
 }
 
+/// Read only the signed envelope's routing hint. The destination Iota verifies
+/// the signature, principals, authority, content and acceptance metadata.
+fn destination(frame: &CommunicationValue) -> Result<IotaNodeId, RelayRouteError> {
+    if !frame.is_type(CommunicationType::Relay)
+        || frame.sender().is_some()
+        || !matches!(
+            frame.get_data(DataType::VersionNumber),
+            Some(DataValue::UnsignedNumber(2) | DataValue::SignedNumber(2))
+        )
+    {
+        return Err(RelayRouteError::InvalidEnvelope);
+    }
+    #[derive(serde::Deserialize)]
+    struct DeclaredRoute {
+        version: u32,
+        destination: String,
+    }
+    let Some(DataValue::Bytes(payload)) = frame.get_data(DataType::SecurePayload) else {
+        return Err(RelayRouteError::InvalidEnvelope);
+    };
+    let declared: DeclaredRoute =
+        serde_json::from_slice(payload).map_err(|_| RelayRouteError::InvalidEnvelope)?;
+    if declared.version != 2 {
+        return Err(RelayRouteError::InvalidEnvelope);
+    }
+    IotaNodeId::new(&declared.destination)
+}
+
+/// Callers authorize the originating connection against the published snapshot.
+/// Forward the original V2 envelope without decoding its application content.
 pub async fn route_relay(
     state: &Arc<AppState>,
-    source: RelaySource,
+    source: &super::iota_connection::IotaConnection,
     frame: CommunicationValue,
 ) -> Result<CommunicationValue, RelayRouteError> {
-    let frame = ensure_relay_frame_id(frame);
-    let message_id = frame.id();
-    let (next_hop, frame) = match source {
-        RelaySource::Client { iota_id } => prepare_client_frame(frame, iota_id),
-        RelaySource::Iota { .. } => prepare_frame(frame),
+    let destination = destination(&frame)?;
+    let (source_node, target) = state
+        .rho
+        .relay_routes(source, &destination)
+        .ok_or(RelayRouteError::UnverifiedIota)?;
+    if destination == source_node {
+        return Err(RelayRouteError::RouteLoop);
     }
-    .map_err(|error| {
-        crate::log_event!(
-            0,
-            crate::util::logger::PrintType::Omikron,
-            crate::util::logger::LogLevel::Warn,
-            "relay.route_failed",
-            "message_id={:?} source={:?} target=None error={}",
-            message_id,
-            source,
-            error
-        );
-        error
-    })?;
-    if let Err(error) = validate_source_next_hop(source, next_hop) {
-        crate::log_event!(
-            0,
-            crate::util::logger::PrintType::Omikron,
-            crate::util::logger::LogLevel::Warn,
-            "relay.route_failed",
-            "message_id={:?} source={:?} target={:?} error={}",
-            message_id,
-            source,
-            next_hop,
-            error
-        );
-        return Err(error);
-    };
-
-    let result = async {
-        match source {
-            RelaySource::Client { iota_id } => {
-                let rho = state
-                    .rho
-                    .get_by_iota(
-                        i64::try_from(iota_id)
-                            .map_err(|_| RelayRouteError::InvalidRouteTarget(iota_id))?,
-                    )
-                    .await
-                    .ok_or(RelayRouteError::DestinationIotaNotLocal)?;
-                let response = rho
-                    .await_relay_to_iota(&frame)
-                    .await
-                    .map_err(RelayRouteError::Send)?;
-                route_response(response)
-            }
-            RelaySource::Iota { iota_id } => {
-                route_from_iota(&state.rho, &state.omega, iota_id, next_hop, frame).await
-            }
-        }
-    }
-    .await;
-    if let Err(error) = &result {
-        crate::log_event!(
-            0,
-            crate::util::logger::PrintType::Omikron,
-            crate::util::logger::LogLevel::Warn,
-            "relay.route_failed",
-            "message_id={:?} source={:?} target={:?} error={}",
-            message_id,
-            source,
-            next_hop,
-            error
+    if let Some(target) = target {
+        return route_response(
+            target
+                .await_relay_to_iota(&frame)
+                .await
+                .map_err(RelayRouteError::Send)?,
         );
     }
-    result
+    route_response(
+        state
+            .omega
+            .await_response(&frame, Some(Duration::from_secs(20)))
+            .await
+            .map_err(RelayRouteError::Send)?,
+    )
 }
 
 pub async fn route_from_omega(
     rho: &RhoManager,
     frame: CommunicationValue,
 ) -> Result<CommunicationValue, RelayRouteError> {
-    let (next_hop, frame) = prepare_frame(ensure_relay_frame_id(frame))?;
-    let RouteTarget::Iota(iota_id) = next_hop else {
-        return Err(RelayRouteError::InvalidRouteTarget(next_hop.id()));
-    };
+    let destination = destination(&frame)?;
     let target = rho
-        .get_by_iota(
-            i64::try_from(iota_id).map_err(|_| RelayRouteError::InvalidRouteTarget(iota_id))?,
-        )
-        .await
+        .get_by_node(&destination)
         .ok_or(RelayRouteError::DestinationIotaNotLocal)?;
-    let response = target
-        .await_relay_to_iota(&frame)
-        .await
-        .map_err(RelayRouteError::Send)?;
-    route_response(response)
-}
-
-async fn route_from_iota(
-    rho: &RhoManager,
-    omega: &OmegaConnection,
-    source_iota_id: u64,
-    next_hop: RouteTarget,
-    frame: CommunicationValue,
-) -> Result<CommunicationValue, RelayRouteError> {
-    match next_hop {
-        RouteTarget::User(user_id) => {
-            let user_id_i64 =
-                i64::try_from(user_id).map_err(|_| RelayRouteError::InvalidRouteTarget(user_id))?;
-            let target = rho
-                .get_for_user_on_iota(user_id_i64, source_iota_id)
-                .ok_or(RelayRouteError::UnauthorizedUserRoute {
-                    source_iota_id,
-                    user_id,
-                })?;
-            target
-                .send_relay_to_client(&frame)
-                .await
-                .map(|_| CommunicationValue::new(CommunicationType::Success))
-                .map_err(|error| {
-                    if error == "client offline" {
-                        RelayRouteError::ClientOffline
-                    } else {
-                        RelayRouteError::Send(error)
-                    }
-                })
-        }
-        RouteTarget::Iota(iota_id) => {
-            if iota_id == source_iota_id {
-                return Err(RelayRouteError::RouteLoop);
-            }
-            if let Some(target) = rho
-                .get_by_iota(
-                    i64::try_from(iota_id)
-                        .map_err(|_| RelayRouteError::InvalidRouteTarget(iota_id))?,
-                )
-                .await
-            {
-                let response = target
-                    .await_relay_to_iota(&frame)
-                    .await
-                    .map_err(RelayRouteError::Send)?;
-                return route_response(response);
-            }
-            let response = omega
-                .await_response(&frame, Some(Duration::from_secs(20)))
-                .await
-                .map_err(RelayRouteError::Send)?;
-            route_response(response)
-        }
-    }
+    route_response(
+        target
+            .await_relay_to_iota(&frame)
+            .await
+            .map_err(RelayRouteError::Send)?,
+    )
 }
 
 fn route_response(response: CommunicationValue) -> Result<CommunicationValue, RelayRouteError> {
@@ -372,304 +268,212 @@ pub fn ensure_relay_frame_id(frame: CommunicationValue) -> CommunicationValue {
     if frame.id().is_some() {
         return frame;
     }
-    let id = NEXT_RELAY_FRAME_ID.fetch_add(1, Ordering::Relaxed).max(1);
-    frame.with_id(id)
-}
-
-fn prepare_frame(
-    frame: CommunicationValue,
-) -> Result<(RouteTarget, CommunicationValue), RelayRouteError> {
-    let next_hop = frame.receiver().ok_or(RelayRouteError::MissingReceiver)?;
-    let target =
-        RouteTarget::from_wire_id(next_hop).ok_or(RelayRouteError::InvalidRouteTarget(next_hop))?;
-    let frame = forward_relay_frame(&frame, next_hop)?;
-    Ok((target, frame))
-}
-
-/*
- * Older clients sent their authenticated Iota's raw ID as the first relay
- * hop. Accept only that exact value, then restore the namespace tag before
- * forwarding so legacy clients cannot select a different route.
- */
-fn prepare_client_frame(
-    frame: CommunicationValue,
-    source_iota_id: u64,
-) -> Result<(RouteTarget, CommunicationValue), RelayRouteError> {
-    let receiver = frame.receiver().ok_or(RelayRouteError::MissingReceiver)?;
-    if let Some(target) = RouteTarget::from_wire_id(receiver) {
-        let frame = forward_relay_frame(&frame, receiver)?;
-        return Ok((target, frame));
-    }
-    if receiver != source_iota_id {
-        return Err(RelayRouteError::InvalidRouteTarget(receiver));
-    }
-    let target = RouteTarget::Iota(source_iota_id);
-    let wire_id = target
-        .wire_id()
-        .ok_or(RelayRouteError::InvalidRouteTarget(source_iota_id))?;
-    let frame = forward_relay_frame(&frame, wire_id)?;
-    Ok((target, frame))
-}
-
-fn validate_source_next_hop(
-    source: RelaySource,
-    next_hop: RouteTarget,
-) -> Result<(), RelayRouteError> {
-    match source {
-        RelaySource::Client { iota_id } => match next_hop {
-            RouteTarget::Iota(actual) if actual == iota_id => Ok(()),
-            _ => Err(RelayRouteError::InvalidClientRoute {
-                expected: iota_id,
-                actual: next_hop.id(),
-            }),
-        },
-        RelaySource::Iota { iota_id } => {
-            if next_hop == RouteTarget::Iota(iota_id) {
-                Err(RelayRouteError::RouteLoop)
-            } else {
-                Ok(())
-            }
-        }
-    }
+    frame.with_id(NEXT_RELAY_FRAME_ID.fetch_add(1, Ordering::Relaxed).max(1))
 }
 
 #[cfg(test)]
 mod tests {
-    use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
-
-    use crate::rho::connection::OptionalDataValueCompat;
-
-    use super::{
-        MessageSecurityClass, RelayRouteError, RelaySource, RouteTarget, message_security_class,
-        prepare_client_frame, prepare_frame, relay_route_error_response, validate_source_next_hop,
-    };
-
-    fn wire(target: RouteTarget) -> u64 {
-        let Some(value) = target.wire_id() else {
-            panic!("valid route target was rejected");
-        };
-        value
-    }
-
-    fn relay(receiver: Option<u64>) -> CommunicationValue {
-        let frame = CommunicationValue::new(CommunicationType::Relay)
-            .without_sender()
-            .with_payload(DataValue::Bytes(vec![1, 2, 3]));
-        receiver.map_or(frame.clone(), |id| frame.with_receiver(id))
-    }
+    use super::*;
 
     #[test]
-    fn relay_requires_a_next_hop() {
-        assert!(matches!(
-            prepare_frame(relay(None)),
-            Err(RelayRouteError::MissingReceiver)
-        ));
-    }
-
-    #[test]
-    fn iota_target_round_trips() {
-        let original = RouteTarget::Iota(42);
-        let wire = wire(original);
-
-        assert_eq!(RouteTarget::from_wire_id(wire), Some(original));
-    }
-
-    #[test]
-    fn raw_iota_id_is_not_a_valid_typed_route() {
-        assert_ne!(RouteTarget::from_wire_id(42), Some(RouteTarget::Iota(42)));
-    }
-
-    #[test]
-    fn client_raw_iota_receiver_is_rewritten_to_a_typed_route() {
-        let (target, forwarded) = match prepare_client_frame(relay(Some(42)), 42) {
-            Ok(value) => value,
-            Err(error) => panic!("legacy client relay was rejected: {error}"),
-        };
-
-        assert_eq!(target, RouteTarget::Iota(42));
-        assert_eq!(forwarded.receiver(), Some(wire(RouteTarget::Iota(42))));
-    }
-
-    #[test]
-    fn client_raw_receiver_cannot_select_another_iota() {
-        assert!(matches!(
-            prepare_client_frame(relay(Some(43)), 42),
-            Err(RelayRouteError::InvalidRouteTarget(43))
-        ));
-    }
-
-    #[test]
-    fn relay_rejects_an_outer_sender() {
-        let frame = relay(Some(wire(RouteTarget::Iota(7)))).with_sender(9);
-        assert!(matches!(
-            prepare_frame(frame),
-            Err(RelayRouteError::Relay(
-                mtp::codec::RelayError::OuterSenderPresent
-            ))
-        ));
-    }
-
-    #[test]
-    fn relay_forwarding_preserves_payload_and_next_hop() {
-        let frame = relay(Some(wire(RouteTarget::Iota(7))));
-        let (next_hop, forwarded) = match prepare_frame(frame.clone()) {
-            Ok(value) => value,
-            Err(error) => panic!("valid relay was rejected: {error}"),
-        };
-        assert_eq!(next_hop, RouteTarget::Iota(7));
-        assert_eq!(forwarded.receiver(), Some(wire(RouteTarget::Iota(7))));
-        assert_eq!(forwarded.sender(), None);
-        assert_eq!(forwarded.payload(), frame.payload());
-    }
-
-    #[test]
-    fn non_relay_frames_are_rejected() {
-        let frame = CommunicationValue::new(CommunicationType::Ping)
-            .with_receiver(wire(RouteTarget::Iota(7)));
-        assert!(matches!(
-            prepare_frame(frame),
-            Err(RelayRouteError::Relay(mtp::codec::RelayError::NotRelay))
-        ));
-    }
-
-    #[test]
-    fn client_cannot_address_another_iota() {
-        assert!(matches!(
-            validate_source_next_hop(RelaySource::Client { iota_id: 7 }, RouteTarget::Iota(8)),
-            Err(RelayRouteError::InvalidClientRoute {
-                expected: 7,
-                actual: 8
-            })
-        ));
-    }
-
-    #[test]
-    fn client_cannot_address_a_user() {
-        assert!(matches!(
-            validate_source_next_hop(RelaySource::Client { iota_id: 7 }, RouteTarget::User(8)),
-            Err(RelayRouteError::InvalidClientRoute {
-                expected: 7,
-                actual: 8
-            })
-        ));
-    }
-
-    #[test]
-    fn iota_cannot_route_to_itself() {
-        assert!(matches!(
-            validate_source_next_hop(RelaySource::Iota { iota_id: 7 }, RouteTarget::Iota(7)),
-            Err(RelayRouteError::RouteLoop)
-        ));
-    }
-
-    #[tokio::test]
-    async fn omega_does_not_forward_to_another_omikron() {
-        let rho = crate::rho::rho_manager::RhoManager::new();
-        let result = super::route_from_omega(&rho, relay(Some(wire(RouteTarget::Iota(7))))).await;
-        assert!(matches!(
-            result,
-            Err(RelayRouteError::DestinationIotaNotLocal)
-        ));
-    }
-
-    #[test]
-    fn route_target_namespace_is_explicit() {
+    fn receipt_pages_require_authenticated_peer_control() {
+        let page = CommunicationValue::new(CommunicationType::RelayReceiptPage);
+        assert_eq!(page.get_type().0, 225);
+        for (kind, id) in [
+            (DataType::ReceiptCursor, 250),
+            (DataType::ReceiptUpper, 251),
+            (DataType::ReceiptMore, 252),
+            (DataType::ReceiptComplete, 253),
+            (DataType::ReceiptSequence, 254),
+            (DataType::ReceiptAcceptedAt, 255),
+        ] {
+            let frame = page
+                .clone()
+                .add_typed_default(kind, DataValue::UnsignedNumber(42));
+            assert_eq!(frame.data().unwrap()[0].0.0, id);
+        }
+        let bytes = page.to_bytes().unwrap();
+        let page = CommunicationValue::from_bytes(&bytes).unwrap();
+        assert!(is_relay_receipt_page(&page));
         assert_eq!(
-            RouteTarget::from_wire_id(wire(RouteTarget::User(7))),
-            Some(RouteTarget::User(7))
+            message_security_class(&page),
+            MessageSecurityClass::AuthenticatedPeerControl
         );
-        assert_eq!(
-            RouteTarget::from_wire_id(wire(RouteTarget::Iota(7))),
-            Some(RouteTarget::Iota(7))
-        );
-        assert_eq!(RouteTarget::from_wire_id(7), None);
-    }
-
-    #[test]
-    fn client_offline_response_keeps_legacy_type_and_identifies_user() {
-        let response = relay_route_error_response(
-            4,
-            Some(RouteTarget::User(42)),
-            &RelayRouteError::ClientOffline,
-        );
-        assert!(response.is_type(CommunicationType::ErrorNoIota));
-        assert_eq!(
-            response.get_data(DataType::ErrorType).as_str(),
-            Some("client_offline")
-        );
-        assert_eq!(response.get_data(DataType::UserId).as_number(), Some(42));
-    }
-
-    #[test]
-    fn unauthorized_user_route_does_not_expose_route_ownership() {
-        let response = relay_route_error_response(
-            4,
-            Some(RouteTarget::User(42)),
-            &RelayRouteError::UnauthorizedUserRoute {
-                source_iota_id: 100,
-                user_id: 42,
-            },
-        );
-        assert!(response.is_type(CommunicationType::ErrorNotAuthenticated));
-        assert!(response.get_data(DataType::UserId).as_number().is_none());
-    }
-
-    #[test]
-    fn unavailable_iota_response_keeps_legacy_type_and_identifies_iota() {
-        let response = relay_route_error_response(
-            4,
-            Some(RouteTarget::Iota(99)),
-            &RelayRouteError::DestinationIotaNotLocal,
-        );
-        assert!(response.is_type(CommunicationType::ErrorNoIota));
-        assert_eq!(
-            response.get_data(DataType::ErrorType).as_str(),
-            Some("destination_iota_not_local")
-        );
-        assert_eq!(response.get_data(DataType::IotaId).as_number(), Some(99));
-    }
-
-    #[test]
-    fn successful_route_response_is_not_reconstructed() {
-        let response = CommunicationValue::new(CommunicationType::Success)
-            .with_payload(DataValue::Bytes(vec![9, 8, 7]));
-        let routed = match super::route_response(response.clone()) {
-            Ok(value) => value,
-            Err(_) => return,
-        };
-        assert_eq!(routed.payload(), response.payload());
     }
 
     #[test]
     fn synchronized_setting_requests_use_authenticated_peer_control() {
-        for setting_type in [
+        for kind in [
             CommunicationType::SyncedSettingSet,
             CommunicationType::SyncedSettingGet,
             CommunicationType::SyncedSettingDelete,
             CommunicationType::SyncedSettingsList,
         ] {
-            let frame = CommunicationValue::new(setting_type);
             assert_eq!(
-                message_security_class(&frame),
+                message_security_class(&CommunicationValue::new(kind)),
                 MessageSecurityClass::AuthenticatedPeerControl
             );
         }
     }
 
     #[test]
-    fn synchronized_setting_requests_are_not_relay_only() {
-        for setting_type in [
-            CommunicationType::SyncedSettingSet,
-            CommunicationType::SyncedSettingGet,
-            CommunicationType::SyncedSettingDelete,
-            CommunicationType::SyncedSettingsList,
-            CommunicationType::SyncedSettingChanged,
-        ] {
-            let frame = CommunicationValue::new(setting_type);
-            assert_ne!(
-                message_security_class(&frame),
-                MessageSecurityClass::RelayOnly
-            );
+    fn synchronized_setting_notifications_are_not_relay_only() {
+        assert_ne!(
+            message_security_class(&CommunicationValue::new(
+                CommunicationType::SyncedSettingChanged
+            )),
+            MessageSecurityClass::RelayOnly
+        );
+    }
+
+    fn relay(node: &str) -> CommunicationValue {
+        CommunicationValue::new(CommunicationType::Relay).with_id(7)
+            .add_typed_default(DataType::VersionNumber, DataValue::UnsignedNumber(2))
+            .add_typed_default(DataType::SecurePayload, DataValue::Bytes(format!(
+                "{{ \"version\":2, \"destination\":\"{node}\", \"signature\":\"opaque\", \"content\":\"not decoded\" }}"
+            ).into_bytes()))
+    }
+
+    #[test]
+    fn routing_reads_only_v2_destination_and_preserves_envelope() {
+        let node = format!("iota:v1:{}", "AB".repeat(32));
+        let frame = relay(&node).with_receiver(123);
+        let bytes = frame.to_bytes().unwrap();
+        assert_eq!(
+            destination(&frame).unwrap(),
+            IotaNodeId::new(&node).unwrap()
+        );
+        assert_eq!(frame.to_bytes().unwrap(), bytes);
+    }
+
+    #[test]
+    fn legacy_numeric_and_principal_destinations_are_rejected() {
+        for node in ["42", "user:42", "omega:example:42", "iota:v1:abcd"] {
+            assert!(destination(&relay(node)).is_err());
         }
+        let legacy = CommunicationValue::new(CommunicationType::Relay)
+            .with_receiver(42)
+            .with_payload(DataValue::Bytes(vec![1, 2, 3]));
+        assert!(destination(&legacy).is_err());
+    }
+
+    #[test]
+    fn both_version_markers_and_no_outer_sender_are_required() {
+        let frame = relay(&format!("iota:v1:{}", "ab".repeat(32)));
+        assert!(
+            destination(
+                &frame
+                    .clone()
+                    .add_typed_default(DataType::VersionNumber, DataValue::UnsignedNumber(1))
+            )
+            .is_err()
+        );
+        assert!(destination(&frame.with_sender(9)).is_err());
+        let frame = CommunicationValue::new(CommunicationType::Relay)
+            .add_typed_default(DataType::VersionNumber, DataValue::UnsignedNumber(2))
+            .add_typed_default(
+                DataType::SecurePayload,
+                DataValue::Bytes(
+                    format!(
+                        "{{\"version\":1,\"destination\":\"iota:v1:{}\"}}",
+                        "ab".repeat(32)
+                    )
+                    .into_bytes(),
+                ),
+            );
+        assert!(destination(&frame).is_err());
+    }
+
+    #[test]
+    fn duplicate_signed_destinations_are_rejected() {
+        let node = format!("iota:v1:{}", "ab".repeat(32));
+        let frame = relay(&node).add_typed_default(
+            DataType::SecurePayload,
+            DataValue::Bytes(
+                format!("{{\"version\":2,\"destination\":\"{node}\",\"destination\":\"{node}\"}}")
+                    .into_bytes(),
+            ),
+        );
+        assert!(destination(&frame).is_err());
+    }
+
+    #[test]
+    fn fingerprint_matches_iota_full_serialized_key_algorithm() {
+        let keys = mtp::crypto::Keyring::generate().public_key_bundle();
+        let hash = mtp::crypto::sha256(&keys.try_as_bytes().unwrap());
+        let expected = format!(
+            "iota:v1:{}",
+            hash.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        assert_eq!(IotaNodeId::from_public_keys(&keys).unwrap().0, expected);
+    }
+
+    #[tokio::test]
+    async fn omega_requires_a_canonical_local_route() {
+        let rho = RhoManager::new();
+        assert!(matches!(
+            route_from_omega(&rho, relay(&format!("iota:v1:{}", "ab".repeat(32)))).await,
+            Err(RelayRouteError::DestinationIotaNotLocal)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_forwarding_keeps_opaque_envelope_and_destination_acceptance() {
+        use crate::rho::{
+            connection::{GeneralConnection, admission_engine},
+            iota_connection::IotaConnection,
+            rho_connection::RhoConnection,
+            test_support,
+        };
+        let state = test_support::state();
+        let (host, peer, transport) = test_support::authenticated("iota").await;
+        let general =
+            GeneralConnection::admit(transport, state.clone(), &admission_engine()).unwrap();
+        let iota = IotaConnection::from_general(general, 42).await;
+        let node = iota.node_id.as_ref().unwrap().0.clone();
+        let rho = Arc::new(RhoConnection::new(iota.clone(), vec![]).await);
+        state.rho.add(rho).await;
+        let frame = relay(&node);
+        let original_payload = frame.get_data(DataType::SecurePayload).cloned();
+        let delivery = route_from_omega(&state.rho, frame);
+        let endpoint = async {
+            let received = peer.receive().await.unwrap();
+            assert!(received.is_type(CommunicationType::Relay));
+            assert_eq!(
+                received.get_data(DataType::SecurePayload).cloned(),
+                original_payload
+            );
+            assert_eq!(received.receiver(), None);
+            assert_eq!(received.sender(), None);
+            let response = CommunicationValue::new(CommunicationType::Success)
+                .add_typed_default(
+                    DataType::RelayMessageId,
+                    DataValue::Str("accepted-original".into()),
+                )
+                .add_typed_default(DataType::RelayAcceptedAt, DataValue::UnsignedNumber(1234));
+            assert!(
+                iota.waiting_tasks
+                    .complete(received.id().unwrap(), response.clone())
+            );
+            response
+        };
+        let (delivered, accepted) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(delivery, endpoint)
+        })
+        .await
+        .unwrap();
+        let delivered = delivered.unwrap();
+        assert_eq!(
+            delivered.get_data(DataType::RelayMessageId),
+            accepted.get_data(DataType::RelayMessageId)
+        );
+        assert_eq!(
+            delivered.get_data(DataType::RelayAcceptedAt),
+            accepted.get_data(DataType::RelayAcceptedAt)
+        );
+        peer.sender.close().await;
+        host.shutdown().await;
     }
 }

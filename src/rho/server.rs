@@ -8,7 +8,7 @@ use crate::{
     app_state::AppState,
     log, log_err,
     omega::{AuthIdentity, AuthIdentityKind, omega_connection::OmegaConnection},
-    rho::connection::{ConnectionKind, GeneralConnection, OptionalDataValueCompat},
+    rho::connection::{ConnectionKind, GeneralConnection, OptionalDataValueExt, admission_engine},
     util::logger::PrintType,
 };
 use http::{Method, StatusCode};
@@ -47,7 +47,7 @@ fn web_config(max_connections: usize) -> Result<WebServerConfig, mtp::webserver:
         })
 }
 
-fn rho_policy() -> Policy {
+pub(super) fn rho_policy() -> Policy {
     Policy::default()
         .with_send_mode(SendMode::SingleStreamPerMessage)
         .with_timeouts(
@@ -201,24 +201,34 @@ pub async fn complete_register(
             DataValue::Str(BASE64_STD.encode(pub_key_bytes)),
         );
 
-    let response = match omega
-        .await_response(&request, Some(Duration::from_secs(20)))
-        .await
-    {
-        Ok(response) => response,
-        Err(e) => {
+    // MTP may cancel its registration callback during transport shutdown. Keep
+    // observing the remote mutation independently of that callback's lifetime.
+    let (result, receive) = tokio::sync::oneshot::channel();
+    let mut operations = tokio::task::JoinSet::new();
+    operations.spawn(async move {
+        let response = omega
+            .await_response(&request, Some(Duration::from_secs(20)))
+            .await;
+        let _ = result.send(response);
+    });
+    drop(super::tasks::supervise(operations));
+    let response = match receive.await {
+        Ok(Ok(response)) => response,
+        error => {
             log_err!(
                 0,
                 PrintType::General,
-                "Failed to complete Iota registration: {}",
-                e
+                "Failed to complete Iota registration: {:?}",
+                error
             );
             return 0;
         }
     };
 
     match response.get_data(DataType::IotaId) {
-        Some(DataValue::SignedNumber(id)) => *id as u64,
+        Some(DataValue::SignedNumber(id)) => {
+            u64::try_from(*id).ok().filter(|id| *id > 0).unwrap_or(0)
+        }
         _ => 0,
     }
 }
@@ -263,6 +273,9 @@ pub async fn start(
     let web_config = web_config(state.config.rho_max_connections)?;
     let mut host = MTPWebServer::new(host_config, web_config).await?;
     let mut provisioning_cleanup = tokio::time::interval(Duration::from_secs(30));
+    let admission_engine = Arc::new(admission_engine());
+    let (connection_shutdown, _) = watch::channel(false);
+    let mut connections = tokio::task::JoinSet::new();
     log!(
         0,
         PrintType::General,
@@ -274,6 +287,12 @@ pub async fn start(
     loop {
         let accepted = tokio::select! {
             _ = shutdown.wait_for(|shutting_down| *shutting_down) => break,
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    super::tasks::record_failure(error);
+                }
+                continue;
+            },
             _ = provisioning_cleanup.tick() => {
                 state.provisioning.prune_expired();
                 continue;
@@ -310,14 +329,15 @@ pub async fn start(
         };
         let peer_ip = conn.remote_addr.map(|address| address.ip());
         let state = state.clone();
-        tokio::spawn(async move {
-            let Some(conn) = GeneralConnection::new(conn, state.clone()) else {
-                log_err!(
-                    0,
-                    PrintType::General,
-                    "Rejected connection: unrecognized or unauthenticated description"
-                );
-                return;
+        let admission_engine = admission_engine.clone();
+        let shutdown = connection_shutdown.subscribe();
+        connections.spawn(async move {
+            let conn = match GeneralConnection::admit(conn, state.clone(), &admission_engine) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    log_err!(0, PrintType::General, "Rejected connection: {}", error);
+                    return;
+                }
             };
 
             let anonymous_permit = if matches!(
@@ -383,10 +403,16 @@ pub async fn start(
             let _global_permit = global_permit;
             let _anonymous_permit = anonymous_permit;
             let _anonymous_ip_permit = anonymous_ip_permit;
-            conn.handle().await;
+            conn.handle_until_shutdown(shutdown).await;
         });
     }
+    // Stop accepting first, then let application handlers cancel messages and clean up.
+    connection_shutdown.send_replace(true);
+    // Transfer ownership before awaiting transport shutdown. A cancelled listener
+    // must not drop its JoinSet and abort mutation-bearing connection handlers.
+    let completion = super::tasks::supervise(connections);
     host.shutdown().await;
+    let _ = completion.await;
     log!(0, PrintType::General, "Server stopped");
 
     Ok(())
@@ -394,12 +420,185 @@ pub async fn start(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancelling_registration_callback_retains_remote_observation() {
+        let state = crate::rho::test_support::state();
+        let mut requests = state.omega.test_requests();
+        let callback = tokio::spawn(super::complete_register(
+            state.omega.clone(),
+            mtp::crypto::Keyring::generate().public_key_bundle(),
+            Some("iota".into()),
+        ));
+        let (request, response) = tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        callback.abort();
+        assert!(callback.await.unwrap_err().is_cancelled());
+        assert!(!response.is_closed());
+        response
+            .send(Ok(request.add_typed_default(
+                DataType::IotaId,
+                DataValue::SignedNumber(2),
+            )))
+            .unwrap();
+    }
     use super::{
         AuthIdentity, AuthIdentityKind, HttpResponse, authenticated_key_response,
         authentication_identity, public_key_lookup_request, rho_policy, web_config, with_cors,
     };
     use mtp::codec::{CommunicationType, DataType, DataValue};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn listener_shutdown_ends_active_handlers_and_releases_their_permits() {
+        use crate::rho::{
+            connection::{GeneralConnection, admission_engine},
+            test_support,
+        };
+        let state = test_support::state();
+        let (host, peer, accepted) = test_support::guest("anonymous").await;
+        let general =
+            GeneralConnection::admit(accepted, state.clone(), &admission_engine()).unwrap();
+        let global = state
+            .rho_connection_limits
+            .all
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        let (shutdown, receive) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn({
+            let general = general.clone();
+            async move {
+                let _permit = global;
+                general.handle_until_shutdown(receive).await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while general.active_handler().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            general.tau_session.read().await.lifecycle(),
+            tau::LifecycleState::Closed
+        );
+        assert_eq!(general.active_handler(), None);
+        assert_eq!(state.rho_connection_limits.all.available_permits(), 2);
+        peer.sender.close().await;
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn guest_handlers_hold_application_permits_until_the_receive_loop_exits() {
+        use crate::rho::{
+            connection::{GeneralConnection, admission_engine},
+            test_support,
+        };
+        use tau::LifecycleState;
+        for role in [
+            "anonymous",
+            "registering-client",
+            "provisioning-client",
+            "tauth",
+        ] {
+            let state = test_support::state();
+            let (host, client, connection) = test_support::guest(role).await;
+            let general =
+                GeneralConnection::admit(connection, state.clone(), &admission_engine()).unwrap();
+            let global = state
+                .rho_connection_limits
+                .all
+                .clone()
+                .try_acquire_owned()
+                .unwrap();
+            let anonymous = state
+                .rho_connection_limits
+                .anonymous
+                .clone()
+                .try_acquire_owned()
+                .unwrap();
+            let ip = "127.0.0.1".parse().unwrap();
+            let per_ip = state
+                .rho_connection_limits
+                .try_acquire_anonymous_per_ip(ip)
+                .unwrap();
+            let task = tokio::spawn({
+                let general = general.clone();
+                async move {
+                    let _permits = (global, anonymous, per_ip);
+                    general.handle().await;
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while general.tau_session.read().await.lifecycle() != LifecycleState::Active {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!task.is_finished(), "{role} detached its receive loop");
+            assert_eq!(state.rho_connection_limits.all.available_permits(), 1);
+            assert_eq!(state.rho_connection_limits.anonymous.available_permits(), 0);
+            assert!(
+                state
+                    .rho_connection_limits
+                    .try_acquire_anonymous_per_ip(ip)
+                    .is_none()
+            );
+            client.sender.close().await;
+            tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                general.tau_session.read().await.lifecycle(),
+                LifecycleState::Closed
+            );
+            assert_eq!(state.rho_connection_limits.all.available_permits(), 2);
+            assert_eq!(state.rho_connection_limits.anonymous.available_permits(), 1);
+            assert!(
+                state
+                    .rho_connection_limits
+                    .try_acquire_anonymous_per_ip(ip)
+                    .is_some()
+            );
+            host.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_admission_releases_the_listener_permit() {
+        use crate::rho::{
+            connection::{GeneralConnection, admission_engine},
+            test_support,
+        };
+        let state = test_support::state();
+        let (host, client, connection) = test_support::guest("client").await;
+        let permit = state
+            .rho_connection_limits
+            .all
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            assert!(GeneralConnection::admit(connection, task_state, &admission_engine()).is_err());
+        });
+        task.await.unwrap();
+        assert_eq!(state.rho_connection_limits.all.available_permits(), 2);
+        client.sender.close().await;
+        host.shutdown().await;
+    }
 
     #[test]
     fn rho_connection_budget_configures_mtp_admission() {

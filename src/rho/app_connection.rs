@@ -1,6 +1,6 @@
 use crate::app_state::AppState;
 use crate::rho::connection::{
-    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueCompat, RequiredMtpFields,
+    GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueExt, RequiredCommunicationFields,
 };
 use crate::util::logger::PrintType;
 use crate::{log_cv_in, log_cv_out, log_err};
@@ -23,6 +23,7 @@ pub struct AppConnection {
     pub receiver: Arc<MtpReceiver>,
     is_open: Arc<RwLock<bool>>,
     message_slots: Arc<tokio::sync::Semaphore>,
+    tasks: super::tasks::MessageTasks,
 }
 
 impl AppConnection {
@@ -35,16 +36,23 @@ impl AppConnection {
             receiver: general.receiver.clone(),
             is_open: Arc::new(RwLock::new(true)),
             message_slots: Arc::new(tokio::sync::Semaphore::new(32)),
+            tasks: super::tasks::MessageTasks::new(
+                general.shutdown.subscribe(),
+                general.state.config.message_drain,
+            ),
         })
     }
 
-    pub fn start(self: Arc<Self>) {
-        tokio::spawn(async move {
-            while let Ok(value) = self.receiver.receive().await {
-                self.clone().handle_message(value).await;
-            }
-            *self.is_open.write().await = false;
-        });
+    pub async fn run(self: Arc<Self>) {
+        while let Some(Ok(value)) = self
+            .tasks
+            .while_connected(&self.receiver, self.receiver.receive())
+            .await
+        {
+            self.clone().handle_message(value).await;
+        }
+        self.tasks.drain().await;
+        *self.is_open.write().await = false;
     }
 
     pub async fn send_message(self: Arc<Self>, value: &CommunicationValue) {
@@ -56,35 +64,38 @@ impl AppConnection {
     }
 
     pub async fn handle_message(self: Arc<Self>, value: CommunicationValue) {
-        let Ok(permit) = self.message_slots.clone().acquire_owned().await else {
+        let Some(Ok(permit)) = self
+            .tasks
+            .while_connected(&self.receiver, self.message_slots.clone().acquire_owned())
+            .await
+        else {
             return;
         };
-        tokio::spawn(async move {
+        let connection = self.clone();
+        if let Err(error) = connection.tasks.spawn_cancellable(async move {
             let _permit = permit;
             let message_id = match value.require_id() {
                 Ok(message_id) => message_id,
                 Err(_) => {
-                    self.send_error(0, "missing message ID").await;
+                    self.send_error(&value, "missing message ID").await;
                     return;
                 }
             };
             log_cv_in!(PrintType::App, &value);
             if !is_tauth_command(&value) {
-                self.send_error(message_id, "raw MTP command is not available to TAuth apps")
+                self.send_error(&value, "raw MTP command is not available to TAuth apps")
                     .await;
                 return;
             }
             let locator_value = value.get_data(DataType::Locator);
             let Some(locator_json) = locator_value.as_str() else {
-                self.send_error(message_id, "missing signed user route")
-                    .await;
+                self.send_error(&value, "missing signed user route").await;
                 return;
             };
             let locator = match serde_json::from_str::<TAuthLocator>(locator_json) {
                 Ok(locator) if locator.target_iota_id > 0 => locator,
                 _ => {
-                    self.send_error(message_id, "invalid signed user route")
-                        .await;
+                    self.send_error(&value, "invalid signed user route").await;
                     return;
                 }
             };
@@ -94,10 +105,10 @@ impl AppConnection {
                 .get_by_iota(locator.target_iota_id as i64)
                 .await
             else {
-                self.send_error(message_id, "target Iota is offline").await;
+                self.send_error(&value, "target Iota is offline").await;
                 return;
             };
-            let forwarded = value.with_sender(self.connection_id);
+            let forwarded = value.clone().with_sender(self.connection_id);
             match rho
                 .get_iota_connection()
                 .clone()
@@ -112,17 +123,28 @@ impl AppConnection {
                         "TAuth forwarding failed: {}",
                         error
                     );
-                    self.send_error(message_id, "target Iota request failed")
-                        .await;
+                    self.send_error(&value, "target Iota request failed").await;
                 }
             }
-        });
+        }) {
+            log_err!(
+                connection.connection_id as i64,
+                PrintType::App,
+                "App message submission failed: {}",
+                error
+            );
+            connection.sender.close();
+        }
     }
 
-    async fn send_error(self: Arc<Self>, message_id: u32, message: &str) {
-        let response = CommunicationValue::new(CommunicationType::ErrorInvalidData)
-            .with_id(message_id)
-            .add_typed_default(DataType::Message, DataValue::Str(message.to_owned()));
+    async fn send_error(self: Arc<Self>, request: &CommunicationValue, message: &str) {
+        let latest = mtp::codec::TypeMap::latest();
+        let response = tau::error_response(
+            request,
+            CommunicationType::ErrorInvalidData,
+            request.type_map().unwrap_or(&latest),
+        )
+        .add_typed_default(DataType::Message, DataValue::Str(message.to_owned()));
         self.send_message(&response).await;
     }
 }

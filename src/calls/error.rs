@@ -6,6 +6,8 @@ pub enum CallError {
     NotConfigured,
     #[error("LiveKit request for room {call_id} timed out")]
     RequestTimedOut { call_id: uuid::Uuid },
+    #[error("LiveKit mutation recovery for room {call_id} requires attention: {detail}")]
+    MutationRecovery { call_id: uuid::Uuid, detail: String },
     #[error("failed to create room {call_id}: {detail}")]
     RoomCreationFailed { call_id: uuid::Uuid, detail: String },
     #[error("room {call_id} was not found")]

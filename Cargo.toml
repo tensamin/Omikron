@@ -4,15 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tau = { git = "https://github.com/TensaminDev/Tau.git", rev = "6465cd77f61e0df3316f331b6a49885864a81033" }
 libc = "0.2"
-mtp = { git = "https://git.methanium.net/methanium/mtp", rev = "ad489265deacadd6de52ed2129d071803a0e7247", features = [
+mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584", features = [
     "web-server",
     "client",
     "crypto",
     "files",
     "raw",
 ] }
-mtp-native = { git = "https://git.methanium.net/methanium/mtp", rev = "ad489265deacadd6de52ed2129d071803a0e7247" }
+mtp-native = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584" }
 
 ansi_term = "0.12.1"
 uuid = { version = "1.24.0", features = ["v4"] }
@@ -37,3 +38,6 @@ trust-dns-resolver = "0.23.2"
 serde_json = "1.0.151"
 serde = { version = "1", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+
+[dev-dependencies]
+rcgen = "0.14"
