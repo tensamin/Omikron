@@ -46,19 +46,19 @@
     "type-maps": {
       "flake": false,
       "locked": {
-        "lastModified": 1792182877,
-        "narHash": "sha256-8y9i6ccph7sRghDf/hn6l2pDahAGK1wZnBluCHPdZ6w=",
+        "lastModified": 1792833625,
+        "narHash": "sha256-Ndd7moZJU3Uo48WmIcH6mK23DBqCWLUzvE0hsiO/E+s=",
         "ref": "main",
-        "rev": "76793898fac4b242918e2f26dc67312cb459d88b",
-        "revCount": 31,
+        "rev": "f0f856ca1d5fc3ca2b05a71f287c226ea58a6c60",
+        "revCount": 32,
         "type": "git",
-        "url": "https://github.com/TensaminDev/MTP-Type-Maps.git"
+        "url": "https://github.com/tensamin/MTP-Type-Maps.git"
       },
       "original": {
         "ref": "main",
-        "rev": "76793898fac4b242918e2f26dc67312cb459d88b",
+        "rev": "f0f856ca1d5fc3ca2b05a71f287c226ea58a6c60",
         "type": "git",
-        "url": "https://github.com/TensaminDev/MTP-Type-Maps.git"
+        "url": "https://github.com/tensamin/MTP-Type-Maps.git"
       }
     }
   },

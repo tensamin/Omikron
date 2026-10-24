@@ -12,7 +12,7 @@ use std::{
 };
 
 use ansi_term::Color;
-use mtp::codec::{CommunicationType, CommunicationValue, DataTypeId, DataValue, TypeMap};
+use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue, TypeMap};
 
 static LOGGER: OnceLock<mpsc::SyncSender<LoggerCommand>> = OnceLock::new();
 static DROPPED_LOGS: AtomicU64 = AtomicU64::new(0);
@@ -433,18 +433,20 @@ pub fn format_cv(cv: &CommunicationValue) -> String {
 }
 
 fn has_sensitive_payload(cv: &CommunicationValue) -> bool {
-    matches!(
-        cv.get_comm_type_enum(),
-        Some(
-            CommunicationType::PasswordEnrollmentStart
-                | CommunicationType::PasswordEnrollmentResponse
-                | CommunicationType::PasswordEnrollmentFinish
-                | CommunicationType::PasswordProvisioningStart
-                | CommunicationType::PasswordProvisioningResponse
-                | CommunicationType::PasswordProvisioningFinish
-                | CommunicationType::ProvisioningCredential
+    cv.get_data(DataType::CallPayload).is_some()
+        || matches!(
+            cv.get_comm_type_enum(),
+            Some(
+                CommunicationType::PasswordEnrollmentStart
+                    | CommunicationType::PasswordEnrollmentResponse
+                    | CommunicationType::PasswordEnrollmentFinish
+                    | CommunicationType::PasswordProvisioningStart
+                    | CommunicationType::PasswordProvisioningResponse
+                    | CommunicationType::PasswordProvisioningFinish
+                    | CommunicationType::ProvisioningCredential
+                    | CommunicationType::CallSetAnonymousJoining
+            )
         )
-    )
 }
 
 fn format_data_container(data: &[(DataTypeId, DataValue)], type_map: &TypeMap) -> String {

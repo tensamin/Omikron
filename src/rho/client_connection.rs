@@ -21,7 +21,7 @@ use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, Da
 use mtp::crypto::PublicKeyBundle;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use std::{collections::VecDeque, str::FromStr};
 use tokio::sync::{Mutex, RwLock, oneshot};
@@ -131,6 +131,7 @@ pub struct ClientConnection {
     client_state_sync: Arc<Mutex<ClientStateSyncState>>,
     session_activity: Arc<RwLock<SessionActivity>>,
     pub(super) foreground_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
+    managed_calls: Arc<AtomicBool>,
 }
 
 impl ClientConnection {
@@ -154,11 +155,15 @@ impl ClientConnection {
             client_state_sync: Arc::new(Mutex::new(ClientStateSyncState::default())),
             session_activity: Arc::new(RwLock::new(SessionActivity::default())),
             foreground_requests: Arc::new(Mutex::new(HashMap::new())),
+            managed_calls: Arc::new(AtomicBool::new(false)),
         })
     }
 
     pub async fn session_activity(&self) -> SessionActivity {
         self.session_activity.read().await.clone()
+    }
+    pub(crate) fn supports_managed_calls(&self) -> bool {
+        self.managed_calls.load(Ordering::Relaxed)
     }
 
     pub(crate) fn notify_connected(self: &Arc<Self>, iota_id: u64) {
@@ -483,6 +488,30 @@ impl ClientConnection {
             }
 
             // Handle call invites
+            if matches!(
+                cv.get_comm_type_enum(),
+                Some(
+                    CommunicationType::CallCommand
+                        | CommunicationType::CallSnapshotGet
+                        | CommunicationType::CallJoinAuthorize
+                )
+            ) {
+                self.managed_calls.store(true, Ordering::Relaxed);
+                self.handle_managed_call(cv).await;
+                return;
+            }
+            if matches!(
+                cv.get_comm_type_enum(),
+                Some(
+                    CommunicationType::CallKeyEnvelopeStage
+                        | CommunicationType::CallKeyEnvelopeGet
+                        | CommunicationType::CallKeyEnvelopeActivate
+                )
+            ) {
+                self.managed_calls.store(true, Ordering::Relaxed);
+                self.handle_call_epoch(cv).await;
+                return;
+            }
             if cv.is_type(CommunicationType::CallReserve) {
                 let result = self.state.call_manager.reserve(self.user_id).await;
                 match result {
@@ -1072,6 +1101,7 @@ impl Clone for ClientConnection {
             client_state_sync: Arc::clone(&self.client_state_sync),
             session_activity: Arc::clone(&self.session_activity),
             foreground_requests: Arc::clone(&self.foreground_requests),
+            managed_calls: Arc::clone(&self.managed_calls),
         }
     }
 }

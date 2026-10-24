@@ -33,9 +33,24 @@ impl IotaConnection {
                     | CommunicationType::MessageStoragePolicyGet
                     | CommunicationType::PasswordEnrollmentStatus
                     | CommunicationType::CallEnvelopeGet
+                    | CommunicationType::CallKeyEnvelopeGet
+                    | CommunicationType::CallContactCheck
             )
         );
-        let journal = if read_only {
+        // These mutations are replayable by immutable ciphertext or durable
+        // operation ID. The call SQLite saga owns retry/reconciliation; a
+        // second uncertain-intent journal would block its lost-response retries.
+        let replayable_call = matches!(
+            expected,
+            Some(
+                CommunicationType::CallEnvelopeStore
+                    | CommunicationType::CallContactAccept
+                    | CommunicationType::CallKeyEnvelopeStage
+                    | CommunicationType::CallKeyEnvelopeActivate
+                    | CommunicationType::CallKeyEnvelopeRevoke
+            )
+        );
+        let journal = if read_only || replayable_call {
             None
         } else {
             let journal = crate::omega::MutationJournal::open(&self.mutation_journal_path)?;

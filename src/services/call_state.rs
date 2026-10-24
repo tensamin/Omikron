@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 use std::time::Duration;
+use tau::calls::{CallClock, CallRepository, SystemCallClock};
 
 use crate::{calls::call_manager::CallManager, util::data_type_id};
 
@@ -48,6 +49,23 @@ impl CallStateAggregator {
         self
     }
 
+    async fn authorized_legacy_snapshot(
+        &self,
+        user_id: u64,
+        id: uuid::Uuid,
+    ) -> Result<tau::calls::CallSnapshot, tau::calls::CallError> {
+        let repository = self
+            .call_manager
+            .repository
+            .as_ref()
+            .ok_or(tau::calls::CallError::StorageUnavailable)?;
+        let call = repository.read(self.call_manager.call_id(id)?).await?;
+        let actor = self.call_manager.actor(user_id)?;
+        let now = SystemCallClock.now_ms()?;
+        call.authorize_envelope_read(actor.principal(), 0, now)?;
+        call.snapshot(&actor, now)
+    }
+
     pub async fn augment_contacts(
         &self,
         user_id: u64,
@@ -58,16 +76,12 @@ impl CallStateAggregator {
         let mut global_calls = Vec::new();
 
         for call in self.call_manager.get_call_groups(user_id).await {
-            let (call_self, pending, members, pending_invitees) = {
-                let state = call.state.read().await;
-                (
-                    state.members.get(&user_id).cloned(),
-                    state.pending_invites.get(&user_id).cloned(),
-                    state.members.keys().copied().collect::<Vec<_>>(),
-                    state.pending_invites.keys().copied().collect::<Vec<_>>(),
-                )
-            };
-            if call_self.is_none() && pending.is_none() {
+            if self.rho.is_some()
+                && self
+                    .authorized_legacy_snapshot(user_id, call.call_id)
+                    .await
+                    .is_err()
+            {
                 continue;
             }
             let secret = if let Some(rho_manager) = &self.rho {
@@ -98,8 +112,84 @@ impl CallStateAggregator {
             if self.rho.is_some() && secret.is_none() {
                 continue;
             }
+            let scoped = if self.rho.is_some() {
+                match self.authorized_legacy_snapshot(user_id, call.call_id).await {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(_) => continue,
+                }
+            } else {
+                None
+            };
+
+            // Envelope lookup can await a remote Iota. Refresh the committed
+            // projection afterwards so a kick during lookup cannot expose it.
+            let Some(call) = self.call_manager.get_call(call.call_id).await else {
+                continue;
+            };
+            let revision = scoped.as_ref().map(|snapshot| snapshot.revision);
+            let (call_self, pending, members, pending_invitees) = if let Some(snapshot) = scoped {
+                let authority = self
+                    .call_manager
+                    .principal(user_id)
+                    .ok()
+                    .map(|p| p.authority);
+                let members = snapshot
+                    .members
+                    .iter()
+                    .filter(|m| Some(&m.principal.authority) == authority.as_ref())
+                    .map(|m| m.principal.user_id)
+                    .collect::<Vec<_>>();
+                let pending_invitees = snapshot
+                    .invitations
+                    .iter()
+                    .filter(|i| {
+                        i.delivery_ready && Some(&i.recipient.authority) == authority.as_ref()
+                    })
+                    .map(|i| i.recipient.user_id)
+                    .collect::<Vec<_>>();
+                let own = snapshot
+                    .member
+                    .map(|m| crate::calls::call_group::CallMember {
+                        user_id: m.principal.user_id,
+                        role: match m.role {
+                            tau::calls::CallRole::Member => {
+                                crate::calls::call_group::CallRole::Member
+                            }
+                            _ => crate::calls::call_group::CallRole::Admin,
+                        },
+                        timeout_until_ms: m.timeout_until_ms,
+                        participating: false,
+                    });
+                let pending =
+                    snapshot
+                        .invitation
+                        .map(|i| crate::calls::call_group::PendingCallInvite {
+                            inviter_id: i.inviter.user_id,
+                            created_at_ms: i
+                                .expires_at_ms
+                                .saturating_sub(snapshot.policy.invite_ttl_ms),
+                        });
+                (own, pending, members, pending_invitees)
+            } else {
+                let state = call.state.read().await;
+                (
+                    state.members.get(&user_id).cloned(),
+                    state.pending_invites.get(&user_id).cloned(),
+                    state.members.keys().copied().collect::<Vec<_>>(),
+                    state.pending_invites.keys().copied().collect::<Vec<_>>(),
+                )
+            };
+            if call_self.is_none() && pending.is_none() {
+                continue;
+            }
 
             let mut call_map = BTreeMap::new();
+            if let Some(revision) = revision {
+                call_map.insert(
+                    data_type_id(DataType::VersionNumber, &tm),
+                    DataValue::UnsignedNumber(revision.into()),
+                );
+            }
             call_map.insert(
                 data_type_id(DataType::CallId, &tm),
                 DataValue::Str(call.call_id.to_string()),
@@ -192,6 +282,77 @@ mod tests {
     use super::*;
     use crate::calls::call_group::CallGroup;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn state_sync_key_gate_is_stricter_than_snapshot_visibility() {
+        use tau::calls::*;
+        for case in 0..4 {
+            let mut call = crate::calls::repository::tests::call();
+            let now = SystemCallClock.now_ms().unwrap();
+            let expected = match case {
+                0 => {
+                    call.members
+                        .iter_mut()
+                        .find(|m| m.principal.user_id == 4)
+                        .unwrap()
+                        .timeout_until_ms = Some(now + 60_000);
+                    CallError::TimedOut {
+                        until_ms: now + 60_000,
+                    }
+                }
+                1 => {
+                    call.policy.join_policy = JoinPolicy::Approved;
+                    call.members
+                        .iter_mut()
+                        .find(|m| m.principal.user_id == 4)
+                        .unwrap()
+                        .approved = false;
+                    CallError::NotAuthorized
+                }
+                2 => {
+                    call.lifecycle = CallLifecycle::Ending;
+                    CallError::AlreadyEnded
+                }
+                _ => {
+                    call.key_epoch = 1;
+                    CallError::KeyEpochPending
+                }
+            };
+            let repository = Arc::new(
+                crate::calls::repository::SqliteCallRepository::open(std::path::Path::new(
+                    ":memory:",
+                ))
+                .unwrap(),
+            );
+            repository.insert(call.clone()).await.unwrap();
+            let livekit = Arc::new(crate::calls::call_util::LiveKitService::new(None));
+            let runtime = Arc::new(crate::calls::runtime::CallRuntime {
+                repository: repository.clone(),
+                rho: Arc::new(crate::rho::rho_manager::RhoManager::new()),
+                principal_authority: call.owner.authority.clone(),
+            });
+            let engine = Arc::new(CallEngine::new(
+                repository.clone(),
+                livekit.clone(),
+                runtime.clone(),
+                runtime,
+                Arc::new(SystemCallClock),
+            ));
+            let manager = Arc::new(CallManager::new_with_owner(livekit, 42).with_runtime(
+                repository,
+                engine,
+                call.id.owner_authority.clone(),
+                call.owner.authority.clone(),
+            ));
+            assert!(manager.snapshot(4, call.id.clone()).await.is_ok());
+            assert_eq!(
+                CallStateAggregator::new(manager)
+                    .authorized_legacy_snapshot(4, call.id.id)
+                    .await,
+                Err(expected)
+            );
+        }
+    }
 
     #[tokio::test]
     async fn augment_contacts_preserves_contacts_without_call_invites() {

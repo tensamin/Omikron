@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tau = { git = "https://github.com/TensaminDev/Tau.git", rev = "6465cd77f61e0df3316f331b6a49885864a81033" }
+tau = { git = "https://github.com/tensamin/Tau.git", rev = "f1cfbb8477abc037fd262a60dc6be2cb35623340" }
 libc = "0.2"
 mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584", features = [
     "web-server",
@@ -20,6 +20,9 @@ uuid = { version = "1.24.0", features = ["v4"] }
 base64 = "0.22.1"
 dashmap = "6.2.1"
 http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 once_cell = "1.21.4"
 rand = "0.10.2"
 rustls = { version = "0.23.42", default-features = false, features = [
@@ -41,3 +44,4 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]
 rcgen = "0.14"
+sha2 = "0.10"

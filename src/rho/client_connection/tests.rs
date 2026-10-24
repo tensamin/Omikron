@@ -3,6 +3,257 @@ use super::{
 };
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 
+#[test]
+fn managed_call_allowlist_is_local_and_excludes_results_and_direct_revocation() {
+    use crate::rho::relay_router::{MessageSecurityClass, message_security_class};
+    for operation in [
+        CommunicationType::CallCommand,
+        CommunicationType::CallSnapshotGet,
+        CommunicationType::CallJoinAuthorize,
+        CommunicationType::CallKeyEnvelopeStage,
+        CommunicationType::CallKeyEnvelopeGet,
+        CommunicationType::CallKeyEnvelopeActivate,
+    ] {
+        assert_eq!(
+            message_security_class(&CommunicationValue::new(operation)),
+            MessageSecurityClass::AuthenticatedLocalRequest
+        );
+    }
+    for operation in [
+        CommunicationType::CallCommandResult,
+        CommunicationType::CallSnapshot,
+        CommunicationType::CallStateChanged,
+        CommunicationType::CallJoinGrant,
+        CommunicationType::CallKeyEpochChanged,
+        CommunicationType::CallKeyEnvelopeRevoke,
+    ] {
+        assert_eq!(
+            message_security_class(&CommunicationValue::new(operation)),
+            MessageSecurityClass::Unsupported
+        );
+    }
+}
+
+#[tokio::test]
+async fn managed_commands_cross_authenticated_mtp_dispatch_with_the_session_actor() {
+    use crate::{
+        calls::{
+            call_manager::CallManager,
+            call_util::LiveKitService,
+            repository::{SqliteCallRepository, tests::ContractAdapters},
+        },
+        rho::{
+            connection::{GeneralConnection, admission_engine},
+            test_support,
+        },
+    };
+    use std::{sync::Arc, time::Duration};
+    use tau::calls::*;
+
+    async fn exchange(
+        peer: &mtp::client::MTPConnection,
+        general: &Arc<GeneralConnection>,
+        client: &Arc<super::ClientConnection>,
+        request: CommunicationValue,
+    ) -> serde_json::Value {
+        let id = request.id();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            peer.sender.send(&request).await.unwrap();
+            let incoming = general.receiver.receive().await.unwrap();
+            client.clone().handle_message(incoming).await;
+            let response = peer.receive().await.unwrap();
+            assert_eq!(response.id(), id);
+            let payload = response
+                .get_data(DataType::CallPayload)
+                .and_then(|v| v.as_bytes())
+                .expect("managed response must use the typed call protocol");
+            serde_json::from_slice(&payload).unwrap()
+        })
+        .await
+        .unwrap()
+    }
+
+    let mut state = test_support::state();
+    let repository =
+        Arc::new(SqliteCallRepository::open(std::path::Path::new(":memory:")).unwrap());
+    let mut call = crate::calls::repository::tests::call();
+    call.id.owner_authority =
+        CallAuthority::new(format!("omikron-key:{}", "b".repeat(64))).unwrap();
+    let principal = CallPrincipal {
+        authority: call.owner.authority.clone(),
+        user_id: 42,
+    };
+    call.members.push(CallMember {
+        principal: principal.clone(),
+        role: CallRole::Member,
+        authorized: true,
+        approved: true,
+        guest: false,
+        restrictions: Restrictions::default(),
+        overrides: PermissionOverrides::default(),
+        timeout_until_ms: None,
+    });
+    repository.insert(call.clone()).await.unwrap();
+    let adapters = Arc::new(ContractAdapters);
+    let engine = Arc::new(CallEngine::new(
+        repository.clone(),
+        adapters.clone(),
+        adapters.clone(),
+        adapters,
+        Arc::new(SystemCallClock),
+    ));
+    let manager = Arc::new(
+        CallManager::new_with_owner(Arc::new(LiveKitService::new(None)), 1).with_runtime(
+            repository.clone(),
+            engine,
+            call.id.owner_authority.clone(),
+            call.owner.authority.clone(),
+        ),
+    );
+    let owned = Arc::get_mut(&mut state).unwrap();
+    owned.call_manager = manager.clone();
+    owned.call_state_aggregator = Arc::new(crate::services::call_state::CallStateAggregator::new(
+        manager,
+    ));
+    let (host, peer, transport) = test_support::authenticated("client").await;
+    let general = GeneralConnection::admit(transport, state, &admission_engine()).unwrap();
+    let client = super::ClientConnection::from_general(general.clone(), 42).await;
+    let target = call
+        .members
+        .iter()
+        .find(|m| m.principal.user_id == 4)
+        .unwrap()
+        .principal
+        .clone();
+    let mut request = CallCommandRequest {
+        call: call.id.clone(),
+        operation_id: uuid::Uuid::new_v4(),
+        expected_revision: None,
+        command: CallCommand::SetMemberRestriction {
+            target: target.clone(),
+            restriction: MemberRestriction::Microphone,
+            enabled: true,
+        },
+    };
+    let wire = CommunicationValue::new(CommunicationType::CallCommand)
+        .with_id(41)
+        .with_sender(1)
+        .add_typed_default(DataType::UserId, DataValue::UnsignedNumber(1))
+        .add_typed_default(
+            DataType::CallPayload,
+            DataValue::Bytes(encode_call_command(&request).unwrap()),
+        );
+    let denied = exchange(&peer, &general, &client, wire).await;
+    assert_eq!(denied["error"]["error"], "not_authorized");
+    assert!(
+        !repository
+            .read(call.id.clone())
+            .await
+            .unwrap()
+            .member(&target)
+            .unwrap()
+            .restrictions
+            .microphone
+    );
+
+    repository
+        .transact(
+            AuthenticatedCallActor::from_verified_session(call.owner.clone()).unwrap(),
+            CallCommandRequest {
+                call: call.id.clone(),
+                operation_id: uuid::Uuid::new_v4(),
+                expected_revision: None,
+                command: CallCommand::SetRole {
+                    target: principal,
+                    role: CallRole::Moderator,
+                },
+            },
+            SystemCallClock.now_ms().unwrap(),
+        )
+        .await
+        .unwrap();
+    request.operation_id = uuid::Uuid::new_v4();
+    let wire = CommunicationValue::new(CommunicationType::CallCommand)
+        .with_id(42)
+        .with_sender(9999)
+        .add_typed_default(
+            DataType::CallPayload,
+            DataValue::Bytes(encode_call_command(&request).unwrap()),
+        );
+    let applied = exchange(&peer, &general, &client, wire.clone()).await;
+    assert_eq!(applied["result"]["revision"], 2);
+    assert_eq!(
+        exchange(&peer, &general, &client, wire.with_id(43)).await,
+        applied
+    );
+    assert_eq!(repository.read(call.id.clone()).await.unwrap().revision, 2);
+
+    let lookup = serde_json::to_vec(&serde_json::json!({"version":1,"call":call.id})).unwrap();
+    let snapshot = exchange(
+        &peer,
+        &general,
+        &client,
+        CommunicationValue::new(CommunicationType::CallSnapshotGet)
+            .with_id(44)
+            .with_sender(1)
+            .add_typed_default(DataType::CallPayload, DataValue::Bytes(lookup.clone())),
+    )
+    .await;
+    assert_eq!(snapshot["result"]["member"]["principal"]["user_id"], 42);
+    assert_eq!(snapshot["result"]["member"]["role"], "moderator");
+    let target_snapshot = snapshot["result"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["principal"]["user_id"] == 4)
+        .unwrap();
+    assert_eq!(target_snapshot["permissions"]["publish_microphone"], false);
+    let grant = exchange(
+        &peer,
+        &general,
+        &client,
+        CommunicationValue::new(CommunicationType::CallJoinAuthorize)
+            .with_id(45)
+            .with_sender(1)
+            .add_typed_default(DataType::CallPayload, DataValue::Bytes(lookup)),
+    )
+    .await;
+    assert_eq!(grant["result"]["permissions"]["moderate"], true);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        peer.sender
+            .send(
+                &CommunicationValue::new(CommunicationType::CallDisconnectUser)
+                    .with_id(46)
+                    .add_typed_default(DataType::CallId, DataValue::Str(call.id.id.to_string()))
+                    .add_typed_default(DataType::UserId, DataValue::UnsignedNumber(4)),
+            )
+            .await
+            .unwrap();
+        client
+            .clone()
+            .handle_message(general.receiver.receive().await.unwrap())
+            .await;
+        let response = peer.receive().await.unwrap();
+        assert!(response.is_type(CommunicationType::Success));
+        assert_eq!(
+            response
+                .get_data(DataType::Description)
+                .and_then(|v| v.as_str()),
+            Some("pending_enforcement")
+        );
+        assert_eq!(
+            response
+                .get_data(DataType::VersionNumber)
+                .and_then(|v| v.as_number()),
+            Some(3)
+        );
+    })
+    .await
+    .unwrap();
+    peer.sender.close().await;
+    host.shutdown().await;
+}
+
 #[tokio::test]
 async fn local_cleanup_outlives_notification_budget_without_omega() {
     use crate::{

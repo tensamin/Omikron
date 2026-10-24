@@ -49,7 +49,9 @@ fn web_config(max_connections: usize) -> Result<WebServerConfig, mtp::webserver:
 
 pub(super) fn rho_policy() -> Policy {
     Policy::default()
-        .with_send_mode(SendMode::SingleStreamPerMessage)
+        // Version selection and final acceptance must arrive in order. Separate
+        // receive-stream tasks can otherwise deliver acceptance before selection.
+        .with_send_mode(SendMode::PersistentStream)
         .with_timeouts(
             Duration::from_millis(2_000),
             Duration::from_millis(2_000),
@@ -687,6 +689,7 @@ mod tests {
     #[test]
     fn rho_policy_keeps_idle_peers_alive_and_detects_dead_peers() {
         let policy = rho_policy();
+        assert_eq!(policy.send_mode, mtp::host::SendMode::PersistentStream);
         assert_eq!(policy.keep_alive_interval, Some(Duration::from_secs(6)));
         assert_eq!(policy.max_idle_timeout, Some(Duration::from_secs(30)));
     }

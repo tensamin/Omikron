@@ -7,7 +7,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     type-maps = {
-      url = "git+https://github.com/TensaminDev/MTP-Type-Maps.git?ref=main&rev=76793898fac4b242918e2f26dc67312cb459d88b";
+      url = "git+https://github.com/tensamin/MTP-Type-Maps.git?ref=main&rev=f0f856ca1d5fc3ca2b05a71f287c226ea58a6c60";
       flake = false;
     };
   };
@@ -117,7 +117,7 @@
               pname = "omikron";
               version = "0.1.0";
               src = source;
-              hash = "sha256-inwQNzwLcvH9HKJdHBADgQBIjf27OJg/rafrh3dA2bg=";
+              hash = "sha256-gIs2tloZE/xSahP125esHswqgovmnXzKn3RywrXhZ6w=";
             };
           };
           container = self.lib.mkContainer {

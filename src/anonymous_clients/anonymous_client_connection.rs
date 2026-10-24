@@ -1,5 +1,4 @@
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -143,6 +142,22 @@ impl AnonymousClientConnection {
                 }
             };
             log_cv_in!(PrintType::Client, &cv);
+
+            if cv.is_type(CommunicationType::CallJoinAuthorize) {
+                self.handle_guest_join(cv).await;
+                return;
+            }
+            if matches!(
+                cv.get_comm_type_enum(),
+                Some(
+                    CommunicationType::CallSnapshotGet
+                        | CommunicationType::CallKeyEnvelopeGet
+                        | CommunicationType::CallCommand
+                )
+            ) {
+                self.handle_guest_call(cv).await;
+                return;
+            }
 
             if cv.is_type(CommunicationType::Relay) {
                 self.send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
@@ -509,6 +524,147 @@ impl AnonymousClientConnection {
         self.send_message(&response).await;
     }
 
+    async fn handle_guest_call(self: Arc<Self>, cv: CommunicationValue) {
+        use tau::calls::*;
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
+        let operation = cv.get_comm_type_enum();
+        let reply = match operation {
+            Some(CommunicationType::CallCommand) => CommunicationType::CallCommandResult,
+            Some(CommunicationType::CallSnapshotGet) => CommunicationType::CallSnapshot,
+            _ => CommunicationType::CallKeyEnvelopeGet,
+        };
+        let outcome: Result<serde_json::Value, CallError> = async {
+            let bytes = cv
+                .get_data(DataType::CallPayload)
+                .and_then(|value| value.as_bytes())
+                .ok_or(CallError::InvalidRequest)?;
+            if bytes.len() > MAX_CALL_COMMAND_BYTES {
+                return Err(CallError::InvalidRequest);
+            }
+            let manager = &self.state.call_manager;
+            let engine = manager
+                .engine
+                .as_ref()
+                .ok_or(CallError::StorageUnavailable)?;
+            if operation == Some(CommunicationType::CallCommand) {
+                let request = decode_call_command(&bytes)?;
+                if !matches!(
+                    request.command,
+                    CallCommand::Leave | CallCommand::AcknowledgeKeyEpoch { .. }
+                ) {
+                    return Err(CallError::NotAuthorized);
+                }
+                let actor = manager
+                    .guest_actor(self.user_id, request.call.clone())
+                    .await?;
+                return serde_json::to_value(engine.execute(actor, request).await?)
+                    .map_err(|_| CallError::StorageUnavailable);
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Lookup {
+                version: u16,
+                call: CallId,
+                epoch: Option<u64>,
+            }
+            let request: Lookup =
+                serde_json::from_slice(&bytes).map_err(|_| CallError::InvalidRequest)?;
+            if request.version != CALL_PROTOCOL_VERSION {
+                return Err(CallError::UnsupportedVersion);
+            }
+            let actor = manager
+                .guest_actor(self.user_id, request.call.clone())
+                .await?;
+            let snapshot = engine.snapshot(actor.clone(), request.call.clone()).await?;
+            if operation == Some(CommunicationType::CallSnapshotGet) {
+                return serde_json::to_value(snapshot).map_err(|_| CallError::StorageUnavailable);
+            }
+            let epoch = request.epoch.ok_or(CallError::InvalidRequest)?;
+            if epoch == 0 || epoch != snapshot.key_epoch {
+                return Err(CallError::KeyEpochPending);
+            }
+            let payload = manager
+                .repository
+                .as_ref()
+                .ok_or(CallError::StorageUnavailable)?
+                .epoch_payload(request.call, actor.principal().clone(), epoch)
+                .await?
+                .ok_or(CallError::KeyEpochPending)?;
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&payload).map_err(|_| CallError::StorageUnavailable)?;
+            Ok(serde_json::json!({ "state": "available", "envelope": envelope }))
+        }
+        .await;
+        let payload = match outcome {
+            Ok(result) => serde_json::json!({ "version": CALL_PROTOCOL_VERSION, "result": result }),
+            Err(error) => serde_json::json!({ "version": CALL_PROTOCOL_VERSION, "error": error }),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&payload) {
+            self.send_message(
+                &CommunicationValue::new(reply)
+                    .with_id(message_id)
+                    .add_typed_default(DataType::CallPayload, DataValue::Bytes(bytes)),
+            )
+            .await;
+        }
+    }
+
+    async fn handle_guest_join(self: Arc<Self>, cv: CommunicationValue) {
+        use tau::calls::*;
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
+        let outcome: Result<JoinGrant, CallError> = async {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Admission {
+                version: u16,
+                call: CallId,
+                capability: String,
+                operation_id: Uuid,
+            }
+            let bytes = cv
+                .get_data(DataType::CallPayload)
+                .and_then(|value| value.as_bytes())
+                .ok_or(CallError::InvalidRequest)?;
+            if bytes.len() > MAX_CALL_COMMAND_BYTES {
+                return Err(CallError::InvalidRequest);
+            }
+            let request: Admission =
+                serde_json::from_slice(&bytes).map_err(|_| CallError::InvalidRequest)?;
+            if request.version != CALL_PROTOCOL_VERSION {
+                return Err(CallError::UnsupportedVersion);
+            }
+            if request.operation_id.is_nil() {
+                return Err(CallError::InvalidRequest);
+            }
+            self.state
+                .call_manager
+                .authorize_guest(
+                    self.user_id,
+                    request.call,
+                    request.capability,
+                    request.operation_id,
+                )
+                .await
+        }
+        .await;
+        let payload = match outcome {
+            Ok(grant) => serde_json::json!({ "version": CALL_PROTOCOL_VERSION, "result": grant }),
+            Err(error) => serde_json::json!({ "version": CALL_PROTOCOL_VERSION, "error": error }),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&payload) {
+            self.send_message(
+                &CommunicationValue::new(CommunicationType::CallJoinGrant)
+                    .with_id(message_id)
+                    .add_typed_default(DataType::CallPayload, DataValue::Bytes(bytes)),
+            )
+            .await;
+        }
+    }
+
     /// Handle get call request
     async fn handle_get_call(self: Arc<Self>, cv: CommunicationValue) {
         let Ok(message_id) = cv.require_id() else {
@@ -583,66 +739,15 @@ impl AnonymousClientConnection {
         let Ok(message_id) = cv.require_id() else {
             return;
         };
-        let Ok(call_id) = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or(""))
-        else {
-            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
-                .await;
-            return;
-        };
-        let (Ok(user_id), Ok(untill)) = (
-            positive_data_i64(&cv, DataType::UserId, "user_id"),
-            positive_data_i64(&cv, DataType::Untill, "untill"),
-        ) else {
-            self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
-                .await;
-            return;
-        };
-
-        let Some(call) = self.state.call_manager.get_call(call_id).await else {
-            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
-                .await;
-            return;
-        };
-        let Some(caller) = call.get_caller(self.get_user_id()).await else {
-            self.send_error_response(message_id, CommunicationType::ErrorInvalidUserId)
-                .await;
-            return;
-        };
-        if caller.has_admin()
-            && let Some(target) = call.get_caller(user_id.unsigned_abs()).await
-        {
-            target.set_timeout(untill).await;
-        }
+        self.send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
+            .await;
     }
     async fn handle_call_disconnect_user(self: Arc<Self>, cv: CommunicationValue) {
         let Ok(message_id) = cv.require_id() else {
             return;
         };
-        let Ok(call_id) = Uuid::from_str(cv.get_data(DataType::CallId).as_str().unwrap_or(""))
-        else {
-            self.send_error_response(message_id, CommunicationType::ErrorInvalidCallId)
-                .await;
-            return;
-        };
-        let Ok(user_id) = positive_data_i64(&cv, DataType::UserId, "user_id") else {
-            self.send_error_response(message_id, CommunicationType::ErrorInvalidUserId)
-                .await;
-            return;
-        };
-
-        let Some(call) = self.state.call_manager.get_call(call_id).await else {
-            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
-                .await;
-            return;
-        };
-        let Some(caller) = call.get_caller(self.get_user_id()).await else {
-            self.send_error_response(message_id, CommunicationType::ErrorInvalidUserId)
-                .await;
-            return;
-        };
-        if caller.has_admin() {
-            call.remove_caller(user_id.unsigned_abs()).await;
-        }
+        self.send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
+            .await;
     }
 
     /// Send error response

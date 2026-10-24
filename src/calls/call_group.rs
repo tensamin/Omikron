@@ -1,14 +1,15 @@
+#[cfg(test)]
+use crate::calls::call_manager::CallServiceError;
 use crate::{
-    calls::call_manager::CallServiceError,
-    calls::{call_util::LiveKitService, caller::Caller, error::CallError},
+    calls::{call_util::LiveKitService, error::CallError},
     config::CallLimits,
-    omega::omega_connection::OmegaConnection,
-    rho::connection::OptionalDataValueExt,
     util::data_type_id,
 };
-use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
-use serde::Serialize;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use mtp::codec::{CommunicationValue, DataType, DataValue, TypeMap};
+use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::time::Duration;
+use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -17,15 +18,12 @@ pub struct CallGroup {
     pub owner_omikron_id: u64,
     pub created_at_ms: i64,
     pub state: RwLock<CallGroupState>,
-    pub(crate) livekit: Arc<LiveKitService>,
     pub(crate) limits: CallLimits,
 }
 pub struct CallGroupState {
     pub members: BTreeMap<u64, CallMember>,
     pub pending_invites: BTreeMap<u64, PendingCallInvite>,
     pub anonymous_joining: bool,
-    pub short_link: Option<String>,
-    pub ending: bool,
 }
 #[derive(Clone)]
 pub struct CallMember {
@@ -44,7 +42,7 @@ pub enum CallRole {
     Admin,
     Member,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CallSecretEnvelope {
     pub secret_id: String,
     pub version_number: i64,
@@ -121,18 +119,12 @@ fn now_ms() -> i64 {
 pub fn call_invite_secret_from_cv(cv: &CommunicationValue) -> Option<CallSecretEnvelope> {
     CallSecretEnvelope::from_data_value(cv.get_data(DataType::CallSecret)?)
 }
-#[derive(Serialize)]
-struct CallRoomMetadata {
-    owner_omikron_id: u64,
-    admins: Vec<u64>,
-    anonymous_joining: bool,
-}
 impl CallGroup {
     pub fn new_with_service(
         id: Uuid,
         owner: u64,
         creator: u64,
-        livekit: Arc<LiveKitService>,
+        _livekit: Arc<LiveKitService>,
         limits: CallLimits,
     ) -> Self {
         let mut members = BTreeMap::new();
@@ -156,10 +148,7 @@ impl CallGroup {
                 members,
                 pending_invites: BTreeMap::new(),
                 anonymous_joining: false,
-                short_link: None,
-                ending: false,
             }),
-            livekit,
             limits,
         }
     }
@@ -176,49 +165,17 @@ impl CallGroup {
     pub async fn member_ids(&self) -> Vec<u64> {
         self.state.read().await.members.keys().copied().collect()
     }
-    pub async fn get_caller(&self, id: u64) -> Option<Caller> {
-        let m = self.member(id).await?;
-        let caller = Caller::new(id, self.call_id, m.role == CallRole::Admin);
-        if let Some(until) = m.timeout_until_ms {
-            caller.set_timeout(until).await;
-        }
-        Some(caller)
-    }
-    pub async fn remove_caller(&self, id: u64) {
-        self.revoke(id).await;
-        if let Err(error) = self.livekit.remove_participant(self.call_id, id).await {
-            crate::log_event!(
-                0,
-                crate::util::logger::PrintType::Call,
-                crate::util::logger::LogLevel::Warn,
-                "call.participant_remove_failed",
-                "call_id={} user_id={} error={}",
-                self.call_id,
-                id,
-                error
-            );
-        }
-    }
     #[cfg(test)]
     pub async fn invite(&self, from: u64, to: u64) -> Result<(), CallServiceError> {
-        self.invite_with_storage(from, to, None).await
-    }
-    pub async fn invite_with_storage(
-        &self,
-        from: u64,
-        to: u64,
-        persistence: Option<&crate::calls::persistence::CallPersistence>,
-    ) -> Result<(), CallServiceError> {
         let mut state = self.state.write().await;
         let now = now_ms();
         state.pending_invites.retain(|_, invite| {
             invite.created_at_ms + self.limits.invite_ttl.as_millis() as i64 > now
         });
-        if state.ending
-            || !state
-                .members
-                .get(&from)
-                .is_some_and(|member| member.timeout_until_ms.is_none_or(|until| until <= now))
+        if !state
+            .members
+            .get(&from)
+            .is_some_and(|member| member.timeout_until_ms.is_none_or(|until| until <= now))
             || from == to
             || state.members.contains_key(&to)
         {
@@ -228,10 +185,6 @@ impl CallGroup {
             && state.pending_invites.len() >= self.limits.max_pending_invites_per_call
         {
             return Err(CallServiceError::ResourceLimit);
-        }
-        if let Some(db) = persistence {
-            db.store_invite(self.call_id, to, from, now)
-                .map_err(|_| CallServiceError::DeliveryFailed)?;
         }
         state.pending_invites.insert(
             to,
@@ -248,9 +201,6 @@ impl CallGroup {
         s.pending_invites.retain(|_, invite| {
             invite.created_at_ms + self.limits.invite_ttl.as_millis() as i64 > now_ms()
         });
-        if s.ending {
-            return Err(CallServiceError::InvalidRequest);
-        }
         if s.members.len() >= self.limits.max_members_per_call {
             return Err(CallServiceError::ResourceLimit);
         }
@@ -266,90 +216,12 @@ impl CallGroup {
         s.members.insert(id, m.clone());
         Ok(m)
     }
-    pub async fn revoke(&self, id: u64) -> Option<CallMember> {
-        self.state.write().await.members.remove(&id)
-    }
     pub async fn is_anonymous(&self) -> bool {
         self.state.read().await.anonymous_joining
     }
-    pub async fn update_metadata(&self) -> Result<(), CallError> {
-        let s = self.state.read().await;
-        let metadata = CallRoomMetadata {
-            owner_omikron_id: self.owner_omikron_id,
-            admins: s
-                .members
-                .values()
-                .filter(|m| m.role == CallRole::Admin)
-                .map(|m| m.user_id)
-                .collect(),
-            anonymous_joining: s.anonymous_joining,
-        };
-        let value =
-            serde_json::to_string(&metadata).map_err(|e| CallError::MetadataUpdateFailed {
-                call_id: self.call_id,
-                detail: e.to_string(),
-            })?;
-        drop(s);
-        self.livekit.set_room_metadata(self.call_id, value).await
-    }
-    pub async fn set_anonymous_joining(
-        &self,
-        enable: bool,
-        omega: &OmegaConnection,
-        persistence: Option<&crate::calls::persistence::CallPersistence>,
-    ) -> Result<Option<String>, CallServiceError> {
-        // Link lookup is cancellable preparation, before any local mutation.
-        let mut prepared_link = self.state.read().await.short_link.clone();
-        if enable && prepared_link.is_none() {
-            let link = format!(
-                "https://app.tensamin.net/call/anonymous?call_id={}&omikron_id={}",
-                self.call_id, self.owner_omikron_id
-            );
-            if let Ok(r) = omega
-                .await_response(
-                    &CommunicationValue::new(CommunicationType::ShortenLink)
-                        .add_typed_default(DataType::Link, DataValue::Str(link)),
-                    Some(Duration::from_secs(20)),
-                )
-                .await
-                && let Some(link) = r.get_data(DataType::Link).as_str()
-            {
-                let link = link.to_string();
-                prepared_link = Some(link);
-            }
-        }
-        let result = {
-            let mut state = self.state.write().await;
-            if state.ending {
-                return Err(CallServiceError::NotFound);
-            }
-            let link = state.short_link.clone().or(prepared_link);
-            if let Some(db) = persistence {
-                db.set_anonymous(self.call_id, enable, link.as_deref())
-                    .map_err(|_| CallServiceError::DeliveryFailed)?;
-            }
-            state.anonymous_joining = enable;
-            state.short_link = link.clone();
-            enable.then_some(link).flatten()
-        };
-        if let Err(error) = self.update_metadata().await {
-            crate::log_err!(
-                0,
-                crate::util::logger::PrintType::Call,
-                "Call metadata delivery failed after settings commit: {}",
-                error
-            );
-        }
-        Ok(result)
-    }
-    pub async fn create_anonymous_token(&self, user: u64) -> Result<Option<String>, CallError> {
-        if self.is_anonymous().await {
-            self.livekit
-                .create_token(user, self.call_id, false)
-                .map(Some)
-        } else {
-            Ok(None)
-        }
+    pub async fn create_anonymous_token(&self, _user: u64) -> Result<Option<String>, CallError> {
+        // Legacy random numeric guest IDs are not authenticated call principals.
+        Ok(None)
     }
 }
 
@@ -364,6 +236,7 @@ mod tests {
             max_pending_invites_per_call: 1,
             max_calls_per_user: 1,
             invite_ttl: Duration::from_secs(60),
+            ..CallLimits::default()
         };
         let group = CallGroup::new_with_service(
             Uuid::new_v4(),

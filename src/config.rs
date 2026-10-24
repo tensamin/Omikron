@@ -35,6 +35,9 @@ pub struct CallLimits {
     pub max_pending_invites_per_call: usize,
     pub max_calls_per_user: usize,
     pub invite_ttl: Duration,
+    pub reservation_ttl: Duration,
+    pub empty_grace: Duration,
+    pub max_call_age: Duration,
 }
 
 impl Default for CallLimits {
@@ -44,6 +47,9 @@ impl Default for CallLimits {
             max_pending_invites_per_call: 64,
             max_calls_per_user: 16,
             invite_ttl: Duration::from_secs(3 * 24 * 60 * 60),
+            reservation_ttl: Duration::from_secs(30),
+            empty_grace: Duration::from_secs(5 * 60),
+            max_call_age: Duration::from_secs(3 * 24 * 60 * 60),
         }
     }
 }
@@ -208,6 +214,18 @@ impl Config {
                 max_calls_per_user: parse_positive_or_default("CALL_MAX_CALLS_PER_USER", 16)?,
                 invite_ttl: Duration::from_secs(parse_positive_or_default(
                     "CALL_INVITE_TTL_SECONDS",
+                    3 * 24 * 60 * 60,
+                )?),
+                reservation_ttl: Duration::from_secs(parse_positive_or_default(
+                    "CALL_RESERVATION_TTL_SECONDS",
+                    30,
+                )?),
+                empty_grace: Duration::from_secs(parse_positive_or_default(
+                    "CALL_EMPTY_GRACE_SECONDS",
+                    5 * 60,
+                )?),
+                max_call_age: Duration::from_secs(parse_positive_or_default(
+                    "CALL_MAX_AGE_SECONDS",
                     3 * 24 * 60 * 60,
                 )?),
             },

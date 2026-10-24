@@ -79,7 +79,9 @@ pub async fn guest(role: &str) -> (MTPWebServer, mtp::client::MTPConnection, Web
     let config = ClientConfig::new(format!("https://127.0.0.1:{}/", host.local_addr().port()))
         .with_pinned_pem(cert)
         .with_description(role)
-        .with_policy(rho_policy());
+        // Legacy native clients finish their opening stream after each message.
+        // Rho's outbound persistent stream independently orders its responses.
+        .with_policy(rho_policy().with_send_mode(mtp::host::SendMode::SingleStreamPerMessage));
     let (client, accepted) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(MTPClient::connect(config), host.accept())
     })
@@ -127,7 +129,7 @@ pub async fn authenticated(
         .with_pinned_pem(cert)
         .with_description(role)
         .with_client_id(42)
-        .with_policy(rho_policy());
+        .with_policy(rho_policy().with_send_mode(mtp::host::SendMode::SingleStreamPerMessage));
     let (client, accepted) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
             MTPClient::auth_connect(config, &client_keys, &host_public),

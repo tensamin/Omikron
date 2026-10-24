@@ -1,5 +1,22 @@
 use super::*;
 
+fn legacy_call_result(
+    message_id: u32,
+    result: &tau::calls::CallCommandResult,
+) -> CommunicationValue {
+    let status = match result.status {
+        tau::calls::EnforcementStatus::Applied => "applied",
+        tau::calls::EnforcementStatus::PendingEnforcement => "pending_enforcement",
+    };
+    CommunicationValue::new(CommunicationType::Success)
+        .with_id(message_id)
+        .add_typed_default(
+            DataType::VersionNumber,
+            DataValue::UnsignedNumber(result.revision.into()),
+        )
+        .add_typed_default(DataType::Description, DataValue::Str(status.into()))
+}
+
 pub(super) fn call_error_type(error: &CallServiceError) -> CommunicationType {
     match error {
         CallServiceError::NotFound => CommunicationType::ErrorNotFound,
@@ -7,7 +24,9 @@ pub(super) fn call_error_type(error: &CallServiceError) -> CommunicationType {
             CommunicationType::ErrorNotAuthenticated
         }
         CallServiceError::InvalidUser => CommunicationType::ErrorInvalidUserId,
-        CallServiceError::InvalidRequest => CommunicationType::ErrorInvalidData,
+        CallServiceError::InvalidRequest
+        | CallServiceError::InvalidMigration { .. }
+        | CallServiceError::AuthorityMappingChanged { .. } => CommunicationType::ErrorInvalidData,
         CallServiceError::ResourceLimit => CommunicationType::ErrorInternal,
         CallServiceError::DeliveryFailed => CommunicationType::ErrorNotFound,
         CallServiceError::LiveKit(_) => CommunicationType::ErrorInternal,
@@ -15,6 +34,277 @@ pub(super) fn call_error_type(error: &CallServiceError) -> CommunicationType {
 }
 
 impl ClientConnection {
+    pub(super) async fn handle_call_epoch(self: Arc<Self>, cv: CommunicationValue) {
+        use tau::calls::*;
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
+        let Some(operation) = cv.get_comm_type_enum() else {
+            return;
+        };
+        let outcome: Result<serde_json::Value, CallError> = async {
+            let bytes = cv
+                .get_data(DataType::CallPayload)
+                .and_then(|value| value.as_bytes())
+                .ok_or(CallError::InvalidRequest)?;
+            if bytes.len() > MAX_CALL_COMMAND_BYTES {
+                return Err(CallError::InvalidRequest);
+            }
+            let manager = &self.state.call_manager;
+            let repository = manager
+                .repository
+                .as_ref()
+                .ok_or(CallError::StorageUnavailable)?;
+            if operation == CommunicationType::CallKeyEnvelopeStage {
+                // The repository parses the strict Iota Stage schema, verifies the
+                // proposer and current recipient set, and durably records ciphertext.
+                #[derive(serde::Deserialize)]
+                struct StageHeader {
+                    call_id: CallId,
+                }
+                let header: StageHeader =
+                    serde_json::from_slice(&bytes).map_err(|_| CallError::InvalidRequest)?;
+                if header.call_id != manager.call_id(header.call_id.id)? {
+                    return Err(CallError::NotFound);
+                }
+                repository
+                    .stage_epoch_envelope(header.call_id, manager.actor(self.user_id)?, bytes)
+                    .await?;
+                return Ok(serde_json::json!({ "state": "staged" }));
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Request {
+                version: u16,
+                call: CallId,
+                epoch: u64,
+                generation: Option<u64>,
+            }
+            let request: Request =
+                serde_json::from_slice(&bytes).map_err(|_| CallError::InvalidRequest)?;
+            if request.version != CALL_PROTOCOL_VERSION {
+                return Err(CallError::UnsupportedVersion);
+            }
+            manager.snapshot(self.user_id, request.call.clone()).await?;
+            if operation == CommunicationType::CallKeyEnvelopeActivate {
+                repository
+                    .commit_epoch(
+                        request.call,
+                        manager.actor(self.user_id)?,
+                        request.epoch,
+                        request.generation.ok_or(CallError::InvalidRequest)?,
+                    )
+                    .await?;
+                return Ok(serde_json::json!({ "state": "available", "installed": false }));
+            }
+            if request.epoch == 0 {
+                return Err(CallError::KeyEpochPending);
+            }
+            let recipient = manager.principal(self.user_id)?;
+            repository
+                .read(request.call.clone())
+                .await?
+                .authorize_envelope_read(&recipient, request.epoch, SystemCallClock.now_ms()?)?;
+            let payload = serde_json::to_vec(&serde_json::json!({ "call_id": request.call,
+                "recipient": recipient, "epoch": request.epoch }))
+            .map_err(|_| CallError::InvalidRequest)?;
+            let rho = self
+                .get_rho_connection()
+                .await
+                .ok_or(CallError::StorageUnavailable)?;
+            let response = rho
+                .get_iota_connection()
+                .clone()
+                .await_response(
+                    &CommunicationValue::new(CommunicationType::CallKeyEnvelopeGet)
+                        .with_id(next_policy_request_id())
+                        .add_typed_default(DataType::CallPayload, DataValue::Bytes(payload)),
+                    Some(Duration::from_secs(20)),
+                )
+                .await
+                .map_err(|_| CallError::StorageUnavailable)?;
+            if !response.is_type(CommunicationType::CallKeyEnvelopeGet) {
+                return Err(CallError::KeyEpochPending);
+            }
+            // Recheck after the remote read so revocation cannot expose a cached envelope.
+            repository
+                .read(request.call)
+                .await?
+                .authorize_envelope_read(&recipient, request.epoch, SystemCallClock.now_ms()?)?;
+            let payload = response
+                .get_data(DataType::CallPayload)
+                .and_then(|value| value.as_bytes())
+                .ok_or(CallError::InvalidRequest)?;
+            serde_json::from_slice(&payload).map_err(|_| CallError::InvalidRequest)
+        }
+        .await;
+        let payload = match outcome {
+            Ok(result) => serde_json::json!({ "version": CALL_PROTOCOL_VERSION, "result": result }),
+            Err(error) => serde_json::json!({ "version": CALL_PROTOCOL_VERSION, "error": error }),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&payload) {
+            self.send_message(
+                &CommunicationValue::new(operation)
+                    .with_id(message_id)
+                    .add_typed_default(DataType::CallPayload, DataValue::Bytes(bytes)),
+            )
+            .await;
+        }
+    }
+
+    /// CallPayload never supplies the account actor. The authenticated session does.
+    pub(super) async fn handle_managed_call(self: Arc<Self>, cv: CommunicationValue) {
+        use tau::calls::*;
+        let Ok(message_id) = cv.require_id() else {
+            return;
+        };
+        let operation = cv.get_comm_type_enum();
+        let reply_type = match operation {
+            Some(CommunicationType::CallCommand) => CommunicationType::CallCommandResult,
+            Some(CommunicationType::CallSnapshotGet) => CommunicationType::CallSnapshot,
+            _ => CommunicationType::CallJoinGrant,
+        };
+        let result: Result<serde_json::Value, CallError> = async {
+            let bytes = cv
+                .get_data(DataType::CallPayload)
+                .and_then(|v| v.as_bytes())
+                .ok_or(CallError::InvalidRequest)?;
+            if bytes.len() > MAX_CALL_COMMAND_BYTES {
+                return Err(CallError::InvalidRequest);
+            }
+            if operation == Some(CommunicationType::CallCommand) {
+                let request = decode_call_command(&bytes)?;
+                let manager = &self.state.call_manager;
+                if request.call != manager.call_id(request.call.id)? {
+                    return Err(CallError::NotFound);
+                }
+                if let Some(result) = manager
+                    .repository
+                    .as_ref()
+                    .ok_or(CallError::StorageUnavailable)?
+                    .replay(manager.actor(self.user_id)?, request.clone())
+                    .await?
+                {
+                    return serde_json::to_value(result).map_err(|_| CallError::StorageUnavailable);
+                }
+                if let CallCommand::Invite { target } = &request.command {
+                    self.check_managed_invitation(target).await?;
+                }
+                let result = self
+                    .state
+                    .call_manager
+                    .execute(self.user_id, request)
+                    .await?;
+                serde_json::to_value(result).map_err(|_| CallError::StorageUnavailable)
+            } else {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Lookup {
+                    version: u16,
+                    call: CallId,
+                }
+                let request: Lookup =
+                    serde_json::from_slice(&bytes).map_err(|_| CallError::InvalidRequest)?;
+                if request.version != CALL_PROTOCOL_VERSION {
+                    return Err(CallError::UnsupportedVersion);
+                }
+                if operation == Some(CommunicationType::CallSnapshotGet) {
+                    let snapshot = self
+                        .state
+                        .call_manager
+                        .snapshot(self.user_id, request.call)
+                        .await?;
+                    serde_json::to_value(snapshot).map_err(|_| CallError::StorageUnavailable)
+                } else {
+                    let grant = self
+                        .state
+                        .call_manager
+                        .authorize_join(self.user_id, JoinRequest { call: request.call })
+                        .await?;
+                    serde_json::to_value(grant).map_err(|_| CallError::StorageUnavailable)
+                }
+            }
+        }
+        .await;
+        let payload = match result {
+            Ok(result) => serde_json::json!({ "version": CALL_PROTOCOL_VERSION, "result": result }),
+            Err(error) => serde_json::json!({ "version": CALL_PROTOCOL_VERSION, "error": error }),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&payload) {
+            self.send_message(
+                &CommunicationValue::new(reply_type)
+                    .with_id(message_id)
+                    .add_typed_default(DataType::CallPayload, DataValue::Bytes(bytes)),
+            )
+            .await;
+        }
+    }
+
+    async fn check_managed_invitation(
+        &self,
+        target: &tau::calls::CallPrincipal,
+    ) -> Result<(), tau::calls::CallError> {
+        use tau::calls::CallError;
+        if *target != self.state.call_manager.principal(target.user_id)? {
+            return Err(CallError::NotAuthorized);
+        }
+        let sender = self
+            .state
+            .rho
+            .get_for_user(self.user_id as i64)
+            .await
+            .ok_or(CallError::StorageUnavailable)?;
+        let recipient = self
+            .state
+            .rho
+            .get_for_user(target.user_id as i64)
+            .await
+            .ok_or(CallError::NotFound)?;
+        let request = CommunicationValue::new(CommunicationType::CallContactCheck)
+            .with_id(next_policy_request_id())
+            .add_typed_default(
+                DataType::SenderId,
+                DataValue::SignedNumber(self.user_id.into()),
+            )
+            .add_typed_default(
+                DataType::ReceiverId,
+                DataValue::SignedNumber(target.user_id.into()),
+            );
+        let response = sender
+            .get_iota_connection()
+            .clone()
+            .await_response(&request, Some(Duration::from_secs(20)))
+            .await
+            .map_err(|_| CallError::StorageUnavailable)?;
+        if !response.is_type(CommunicationType::CallContactCheck)
+            || response.get_data(DataType::IsBlocked).as_bool() != Some(true)
+        {
+            return Err(CallError::NotFound);
+        }
+        let request = CommunicationValue::new(CommunicationType::UserBlockCheck)
+            .with_id(next_policy_request_id())
+            .add_typed_default(
+                DataType::SenderId,
+                DataValue::SignedNumber(self.user_id.into()),
+            )
+            .add_typed_default(
+                DataType::ReceiverId,
+                DataValue::SignedNumber(target.user_id.into()),
+            );
+        let response = recipient
+            .get_iota_connection()
+            .clone()
+            .await_response(&request, Some(Duration::from_secs(20)))
+            .await
+            .map_err(|_| CallError::StorageUnavailable)?;
+        if !response.is_type(CommunicationType::UserBlockCheck)
+            || response.get_data(DataType::IsBlocked).as_bool() != Some(false)
+        {
+            return Err(CallError::NotAuthorized);
+        }
+        Ok(())
+    }
+
     /// Handle call invite
     pub(super) async fn handle_call_activate(self: Arc<Self>, cv: CommunicationValue) {
         let Ok(message_id) = cv.require_id() else {
@@ -113,6 +403,17 @@ impl ClientConnection {
         created_at: i64,
         secret: &crate::calls::call_group::CallSecretEnvelope,
     ) -> Result<(), ()> {
+        let manager = &self.state.call_manager;
+        let repository = manager.repository.as_ref().ok_or(())?;
+        repository
+            .stage_legacy_envelope(
+                manager.call_id(id).map_err(|_| ())?,
+                manager.principal(recipient).map_err(|_| ())?,
+                manager.principal(inviter).map_err(|_| ())?,
+                serde_json::to_vec(secret).map_err(|_| ())?,
+            )
+            .await
+            .map_err(|_| ())?;
         let rho = self
             .state
             .rho
@@ -154,6 +455,17 @@ impl ClientConnection {
         recipient: u64,
         id: Uuid,
     ) -> Result<crate::calls::call_group::CallSecretEnvelope, ()> {
+        use tau::calls::{CallClock, CallRepository, SystemCallClock};
+        let manager = &self.state.call_manager;
+        let repository = manager.repository.as_ref().ok_or(())?;
+        let call = manager.call_id(id).map_err(|_| ())?;
+        let principal = manager.principal(recipient).map_err(|_| ())?;
+        repository
+            .read(call.clone())
+            .await
+            .map_err(|_| ())?
+            .authorize_envelope_read(&principal, 0, SystemCallClock.now_ms().map_err(|_| ())?)
+            .map_err(|_| ())?;
         let rho = self
             .state
             .rho
@@ -178,6 +490,12 @@ impl ClientConnection {
         if !response.is_type(CommunicationType::CallEnvelopeGet) {
             return Err(());
         }
+        repository
+            .read(call)
+            .await
+            .map_err(|_| ())?
+            .authorize_envelope_read(&principal, 0, SystemCallClock.now_ms().map_err(|_| ())?)
+            .map_err(|_| ())?;
         crate::calls::call_group::CallSecretEnvelope::from_data_value(
             response.get_data(DataType::CallSecret).ok_or(())?,
         )
@@ -350,6 +668,23 @@ impl ClientConnection {
                         .await;
                     return;
                 }
+                let manager = &self.state.call_manager;
+                let ready = async {
+                    let repository = manager
+                        .repository
+                        .as_ref()
+                        .ok_or(tau::calls::CallError::StorageUnavailable)?;
+                    let call = manager.call_id(call_id)?;
+                    repository
+                        .invitation_ready(call, manager.principal(receiver_id as u64)?, 0)
+                        .await
+                }
+                .await;
+                if ready.is_err() {
+                    self.send_error_response(message_id, CommunicationType::ErrorInternal)
+                        .await;
+                    return;
+                }
                 secret
             }
             relation => {
@@ -414,7 +749,16 @@ impl ClientConnection {
         self.clone().send_message(&response).await;
 
         // The invitation is durable. A stalled client must not delay the sender's acknowledgement.
+        let manager = self.state.call_manager.clone();
         if let Err(error) = self.tasks.spawn_cancellable(async move {
+            let Ok(id) = manager.call_id(call_id) else {
+                return;
+            };
+            if !matches!(manager.snapshot(receiver_id.unsigned_abs(), id).await,
+                Ok(snapshot) if snapshot.lifecycle == tau::calls::CallLifecycle::Active)
+            {
+                return;
+            }
             match tokio::time::timeout(
                 Duration::from_secs(8),
                 target_rho.send_to_local_user(receiver_id.unsigned_abs(), &forward),
@@ -680,11 +1024,9 @@ impl ClientConnection {
             .timeout_user(call_id, self.user_id, user_id.unsigned_abs(), untill)
             .await
         {
-            Ok(()) => {
-                self.send_message(
-                    &CommunicationValue::new(CommunicationType::Success).with_id(message_id),
-                )
-                .await
+            Ok(result) => {
+                self.send_message(&legacy_call_result(message_id, &result))
+                    .await
             }
             Err(error) => {
                 self.send_error_response(message_id, call_error_type(&error))
@@ -707,49 +1049,19 @@ impl ClientConnection {
                 .await;
             return;
         };
-        let previous = self.state.call_manager.get_call(call_id).await;
         match self
             .state
             .call_manager
             .disconnect_user(call_id, self.user_id, user_id.unsigned_abs())
             .await
         {
-            Ok(()) => {
-                if self.state.call_manager.get_call(call_id).await.is_none() {
-                    self.notify_call_ended(call_id, previous).await;
-                }
-                self.send_message(
-                    &CommunicationValue::new(CommunicationType::Success).with_id(message_id),
-                )
-                .await
+            Ok(result) => {
+                self.send_message(&legacy_call_result(message_id, &result))
+                    .await
             }
             Err(error) => {
                 self.send_error_response(message_id, call_error_type(&error))
                     .await
-            }
-        }
-    }
-    pub(super) async fn notify_call_ended(
-        &self,
-        id: Uuid,
-        group: Option<Arc<crate::calls::call_group::CallGroup>>,
-    ) {
-        let Some(group) = group else {
-            return;
-        };
-        let state = group.state.read().await;
-        let users = state
-            .members
-            .keys()
-            .chain(state.pending_invites.keys())
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        for user in users {
-            if let Some(rho) = self.state.rho.get_for_user(user as i64).await {
-                let event = CommunicationValue::new(CommunicationType::CallEnded)
-                    .with_receiver(user)
-                    .add_typed_default(DataType::CallId, DataValue::Str(id.to_string()));
-                let _ = rho.send_to_local_user(user, &event).await;
             }
         }
     }
@@ -765,26 +1077,10 @@ impl ClientConnection {
         };
         let enable = cv.get_data(DataType::Enabled).as_bool().unwrap_or(true);
 
-        let Some(call) = self.state.call_manager.get_call(call_id).await else {
-            self.send_error_response(message_id, CommunicationType::ErrorNotFound)
-                .await;
-            return;
-        };
-        if call.member(self.user_id).await.is_none()
-            || call
-                .member(self.user_id)
-                .await
-                .map(|member| member.role == crate::calls::call_group::CallRole::Admin)
-                != Some(true)
-        {
-            self.send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
-                .await;
-            return;
-        }
         match self
             .state
             .call_manager
-            .set_anonymous_joining(call_id, enable, &self.state.omega)
+            .set_anonymous_joining(call_id, self.user_id, enable, &self.state.omega)
             .await
         {
             Ok(link) => {
@@ -822,19 +1118,15 @@ impl ClientConnection {
                 .await;
             return;
         };
-        let previous = self.state.call_manager.get_call(call_id).await;
         match self
             .state
             .call_manager
             .end_call(call_id, self.user_id)
             .await
         {
-            Ok(()) => {
-                self.notify_call_ended(call_id, previous).await;
-                self.send_message(
-                    &CommunicationValue::new(CommunicationType::Success).with_id(message_id),
-                )
-                .await
+            Ok(result) => {
+                self.send_message(&legacy_call_result(message_id, &result))
+                    .await
             }
             Err(error) => {
                 self.send_error_response(message_id, call_error_type(&error))
