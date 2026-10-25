@@ -59,27 +59,6 @@ acquisition. Semaphore slots only limit concurrency. External notifications have
 25-second budget; mandatory local invalidation is outside that deadline. The listener tracks
 connection tasks, signals shutdown after stopping acceptance, and awaits cleanup.
 
-The total Ctrl-C shutdown budget is `MESSAGE_DRAIN_SECONDS` plus
-`CLEANUP_TIMEOUT_SECONDS`, 27 seconds by default. It covers listener shutdown,
-connection handlers and process-supervised work. `OperationDrainReport` reports
-completed and pending supervisor ownership groups, task failure count, deadline
-status and unresolved remote intents. Completed groups and failures count from
-process start. `WAIT_ON_INCOMPLETE_SHUTDOWN=false` is the default termination policy.
-At the shared deadline Omikron reports incomplete work and exits with an error.
-This relies on the cancellation outcomes below: durable local commit/publication
-has no await, remote authoritative mutations have write-ahead evidence, and
-remaining awaits are preparation, process-local state or postcommit delivery.
-Uncertain remote outcomes never produce a successful shutdown. An operator may
-set `WAIT_ON_INCOMPLETE_SHUTDOWN=true` to retain the runtime until admitted work
-and mandatory local cleanup finish after the initial bounded report. That opt-in
-policy can wait indefinitely for a blocked operation.
-
-Call garbage collection stops admitting cycles at shutdown and supervises an
-active cycle through completion. Durable call removal and registry removal happen
-together before best-effort notifications. Incoming Omega ownership updates also
-stop admission at shutdown; already-admitted updates retain process ownership.
-Omega response handling stays available to outstanding requests during drain.
-
 Omega registration, invitation redemption and account/credential mutation requests,
 non-read-only Iota forwards and LiveKit mutations write an intent to
 `omega-mutations.sqlite3` before sending. Set
@@ -158,33 +137,6 @@ Cancellation behavior follows the operation:
   the incomplete shutdown report. These registries are process-local and disappear
   on process exit; Omega presence is corrected by the next startup snapshot.
 
-Rho binding, membership replacement, revocation, reconnect handoff and registration
-use one routing mutation boundary. Handoff and invalidation acquire client-local
-locks before changing indices or permissions. Removed memberships cannot retain a
-cached forwarding route, and stale client cleanup cannot remove a replacement's
-presence state. Network notifications run after those local mutations.
-
-Routing authorization reads one immutable snapshot of current Iota connections,
-user assignments, membership and canonical node bindings. Assignment publication
-locks only affected owners and clients in deterministic order. Registration also
-rechecks its prepared snapshot generation under the routing mutation guard.
-
-Relay accepts V2 only. The MTP communication type remains `Relay`, with
-`VersionNumber = 2` and the original JSON envelope in `SecurePayload`. Its JSON
-`version` must be 2 and `destination` must be a canonical `iota:v1:<64hex>` node.
-There is no outer sender. Outer receiver IDs do not authorize routing. Node
-bindings derive from the authenticated Iota transport's verified public key,
-using SHA256 of the serialized public key bundle. Unsigned numeric principals
-cannot create bindings, and ambiguous key bindings fail closed. Omikron reads
-only envelope version and destination, then forwards the unchanged envelope.
-The destination Iota verifies signatures and application authority. Cross-Omikron
-delivery requires the same canonical V2 routing support in Omega.
-
-Call activation and call settings publish persistence and local state together.
-Link lookup and LiveKit preparation happen before the local commit. Room metadata
-delivery is best effort after commit, so a cancelled reply cannot undo a persisted
-call or leave it missing from the in-memory registry.
-
 A verified invitation activation updates the Tau application authentication
 context on the existing connection only when its current Rho route and fresh
 client attachment are available. It preserves the MTP sender and receiver,
@@ -202,38 +154,3 @@ Successful activation consumes the challenge and pending state before sending
 success, then awaits `ClientConnection::run()` on the original transport.
 Duplicate activation is rejected by the client handler. Failed success delivery
 closes the transport and runs client cleanup without publishing an online notification.
-
-## Integration checks
-
-Run these commands in Omikron, and separately in Tau:
-
-```sh
-cargo fmt --all -- --check
-cargo check --all-targets
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
-```
-
-Use the Nix development shell. If the private type-map SSH input is unavailable
-but its checkout exists locally, a local validation command is:
-
-```sh
-nix develop --override-input type-maps path:./mtp-type-maps --no-write-lock-file --command cargo test --all-targets
-```
-
-The registration protocol test uses a real MTP guest transport and scripted Omega
-responses. The focused activation test also retains directly prepared pending
-state. Tests cover proof failure, unavailable routes, attachment and transition
-failure, duplicate activation, disconnect during lookup and before success,
-handler continuity, permit retention, bounded drain and stale registry cleanup.
-
-Normal builds consume Tau from `https://git.methanium.net/tensamin/tau`, pinned
-to `e170e5c30db992b938d797051317477bb56393df`. Tau and Omikron share the same
-MTP source and revision. For coordinated local development, use a Cargo override:
-
-```sh
-cargo --config "patch.'https://git.methanium.net/tensamin/tau'.tau.path='../tau'" check
-```
-
-The override changes dependency resolution in `Cargo.lock`. Run a normal build
-after removing the override to restore the published dependency before review.

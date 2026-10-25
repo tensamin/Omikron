@@ -62,6 +62,7 @@ pub struct OfflineAuthPolicy {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {
+    pub password_upstream_timeout: Duration,
     pub message_drain: Duration,
     pub cleanup_timeout: Duration,
     pub wait_on_incomplete_shutdown: bool,
@@ -178,6 +179,17 @@ impl Config {
         }
 
         Ok(Self {
+            password_upstream_timeout: {
+                let seconds =
+                    parse_positive_or_default("PASSWORD_UPSTREAM_TIMEOUT_SECONDS", 18_u64)?;
+                if seconds > 20 {
+                    return Err(ConfigError::InvalidValue {
+                        name: "PASSWORD_UPSTREAM_TIMEOUT_SECONDS",
+                        kind: "integer between 1 and 20",
+                    });
+                }
+                Duration::from_secs(seconds)
+            },
             message_drain: Duration::from_secs(parse_positive_or_default(
                 "MESSAGE_DRAIN_SECONDS",
                 2,

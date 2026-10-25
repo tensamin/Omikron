@@ -139,6 +139,15 @@ pub struct ProvisioningConnection {
 
 impl ProvisioningConnection {
     async fn terminate_forward(&self, id: Uuid, reason: ProvisioningFailure) {
+        if let Ok(session) = self
+            .general
+            .state
+            .provisioning
+            .snapshot(id, self.general.id())
+            && session.method == ProvisioningMethod::Password
+        {
+            self.abort_password(&session).await;
+        }
         let Ok(terminated) =
             self.general
                 .state
@@ -231,6 +240,7 @@ impl ProvisioningConnection {
             self.general.shutdown.subscribe(),
             self.general.state.config.message_drain,
         );
+        let mut rejected_requests = 0;
         while let Some(Ok(request)) = tasks
             .while_connected(&self.receiver, self.receiver.receive())
             .await
@@ -255,11 +265,15 @@ impl ProvisioningConnection {
                 CommunicationType::ErrorInvalidData
             };
             if !Self::valid_fields(&request) {
+                rejected_requests += 1;
                 let _ = bounded_send(
                     &self.sender,
                     &CommunicationValue::new(error_kind).with_id(id),
                 )
                 .await;
+                if rejected_requests >= 8 {
+                    break;
+                }
                 continue;
             }
             // Binding and upstream credential operations are not disposable.
@@ -312,6 +326,7 @@ impl ProvisioningConnection {
                 }
                 Ok(()) => {}
                 Err(ProvisioningOperationError::Replyable(message)) => {
+                    rejected_requests += 1;
                     crate::log_err!(
                         self.general.id() as i64,
                         crate::util::logger::PrintType::Client,
@@ -320,6 +335,9 @@ impl ProvisioningConnection {
                     );
                     let error = CommunicationValue::new(error_kind).with_id(id);
                     let _ = bounded_send(&self.sender, &error).await;
+                    if rejected_requests >= 8 {
+                        break;
+                    }
                 }
                 Err(ProvisioningOperationError::NoFurtherReply(message)) => {
                     crate::log_err!(

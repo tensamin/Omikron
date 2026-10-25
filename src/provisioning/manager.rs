@@ -15,6 +15,7 @@ struct Sessions {
 }
 
 pub struct ProvisioningManager {
+    pub password_admission: super::password_admission::PasswordAdmission,
     sessions: Mutex<Sessions>,
     ttl: Duration,
     max_sessions: usize,
@@ -60,6 +61,7 @@ impl ProvisioningManager {
 
     pub fn new(ttl: Duration, max_sessions: usize) -> Self {
         Self {
+            password_admission: super::password_admission::PasswordAdmission::default(),
             sessions: Mutex::new(Sessions::default()),
             ttl,
             max_sessions,

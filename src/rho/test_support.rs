@@ -15,6 +15,7 @@ use std::{sync::Arc, time::Duration};
 
 pub fn state() -> Arc<AppState> {
     let config = Config {
+        password_upstream_timeout: Duration::from_secs(18),
         message_drain: Duration::from_secs(2),
         cleanup_timeout: Duration::from_secs(25),
         wait_on_incomplete_shutdown: false,

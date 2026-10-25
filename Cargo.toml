@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tau = { git = "https://github.com/tensamin/Tau.git", rev = "f1cfbb8477abc037fd262a60dc6be2cb35623340" }
+tau = { path = "../tau" }
+iota-opaque = { path = "../iota/iota-opaque" }
 libc = "0.2"
 mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584", features = [
     "web-server",
@@ -40,8 +41,8 @@ thiserror = "2.0.19"
 trust-dns-resolver = "0.23.2"
 serde_json = "1.0.151"
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]
 rcgen = "0.14"
-sha2 = "0.10"

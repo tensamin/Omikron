@@ -1,6 +1,23 @@
 use super::*;
 
 impl ProvisioningConnection {
+    pub(super) async fn abort_password(&self, session: &ProvisioningSession) {
+        let request = CommunicationValue::new(CommunicationType::ProvisioningCancel)
+            .with_id(rand::random::<u32>().max(1));
+        let Ok(message) = build_password_iota_request(&request, session, Vec::new()) else {
+            return;
+        };
+        let Some(account) = &session.account else {
+            return;
+        };
+        if let Some(rho) = self.general.state.rho.get_by_iota(account.iota_id).await {
+            let _ = rho
+                .get_iota_connection()
+                .clone()
+                .await_response(&message, Some(Duration::from_secs(2)))
+                .await;
+        }
+    }
     pub(super) async fn password_start(
         &self,
         request: &CommunicationValue,
@@ -10,7 +27,10 @@ impl ProvisioningConnection {
             .get_data(DataType::OpaqueMessage)
             .and_then(DataValue::as_bytes)
             .ok_or("missing KE1")?;
-        if ke1.is_empty() || ke1.len() > 16 * 1024 {
+        if ke1.is_empty()
+            || ke1.len() > 16 * 1024
+            || iota_opaque::opaque::validate_login_request(&ke1).is_err()
+        {
             return Err("invalid KE1");
         }
         let session = self
@@ -18,6 +38,24 @@ impl ProvisioningConnection {
             .state
             .provisioning
             .password_start(id, self.general.id())?;
+        let account = session.account.as_ref().ok_or("account not bound")?;
+        let source = tau::ConnectionFacts::from_mtp(&self.general.mtp_connection)
+            .remote_addr
+            .map(|address| address.ip());
+        let _admission = match self
+            .general
+            .state
+            .provisioning
+            .password_admission
+            .enter(account.user_id, source)
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.terminate_forward(id, ProvisioningFailure::UpstreamUnavailable)
+                    .await;
+                return Err(error);
+            }
+        };
         let response = match self.password_forward(request, &session, ke1).await {
             Ok(response) => response,
             Err(error) => {
@@ -40,7 +78,11 @@ impl ProvisioningConnection {
                 .await;
             return Err("invalid Iota KE2");
         }
-        if bounded_send(&self.sender, &response).await.is_err() {
+        if self
+            .password_delivery(&response, "KE2 delivery")
+            .await
+            .is_err()
+        {
             self.terminate_forward(id, ProvisioningFailure::DeliveryFailed)
                 .await;
             return Err("send failed");
@@ -57,7 +99,10 @@ impl ProvisioningConnection {
             .get_data(DataType::OpaqueMessage)
             .and_then(DataValue::as_bytes)
             .ok_or("missing KE3")?;
-        if ke3.is_empty() || ke3.len() > 16 * 1024 {
+        if ke3.is_empty()
+            || ke3.len() > 16 * 1024
+            || iota_opaque::opaque::validate_login_finalization(&ke3).is_err()
+        {
             return Err("invalid KE3");
         }
         let session = self
@@ -65,6 +110,14 @@ impl ProvisioningConnection {
             .state
             .provisioning
             .password_finish(id, self.general.id())?;
+        let _admission = match self.general.state.provisioning.password_admission.pending() {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.terminate_forward(id, ProvisioningFailure::UpstreamUnavailable)
+                    .await;
+                return Err(error);
+            }
+        };
         let response = match self.password_forward(request, &session, ke3).await {
             Ok(response) => response,
             Err(error) => {
@@ -86,7 +139,11 @@ impl ProvisioningConnection {
             .provisioning
             .password_delivered(id, self.general.id())
             .map_err(|_| "session expired")?;
-        if bounded_send(&self.sender, &response).await.is_err() {
+        if self
+            .password_delivery(&response, "credential delivery")
+            .await
+            .is_err()
+        {
             self.terminate_forward(id, ProvisioningFailure::DeliveryFailed)
                 .await;
             return Err("send failed");
@@ -109,11 +166,44 @@ impl ProvisioningConnection {
             .await
             .ok_or("Iota unavailable")?;
         let message = build_password_iota_request(request, session, opaque)?;
-        rho.get_iota_connection()
+        let started = std::time::Instant::now();
+        let response = rho
+            .get_iota_connection()
             .clone()
-            .await_response(&message, Some(Duration::from_secs(30)))
+            .await_response(
+                &message,
+                Some(self.general.state.config.password_upstream_timeout),
+            )
             .await
-            .map_err(|_| "Iota request failed")
+            .map_err(|_| "Iota request failed");
+        crate::log!(
+            self.general.id() as i64,
+            crate::util::logger::PrintType::Client,
+            "Password {:?} forwarding took {} ms, completed={}",
+            request.get_comm_type_enum(),
+            started.elapsed().as_millis(),
+            response.is_ok()
+        );
+        response
+    }
+
+    async fn password_delivery(
+        &self,
+        response: &CommunicationValue,
+        stage: &str,
+    ) -> Result<(), &'static str> {
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(5), self.sender.send(response)).await;
+        crate::log!(
+            self.general.id() as i64,
+            crate::util::logger::PrintType::Client,
+            "Password {} took {} ms",
+            stage,
+            started.elapsed().as_millis()
+        );
+        result
+            .map_err(|_| "password delivery timed out")?
+            .map_err(|_| "password delivery failed")
     }
 }
 
@@ -252,6 +342,13 @@ pub(super) fn build_password_iota_request(
 ) -> Result<CommunicationValue, &'static str> {
     let account = session.account.as_ref().ok_or("account not bound")?;
     let contact = session.contact.as_ref().ok_or("contact not present")?;
+    use sha2::{Digest, Sha256};
+    let account_fingerprint = Sha256::digest(
+        account
+            .public_key
+            .try_as_bytes()
+            .map_err(|_| "invalid account key")?,
+    );
     Ok(
         CommunicationValue::new(request.get_comm_type_enum().ok_or("invalid operation")?)
             .with_id(request.id().ok_or("missing request ID")?)
@@ -277,6 +374,10 @@ pub(super) fn build_password_iota_request(
                         .map_err(|_| "invalid key")?,
                 ),
             )
-            .add_typed_default(DataType::OpaqueMessage, DataValue::Bytes(opaque)),
+            .add_typed_default(DataType::OpaqueMessage, DataValue::Bytes(opaque))
+            .add_typed_default(
+                DataType::Sha256,
+                DataValue::Bytes(account_fingerprint.to_vec()),
+            ),
     )
 }

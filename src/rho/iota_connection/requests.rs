@@ -11,6 +11,7 @@ impl IotaConnection {
             .type_map()
             .and_then(|map| map.comm_enum_id(cv.get_type().0));
         let timeout = timeout_duration.unwrap_or(Duration::from_secs(10));
+        let password_expectation = expected.and_then(tau::password_response_expectation);
         // Read-only forwards can stop without remote reconciliation. Unknown
         // operations default to a durable uncertain intent, never automatic replay.
         let read_only = matches!(
@@ -50,7 +51,18 @@ impl IotaConnection {
                     | CommunicationType::CallKeyEnvelopeRevoke
             )
         );
-        let journal = if read_only || replayable_call {
+        // OPAQUE exchanges and aborts only consume expiring, single-use state.
+        // They do not need durable mutation reconciliation after transport loss.
+        let ephemeral_password = matches!(
+            expected,
+            Some(
+                CommunicationType::PasswordEnrollmentStart
+                    | CommunicationType::PasswordProvisioningStart
+                    | CommunicationType::PasswordProvisioningFinish
+                    | CommunicationType::ProvisioningCancel
+            )
+        );
+        let journal = if read_only || replayable_call || ephemeral_password {
             None
         } else {
             let journal = crate::omega::MutationJournal::open(&self.mutation_journal_path)?;
@@ -73,6 +85,9 @@ impl IotaConnection {
                 cv,
                 timeout,
                 move |response| {
+                    if let Some(expectation) = &password_expectation {
+                        return expectation.accepts(response);
+                    }
                     if receipt_page && relay_router::is_relay_receipt_page(response) {
                         return true;
                     }
@@ -86,6 +101,7 @@ impl IotaConnection {
                                 expected,
                                 Some(
                                     CommunicationType::Relay
+                                        | CommunicationType::ProvisioningCancel
                                         | CommunicationType::AccountStateApplied
                                         | CommunicationType::CallEnvelopeStore
                                         | CommunicationType::CallContactAccept
@@ -93,7 +109,6 @@ impl IotaConnection {
                                         | CommunicationType::MessageReactionAdd
                                         | CommunicationType::MessageReactionRemove
                                         | CommunicationType::MessageDeleteLive
-                                        | CommunicationType::PasswordEnrollmentFinish
                                 )
                             )
                         || matches!(
@@ -110,12 +125,6 @@ impl IotaConnection {
                             ) | (
                                 Some(CommunicationType::TAuthExchangeCode),
                                 Some(CommunicationType::TAuthExchangeCodeResponse)
-                            ) | (
-                                Some(CommunicationType::PasswordEnrollmentStart),
-                                Some(CommunicationType::PasswordEnrollmentResponse)
-                            ) | (
-                                Some(CommunicationType::PasswordProvisioningStart),
-                                Some(CommunicationType::PasswordProvisioningResponse)
                             )
                         )
                 },

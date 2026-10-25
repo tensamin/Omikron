@@ -102,6 +102,80 @@ use super::{contact_snapshot, is_iota_omega_management_operation, registration_r
 use crate::util::data_type_id;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 
+#[tokio::test]
+async fn password_forwards_accept_only_their_exact_success_contract() {
+    use crate::rho::{
+        connection::{GeneralConnection, admission_engine},
+        test_support,
+    };
+    use CommunicationType::*;
+    use std::time::Duration;
+
+    let (host, peer, transport) = test_support::guest("anonymous").await;
+    let general =
+        GeneralConnection::admit(transport, test_support::state(), &admission_engine()).unwrap();
+    let iota = super::IotaConnection::from_general(general, 2).await;
+    for (request, success) in [
+        (PasswordEnrollmentStart, PasswordEnrollmentResponse),
+        (PasswordEnrollmentFinish, PasswordEnrollmentStatus),
+        (PasswordEnrollmentDisable, PasswordEnrollmentStatus),
+        (PasswordEnrollmentStatus, PasswordEnrollmentStatus),
+        (PasswordProvisioningStart, PasswordProvisioningResponse),
+        (PasswordProvisioningFinish, ProvisioningCredential),
+    ] {
+        for response_type in [
+            success,
+            ErrorInvalidData,
+            ErrorNotAuthenticated,
+            ErrorInternal,
+        ] {
+            let frame = CommunicationValue::new(request)
+                .with_id(99)
+                .add_typed_default(
+                    DataType::Uuid,
+                    DataValue::Str(uuid::Uuid::new_v4().to_string()),
+                );
+            let task = tokio::spawn({
+                let iota = iota.clone();
+                async move {
+                    iota.await_response(&frame, Some(Duration::from_secs(2)))
+                        .await
+                }
+            });
+            let outbound = tokio::time::timeout(Duration::from_secs(2), peer.receive())
+                .await
+                .unwrap()
+                .unwrap();
+            let id = outbound.id().unwrap();
+            assert!(
+                !iota
+                    .waiting_tasks
+                    .complete(id + 1, CommunicationValue::new(response_type))
+            );
+            assert!(
+                !iota
+                    .waiting_tasks
+                    .complete(id, CommunicationValue::new(Success))
+            );
+            assert!(
+                !iota
+                    .waiting_tasks
+                    .complete(id, CommunicationValue::new(Ping))
+            );
+            assert!(
+                iota.waiting_tasks
+                    .complete(id, CommunicationValue::new(response_type).with_id(id))
+            );
+            let response = task.await.unwrap().unwrap();
+            assert!(response.is_type(response_type));
+            assert_eq!(response.id(), Some(99));
+        }
+    }
+    let _ = std::fs::remove_file(&iota.mutation_journal_path);
+    peer.sender.close().await;
+    host.shutdown().await;
+}
+
 fn snapshot(user_ids: DataValue) -> CommunicationValue {
     CommunicationValue::new(CommunicationType::AccountStateSnapshot)
         .with_receiver(7)

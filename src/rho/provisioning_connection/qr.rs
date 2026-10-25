@@ -40,6 +40,14 @@ impl ProvisioningConnection {
         }
         let participant = self.participant(request, role)?;
         let account = if method == ProvisioningMethod::Password {
+            let source = tau::ConnectionFacts::from_mtp(&self.general.mtp_connection)
+                .remote_addr
+                .map(|address| address.ip());
+            self.general
+                .state
+                .provisioning
+                .password_admission
+                .initiate(None, source)?;
             let account = self.resolve_account(request).await?;
             self.general
                 .state
