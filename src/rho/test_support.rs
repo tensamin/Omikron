@@ -94,6 +94,13 @@ pub async fn guest(role: &str) -> (MTPWebServer, mtp::client::MTPConnection, Web
 pub async fn authenticated(
     role: &str,
 ) -> (MTPWebServer, mtp::client::MTPConnection, WebMTPConnection) {
+    authenticated_with_key(role, &Keyring::generate()).await
+}
+
+pub async fn authenticated_with_key(
+    role: &str,
+    client_keys: &Keyring,
+) -> (MTPWebServer, mtp::client::MTPConnection, WebMTPConnection) {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".into()])
         .unwrap()
@@ -103,7 +110,6 @@ pub async fn authenticated(
         .into_bytes();
     let host_keys = Keyring::generate();
     let host_public = host_keys.public_key_bundle();
-    let client_keys = Keyring::generate();
     let client_public = client_keys.public_key_bundle();
     let expected_role = role.to_string();
     let config = HostConfig::new(
@@ -133,7 +139,7 @@ pub async fn authenticated(
         .with_policy(rho_policy().with_send_mode(mtp::host::SendMode::SingleStreamPerMessage));
     let (client, accepted) = tokio::time::timeout(Duration::from_secs(10), async {
         tokio::join!(
-            MTPClient::auth_connect(config, &client_keys, &host_public),
+            MTPClient::auth_connect(config, client_keys, &host_public),
             host.accept()
         )
     })

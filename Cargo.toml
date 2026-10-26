@@ -46,3 +46,9 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]
 rcgen = "0.14"
+
+[patch."https://github.com/Nonanium/MTP.git"]
+mtp = { path = "../mtp" }
+mtp-native = { path = "../mtp/bindings/native" }
+mtp-type-map = { path = "../mtp/type-map" }
+mtp-crypto = { path = "../mtp/crypto" }

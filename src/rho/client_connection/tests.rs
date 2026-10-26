@@ -423,6 +423,181 @@ fn peer_control_requests_replace_a_client_supplied_sender() {
 }
 
 #[test]
+fn native_forwarding_keeps_sealed_frame_and_separates_authenticated_actor() {
+    use mtp::{
+        codec::relay::SealedRelayBuilder,
+        crypto::{Ed25519Signer, Keyring},
+    };
+    let (signer, _, _) = Ed25519Signer::generate();
+    let node = Keyring::generate();
+    let original = SealedRelayBuilder::new(
+        CommunicationType::AddConversation,
+        DataValue::Container(vec![]),
+        99,
+        22,
+        1,
+        &signer,
+    )
+    .message_id(1_u128)
+    .created_at(1)
+    .metadata_recipients(vec![node.public_key_bundle()])
+    .content_recipients(vec![node.public_key_bundle()])
+    .build()
+    .unwrap()
+    .with_id(7);
+    let request = super::authenticated_native_relay_request(&original, 11, 4, 5).unwrap();
+    assert_eq!(request.sender(), Some(11));
+    assert_eq!(
+        request.get_data(DataType::SessionId),
+        Some(&DataValue::UnsignedNumber(4))
+    );
+    assert_eq!(
+        request.get_data(DataType::VersionNumber),
+        Some(&DataValue::UnsignedNumber(5))
+    );
+    assert_eq!(
+        request.get_data(DataType::SecurePayload),
+        Some(&DataValue::Bytes(original.to_bytes().unwrap()))
+    );
+    assert!(super::authenticated_native_relay_request(&original, 11, 4, 0).is_err());
+    let legacy = CommunicationValue::new(CommunicationType::Relay)
+        .with_id(7)
+        .add_typed_default(
+            DataType::SecurePayload,
+            DataValue::Bytes(br#"{"version":2}"#.to_vec()),
+        );
+    assert!(super::authenticated_native_relay_request(&legacy, 11, 4, 5).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_timeout_or_unbound_reply_cannot_release_session_before_revocation_receipt() {
+    use crate::rho::{
+        client_connection::ClientConnection,
+        connection::{GeneralConnection, admission_engine},
+        iota_connection::IotaConnection,
+        rho_connection::RhoConnection,
+        test_support,
+    };
+    use mtp::{
+        codec::relay::SealedRelayBuilder,
+        crypto::{Ed25519Signer, Keyring},
+    };
+    use std::{sync::Arc, time::Duration};
+    for unbound_reply in [true, false] {
+        let state = test_support::state();
+        let (iota_host, iota_peer, iota_transport) = test_support::guest("anonymous").await;
+        let iota_general =
+            GeneralConnection::admit(iota_transport, state.clone(), &admission_engine()).unwrap();
+        let iota = IotaConnection::from_general(iota_general.clone(), 2).await;
+        let rho = Arc::new(RhoConnection::new(iota.clone(), vec![7]).await);
+        state.rho.add(rho.clone()).await;
+        let (client_host, client_peer, client_transport) = test_support::guest("anonymous").await;
+        let general =
+            GeneralConnection::admit(client_transport, state.clone(), &admission_engine()).unwrap();
+        *general.session_id.write().await = 42;
+        let client = ClientConnection::from_general(general.clone(), 7).await;
+        rho.add_client_connection(client.clone()).await;
+        *client.rho_connection.write().await = Some(rho.clone());
+        let (signer, _, _) = Ed25519Signer::generate();
+        let node = Keyring::generate();
+        let native = SealedRelayBuilder::new(
+            CommunicationType::SetChatSecret,
+            DataValue::Container(vec![]),
+            7,
+            22,
+            1,
+            &signer,
+        )
+        .message_id(5_u128)
+        .created_at(1)
+        .metadata_recipients(vec![node.public_key_bundle()])
+        .content_recipients(vec![node.public_key_bundle()])
+        .build()
+        .unwrap()
+        .with_id(73);
+        client.clone().handle_message(native).await;
+        let forwarded = tokio::time::timeout(Duration::from_secs(2), iota_peer.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        let nonce = forwarded
+            .get_data(DataType::Uuid)
+            .and_then(DataValue::as_str)
+            .unwrap()
+            .to_owned();
+        // An unbound response has the same uncertainty as a timeout. It must
+        // trigger explicit revocation rather than release either authorization lock.
+        if unbound_reply {
+            assert!(
+                iota.waiting_tasks.complete(
+                    forwarded.id().unwrap(),
+                    CommunicationValue::new(CommunicationType::ErrorInternal)
+                        .with_id(forwarded.id().unwrap())
+                )
+            );
+        }
+        let revoke = tokio::time::timeout(Duration::from_secs(25), iota_peer.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            revoke
+                .get_data(DataType::Status)
+                .and_then(DataValue::as_str),
+            Some("tensamin-hosted-native-revoke-v1")
+        );
+        assert_eq!(
+            revoke.get_data(DataType::Uuid).and_then(DataValue::as_str),
+            Some(nonce.as_str())
+        );
+        let closing = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client.close().await;
+            }
+        });
+        let reassignment = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state.rho.invalidate_user(7).await;
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), state.rho.bind_user_to_iota(8, 2))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!closing.is_finished());
+        assert!(!reassignment.is_finished());
+        let receipt = CommunicationValue::new(CommunicationType::Success)
+            .with_id(revoke.id().unwrap())
+            .add_typed_default(DataType::Status, DataValue::Str("revoked".into()))
+            .add_typed_default(DataType::Uuid, DataValue::Str(nonce));
+        assert!(iota.waiting_tasks.complete(revoke.id().unwrap(), receipt));
+        if let Ok(response) = tokio::time::timeout(Duration::from_secs(2), client_peer.receive())
+            .await
+            .unwrap()
+        {
+            assert!(response.is_type(CommunicationType::ErrorInternal));
+            assert_eq!(response.id(), Some(73));
+        }
+        tokio::time::timeout(Duration::from_secs(2), closing)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), reassignment)
+            .await
+            .unwrap()
+            .unwrap();
+        iota_peer.sender.close().await;
+        client_peer.sender.close().await;
+        iota_host.shutdown().await;
+        client_host.shutdown().await;
+    }
+}
+
+#[test]
 fn normal_clients_cannot_manage_invitations() {
     for operation in [
         CommunicationType::CreateUserInvitation,
@@ -433,6 +608,135 @@ fn normal_clients_cannot_manage_invitations() {
             operation
         )));
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_revocation_uses_authenticated_replacement_before_route_publication() {
+    use crate::rho::{
+        client_connection::ClientConnection,
+        connection::{GeneralConnection, admission_engine},
+        iota_connection::IotaConnection,
+        rho_connection::RhoConnection,
+        test_support,
+    };
+    use mtp::{
+        codec::relay::SealedRelayBuilder,
+        crypto::{Ed25519Signer, Keyring},
+    };
+    use std::{sync::Arc, time::Duration};
+    let state = test_support::state();
+    let node_key = Keyring::generate();
+    let (old_host, old_peer, transport) =
+        test_support::authenticated_with_key("iota", &node_key).await;
+    let old_general =
+        GeneralConnection::admit(transport, state.clone(), &admission_engine()).unwrap();
+    let old = IotaConnection::from_general(old_general.clone(), 2).await;
+    let rho = Arc::new(RhoConnection::new(old.clone(), vec![7]).await);
+    state.rho.add(rho.clone()).await;
+    let (client_host, client_peer, transport) = test_support::guest("anonymous").await;
+    let general = GeneralConnection::admit(transport, state.clone(), &admission_engine()).unwrap();
+    *general.session_id.write().await = 42;
+    let client = ClientConnection::from_general(general.clone(), 7).await;
+    rho.add_client_connection(client.clone()).await;
+    *client.rho_connection.write().await = Some(rho.clone());
+    let (signer, _, _) = Ed25519Signer::generate();
+    let native = SealedRelayBuilder::new(
+        CommunicationType::SetChatSecret,
+        DataValue::Container(vec![]),
+        7,
+        22,
+        1,
+        &signer,
+    )
+    .message_id(6_u128)
+    .created_at(1)
+    .metadata_recipients(vec![node_key.public_key_bundle()])
+    .content_recipients(vec![node_key.public_key_bundle()])
+    .build()
+    .unwrap()
+    .with_id(74);
+    client.clone().handle_message(native).await;
+    let request = tokio::time::timeout(Duration::from_secs(2), old_peer.receive())
+        .await
+        .unwrap()
+        .unwrap();
+    let nonce = request
+        .get_data(DataType::Uuid)
+        .and_then(DataValue::as_str)
+        .unwrap()
+        .to_owned();
+    // The old authenticated MTP transport is genuinely gone, not just removed
+    // from a routing map. Cancellation must not retry only this closed sender.
+    old_peer.sender.close().await;
+    let closing = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client.close().await;
+        }
+    });
+    let (new_host, new_peer, transport) =
+        test_support::authenticated_with_key("iota", &node_key).await;
+    let new_general =
+        GeneralConnection::admit(transport, state.clone(), &admission_engine()).unwrap();
+    let replacement = IotaConnection::from_general(new_general.clone(), 2).await;
+    assert_eq!(replacement.node_id, old.node_id);
+    let new_rho = Arc::new(RhoConnection::new(replacement.clone(), vec![7]).await);
+    let publication = tokio::spawn({
+        let replacement = replacement.clone();
+        async move {
+            replacement.publish_and_run(new_rho).await;
+        }
+    });
+    // Waiting for user7's remote cancellation must not monopolize the global
+    // routing lock. A different user's assignment still publishes now.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), state.rho.bind_user_to_iota(8, 2))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let revoke = tokio::time::timeout(Duration::from_secs(15), new_peer.receive())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        revoke.get_data(DataType::Uuid).and_then(DataValue::as_str),
+        Some(nonce.as_str())
+    );
+    assert_eq!(
+        revoke
+            .get_data(DataType::Status)
+            .and_then(DataValue::as_str),
+        Some("tensamin-hosted-native-revoke-v1")
+    );
+    assert!(!closing.is_finished());
+    assert!(!publication.is_finished());
+    assert!(Arc::ptr_eq(&state.rho.get_by_iota(2).await.unwrap(), &rho));
+    let receipt = CommunicationValue::new(CommunicationType::Success)
+        .with_id(revoke.id().unwrap())
+        .add_typed_default(DataType::Status, DataValue::Str("revoked".into()))
+        .add_typed_default(DataType::Uuid, DataValue::Str(nonce));
+    new_peer.sender.send(&receipt).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), closing)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.rho.is_current_rho(&rho) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    new_peer.sender.close().await;
+    tokio::time::timeout(Duration::from_secs(2), publication)
+        .await
+        .unwrap()
+        .unwrap();
+    client_peer.sender.close().await;
+    old_host.shutdown().await;
+    new_host.shutdown().await;
+    client_host.shutdown().await;
 }
 
 #[test]

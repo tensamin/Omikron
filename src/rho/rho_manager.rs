@@ -3,6 +3,8 @@ use std::sync::{Arc, RwLock};
 
 use super::rho_connection::RhoConnection;
 
+const MAX_REVOCATION_TRANSPORTS_PER_NODE: usize = 4;
+
 #[derive(Clone, Default)]
 struct RoutingSnapshot {
     generation: u64,
@@ -18,11 +20,111 @@ pub struct RhoManager {
     // Lock order: routing mutation, membership locks, registration-local locks.
     mutations: tokio::sync::Mutex<()>,
     published: RwLock<Arc<RoutingSnapshot>>,
+    revocation_transports: RwLock<
+        HashMap<
+            super::relay_router::IotaNodeId,
+            Vec<std::sync::Weak<super::iota_connection::IotaConnection>>,
+        >,
+    >,
+    revocation_changes: std::sync::OnceLock<tokio::sync::watch::Sender<u64>>,
     #[cfg(test)]
     before_publish: std::sync::Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
 }
 
+pub(crate) struct NativeRouteMutation<'a> {
+    _pauses: Vec<super::native_forwarding::Pause>,
+    _routing: tokio::sync::MutexGuard<'a, ()>,
+}
+
 impl RhoManager {
+    /// Authentication is established before route publication. A replacement
+    /// may cancel old nonces without first taking over any users or sessions.
+    pub(crate) fn register_revocation_transport(
+        &self,
+        connection: &Arc<super::iota_connection::IotaConnection>,
+    ) {
+        if let Some(node) = &connection.node_id {
+            let mut transports = self
+                .revocation_transports
+                .write()
+                .expect("revocation transports poisoned");
+            transports.retain(|_, candidates| {
+                candidates.retain(|candidate| {
+                    candidate
+                        .upgrade()
+                        .is_some_and(|candidate| candidate.receiver.close_reason().is_none())
+                });
+                !candidates.is_empty()
+            });
+            let candidate = Arc::downgrade(connection);
+            let candidates = transports.entry(node.clone()).or_default();
+            candidates.retain(|previous| !previous.ptr_eq(&candidate));
+            if candidates.len() == MAX_REVOCATION_TRANSPORTS_PER_NODE {
+                candidates.remove(0);
+            }
+            candidates.push(candidate);
+            drop(transports);
+            self.revocation_changes
+                .get_or_init(|| tokio::sync::watch::channel(0).0)
+                .send_modify(|sequence| *sequence = sequence.wrapping_add(1));
+        }
+    }
+
+    pub(crate) fn revocation_transport_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revocation_changes
+            .get_or_init(|| tokio::sync::watch::channel(0).0)
+            .subscribe()
+    }
+
+    pub(crate) fn revocation_transport(
+        &self,
+        original: &super::iota_connection::IotaConnection,
+    ) -> Option<Arc<super::iota_connection::IotaConnection>> {
+        self.revocation_transports
+            .read()
+            .expect("revocation transports poisoned")
+            .get(original.node_id.as_ref()?)?
+            .iter()
+            .rev()
+            .filter_map(std::sync::Weak::upgrade)
+            .find(|candidate| candidate.receiver.close_reason().is_none())
+    }
+
+    pub(crate) async fn native_mutation_guard(
+        &self,
+        users: &[i64],
+        iotas: &[i64],
+    ) -> NativeRouteMutation<'_> {
+        let mut paused = HashSet::new();
+        let mut pauses = Vec::new();
+        loop {
+            let routing = self.mutation_guard().await;
+            let snapshot = self.snapshot();
+            let mut additional = Vec::new();
+            for (id, rho) in &snapshot.by_iota {
+                for client in rho.get_client_connections().await {
+                    if (iotas.contains(id) || users.contains(&(client.user_id as i64)))
+                        && paused.insert(Arc::as_ptr(&client.native_forwarding) as usize)
+                    {
+                        additional.push(client.native_forwarding.pause());
+                    }
+                }
+            }
+            if additional.is_empty() {
+                return NativeRouteMutation {
+                    _pauses: pauses,
+                    _routing: routing,
+                };
+            }
+            // Admission requires the same routing lock. Once paused, no new
+            // operation for these clients can race this drain/recheck loop.
+            drop(routing);
+            for pause in &additional {
+                pause.wait().await;
+            }
+            pauses.extend(additional);
+        }
+    }
     fn snapshot(&self) -> Arc<RoutingSnapshot> {
         self.published
             .read()
@@ -197,7 +299,7 @@ impl RhoManager {
         user_id: i64,
         iota_id: i64,
     ) -> Option<Arc<RhoConnection>> {
-        let _mutation = self.mutation_guard().await;
+        let _mutation = self.native_mutation_guard(&[user_id], &[]).await;
         if user_id <= 0 {
             return None;
         }
@@ -213,7 +315,7 @@ impl RhoManager {
     }
 
     pub async fn replace_users_for_iota(&self, iota_id: i64, user_ids: Vec<i64>) {
-        let _mutation = self.mutation_guard().await;
+        let _mutation = self.native_mutation_guard(&user_ids, &[iota_id]).await;
         let rho = self.snapshot().by_iota.get(&iota_id).cloned();
         let Some(rho) = rho else {
             return;
@@ -248,7 +350,7 @@ impl RhoManager {
     }
 
     pub async fn invalidate_user(&self, user_id: i64) {
-        let _mutation = self.mutation_guard().await;
+        let _mutation = self.native_mutation_guard(&[user_id], &[]).await;
         self.publish_assignments_locked(HashMap::from([(user_id, None)]), None, None, true)
             .await;
     }
@@ -456,7 +558,7 @@ impl RhoManager {
         iota_id: i64,
         expected: &RhoConnection,
     ) -> Option<Arc<RhoConnection>> {
-        let _mutation = self.mutation_guard().await;
+        let _mutation = self.native_mutation_guard(&[], &[iota_id]).await;
         let rho = self.snapshot().by_iota.get(&iota_id).cloned()?;
         if !std::ptr::eq(rho.as_ref(), expected) {
             return None;
@@ -472,7 +574,16 @@ impl RhoManager {
     }
 
     pub async fn add(&self, rho_connection: Arc<RhoConnection>) {
-        let _mutation = self.mutation_guard().await;
+        let users: Vec<_> = rho_connection
+            .user_ids
+            .read()
+            .await
+            .iter()
+            .copied()
+            .collect();
+        let _mutation = self
+            .native_mutation_guard(&users, &[rho_connection.iota_id() as i64])
+            .await;
         let iota_id = rho_connection.get_iota_id().await as i64;
         let user_ids = rho_connection.get_user_ids().await;
         let previous = self.snapshot().by_iota.get(&iota_id).cloned();
@@ -562,6 +673,51 @@ impl RhoManager {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn revocation_candidates_are_bounded_and_survive_a_failed_newest_candidate() {
+        use crate::rho::{
+            connection::{GeneralConnection, admission_engine},
+            iota_connection::IotaConnection,
+            test_support,
+        };
+        use std::sync::Arc;
+
+        let state = test_support::state();
+        let (host, peer, transport) = test_support::authenticated("iota").await;
+        let general =
+            GeneralConnection::admit(transport, state.clone(), &admission_engine()).unwrap();
+        let mut candidates = Vec::new();
+        for _ in 0..super::MAX_REVOCATION_TRANSPORTS_PER_NODE + 2 {
+            candidates.push(IotaConnection::from_general(general.clone(), 2).await);
+        }
+        let original = &candidates[0];
+        let node = original.node_id.as_ref().unwrap();
+        assert_eq!(
+            state.rho.revocation_transports.read().unwrap()[node].len(),
+            super::MAX_REVOCATION_TRANSPORTS_PER_NODE
+        );
+        assert!(Arc::ptr_eq(
+            &state.rho.revocation_transport(original).unwrap(),
+            candidates.last().unwrap()
+        ));
+        candidates.pop();
+        assert!(Arc::ptr_eq(
+            &state.rho.revocation_transport(&candidates[0]).unwrap(),
+            candidates.last().unwrap()
+        ));
+        // A new registration prunes stale nodes as well as dead candidates.
+        candidates.clear();
+        let (other_host, other_peer, transport) = test_support::authenticated("iota").await;
+        let general =
+            GeneralConnection::admit(transport, state.clone(), &admission_engine()).unwrap();
+        let _other = IotaConnection::from_general(general, 3).await;
+        assert_eq!(state.rho.revocation_transports.read().unwrap().len(), 1);
+        peer.sender.close().await;
+        other_peer.sender.close().await;
+        host.shutdown().await;
+        other_host.shutdown().await;
+    }
+
     #[tokio::test]
     async fn identical_assignment_updates_do_not_lock_mirrors_or_change_generation() {
         use crate::rho::{

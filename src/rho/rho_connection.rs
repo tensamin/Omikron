@@ -211,7 +211,12 @@ impl RhoConnection {
 
     /// Remove a client connection
     pub async fn close_client_connection(&self, connection: Arc<ClientConnection>) -> bool {
-        let mutation = self.iota_connection.state.rho.mutation_guard().await;
+        let mutation = self
+            .iota_connection
+            .state
+            .rho
+            .native_mutation_guard(&[connection.user_id as i64], &[])
+            .await;
         let target_user_id = connection.user_id as i64;
         let target_session_id = connection.session_id as i64;
         // Do not let a stale transport tear down the replacement for the same
@@ -540,6 +545,107 @@ impl RhoConnection {
             return Err("user route changed during peer control".into());
         }
         Ok(response)
+    }
+
+    /// The caller retains its session and route read guards until this returns.
+    /// A timeout alone cannot release them: Iota must first durably revoke the
+    /// exact forwarding authorization, serializing revocation with its commit.
+    pub async fn await_hosted_native_relay(
+        &self,
+        request: &CommunicationValue,
+        cancellation: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<CommunicationValue, String> {
+        let nonce = request
+            .get_data(DataType::Uuid)
+            .as_str()
+            .ok_or("missing forwarding nonce")?;
+        if !self.iota_connection.state.rho.is_current_rho(self) {
+            return Err("Iota route is obsolete".into());
+        }
+        // Native operations already have immutable user-signed replay identity.
+        // This protocol owns cancellation; do not add a second uncertain-mutation
+        // journal entry that cannot distinguish revocation from acceptance.
+        let operation = self.iota_connection.waiting_tasks.exchange(
+            request,
+            std::time::Duration::from_secs(20),
+            |response| {
+                response.is_type(CommunicationType::Success)
+                    || response
+                        .get_comm_type_enum()
+                        .is_some_and(tau::is_protocol_error)
+            },
+            |outbound| async move { self.iota_connection.sender.send(&outbound).await },
+        );
+        tokio::pin!(operation);
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.wait_for(|cancelled| *cancelled) => Err("forwarding authorization revoked".into()),
+            result = &mut operation => result.map_err(|error| error.to_string()),
+        };
+        if let Ok(response) = &result
+            && response.get_data(DataType::Uuid).as_str() == Some(nonce)
+        {
+            return result;
+        }
+        let revoke = CommunicationValue::new_with_type_map(
+            CommunicationType::Relay,
+            request.type_map().ok_or("missing forwarding dictionary")?,
+        )
+        .with_sender(request.sender().ok_or("missing forwarding actor")?)
+        .add_typed_default(
+            DataType::Status,
+            DataValue::Str("tensamin-hosted-native-revoke-v1".into()),
+        )
+        .add_typed_default(DataType::Uuid, DataValue::Str(nonce.into()));
+        let mut transports = self
+            .iota_connection
+            .state
+            .rho
+            .revocation_transport_changes();
+        loop {
+            let transport = self
+                .iota_connection
+                .state
+                .rho
+                .revocation_transport(&self.iota_connection)
+                .unwrap_or_else(|| self.iota_connection.clone());
+            let expected_nonce = nonce.to_owned();
+            let exchange = transport.waiting_tasks.exchange(
+                &revoke,
+                std::time::Duration::from_secs(10),
+                move |response| {
+                    response.is_type(CommunicationType::Success)
+                        && response.get_data(DataType::Uuid).as_str()
+                            == Some(expected_nonce.as_str())
+                        && response.get_data(DataType::Status).as_str() == Some("revoked")
+                },
+                |outbound| {
+                    let sender = transport.sender.clone();
+                    async move { sender.send(&outbound).await }
+                },
+            );
+            tokio::pin!(exchange);
+            let exchange = loop {
+                tokio::select! {
+                    biased;
+                    result = &mut exchange => break Some(result),
+                    _ = transports.changed() => {
+                        let current = self.iota_connection.state.rho.revocation_transport(&self.iota_connection);
+                        if current.as_ref().is_some_and(|current| !Arc::ptr_eq(current, &transport)) { break None; }
+                    },
+                }
+            };
+            let Some(exchange) = exchange else {
+                continue;
+            };
+            if exchange.is_ok() {
+                return Err("forwarded relay timed out; authorization revoked".into());
+            }
+            // Deliberately retain authorization guards if the peer is unreachable.
+            // Publishing a new route would allow an old in-flight operation to
+            // commit under a session that Omikron had already declared revoked.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     }
 
     pub async fn forward_relay_ack(&self, user_id: u64, frame_id: u32) {

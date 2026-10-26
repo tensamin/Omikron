@@ -589,7 +589,6 @@ impl GeneralConnection {
         };
         let iota = IotaConnection::from_general(self.clone(), id).await;
         let rho = Arc::new(RhoConnection::new(iota.clone(), user_ids).await);
-        iota.set_rho_connection(rho.clone()).await;
         let mut session = self.tau_session.write().await;
         if *self.shutdown.borrow()
             || self.receiver.close_reason().is_some()
@@ -601,9 +600,8 @@ impl GeneralConnection {
             return false;
         }
         drop(session);
-        self.state.rho.add(rho.clone()).await;
         self.set_active_handler(ConnectionKind::Iota);
-        iota.run().await;
+        iota.publish_and_run(rho).await;
         true
     }
 

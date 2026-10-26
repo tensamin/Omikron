@@ -5,6 +5,24 @@ The Omikron also host Voice-Calls.
 
 The Omikron is only used when the Iota is in Centralized and Hybrid mode, or when the Client uses the Tensamin Client with default configuration.
 
+## Building the workspace sources
+
+Keep the `omikron`, `tau`, `mtp`, and `iota` Git checkouts alongside each other.
+Run these commands from the `omikron` checkout so the local Git input URLs
+resolve correctly:
+
+```sh
+nix flake update tau-src mtp-src iota-src type-maps
+nix develop --command cargo check --locked
+nix build --no-link .#default
+```
+
+The flake locks the sibling sources and `mtp-type-maps` by content and rewrites
+Cargo paths to those store inputs. Git excludes untracked files, so add new
+source files before refreshing inputs. Commit the sibling sources and refresh
+`flake.lock` before publishing a release. Cargo forces the checkout-local map;
+the sandboxed package uses the locked copy of that same map.
+
 ## Configuration
 
 Omikron stores its keyring unencrypted in `omikron.mk` and its public key bundle in `omikron.mpkb`. If the keyring does not exist, Omikron generates it on startup.

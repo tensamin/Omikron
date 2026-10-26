@@ -127,7 +127,7 @@ impl IotaConnection {
         } else {
             None
         };
-        Arc::new(Self {
+        let connection = Arc::new(Self {
             state: general.state.clone(),
             _mtp_connection: Some(general.mtp_connection.clone()),
             pub_key: Arc::new(RwLock::new(None)),
@@ -145,9 +145,50 @@ impl IotaConnection {
                 general.state.config.message_drain,
             ),
             mutation_journal_path: crate::omega::mutation_journal_path(),
-        })
+        });
+        connection
+            .state
+            .rho
+            .register_revocation_transport(&connection);
+        connection
     }
+    pub(crate) async fn publish_and_run(self: Arc<Self>, rho: Arc<RhoConnection>) {
+        self.set_rho_connection(rho.clone()).await;
+        // Replacement publication can wait for a revocation receipt on this
+        // transport. Its reader must already be running during that wait.
+        tokio::join!(self.state.rho.add(rho.clone()), self.clone().run());
+        // The reader may close before publication completes. Remove any route
+        // that was published after its first cleanup attempt.
+        rho.close_iota_connection().await;
+    }
+
     pub async fn run(self: Arc<Self>) {
+        let recovery = self.clone();
+        if let Err(error) = self.tasks.spawn(async move {
+            let mut ticks = tokio::time::interval(Duration::from_secs(60));
+            while recovery
+                .tasks
+                .while_connected(&recovery.receiver, ticks.tick())
+                .await
+                .is_some()
+            {
+                if let Err(error) = recovery.reconcile_password_mutations().await {
+                    log_err!(
+                        recovery.iota_id as i64,
+                        PrintType::Iota,
+                        "Password mutation reconciliation failed: {}",
+                        error
+                    );
+                }
+            }
+        }) {
+            log_err!(
+                self.iota_id as i64,
+                PrintType::Iota,
+                "Password reconciliation submission failed: {}",
+                error
+            );
+        }
         let self_clone = self.clone();
         loop {
             match self_clone
@@ -269,6 +310,17 @@ impl IotaConnection {
     }
 
     async fn handle_message_inner(self: Arc<Self>, cv: CommunicationValue) {
+        // Revocation may use an authenticated replacement before it owns a
+        // route. Only its exact nonce-bound receipt can bypass route admission.
+        if self.node_id.is_some()
+            && cv.is_type(CommunicationType::Success)
+            && cv.get_data(DataType::Status).as_str() == Some("revoked")
+            && cv.get_data(DataType::Uuid).as_str().is_some()
+            && let Some(id) = cv.id()
+            && self.waiting_tasks.complete(id, cv.clone())
+        {
+            return;
+        }
         let current = self.get_rho_connection().await.is_some_and(|rho| {
             std::ptr::eq(rho.get_iota_connection().as_ref(), self.as_ref())
                 && self.state.rho.is_current_rho(&rho)

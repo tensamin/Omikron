@@ -103,6 +103,202 @@ use crate::util::data_type_id;
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue, TypeMap};
 
 #[tokio::test]
+async fn password_lost_ack_uses_protected_status_and_resumes_after_reconnect() {
+    use crate::{
+        app_protection::*,
+        rho::{
+            connection::{GeneralConnection, admission_engine},
+            test_support,
+        },
+    };
+    use mtp::{
+        codec::ProtectedMessageBuilder,
+        crypto::{DualSigner, Keyring},
+    };
+    use std::{
+        sync::Arc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    let account = Keyring::generate();
+    let node = Keyring::generate();
+    let build = |kind,
+                 key: &Keyring,
+                 recipient: &Keyring,
+                 signer_id,
+                 recipient_id,
+                 signature,
+                 encryption,
+                 nonce| {
+        let signer = DualSigner::new(
+            &key.sig_cl_secret_key,
+            &key.sig_pq_secret_key,
+            &key.sig_pq_public_key,
+        )
+        .unwrap();
+        ProtectedMessageBuilder::new(
+            kind,
+            DataValue::Container(Vec::new()),
+            signer_id,
+            recipient_id,
+            &signer,
+            purpose(signature),
+            purpose(encryption),
+        )
+        .message_id(nonce)
+        .created_at(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        )
+        .recipients(vec![recipient.public_key_bundle()])
+        .frame_id(99)
+        .build()
+        .unwrap()
+    };
+    let state = test_support::state();
+    let (host, peer, transport) = test_support::authenticated_with_key("iota", &node).await;
+    let general = GeneralConnection::admit(transport, state.clone(), &admission_engine()).unwrap();
+    let iota = super::IotaConnection::from_general(general, 42).await;
+    let rho = Arc::new(crate::rho::rho_connection::RhoConnection::new(iota.clone(), vec![7]).await);
+    state.rho.add(rho.clone()).await;
+    let original_generation = state.rho.user_route_generation(7, &rho).unwrap();
+    for (index, kind) in [
+        CommunicationType::PasswordEnrollmentFinish,
+        CommunicationType::PasswordEnrollmentDisable,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let original = build(
+            kind,
+            &account,
+            &node,
+            7,
+            42,
+            PASSWORD_MANAGEMENT_SIGNATURE,
+            PASSWORD_MANAGEMENT_ENCRYPTION,
+            index as u128 + 1,
+        )
+        .with_sender(7);
+        let task = tokio::spawn({
+            let iota = iota.clone();
+            let original = original.clone();
+            async move {
+                iota.await_response(&original, Some(Duration::from_millis(100)))
+                    .await
+            }
+        });
+        let outbound = tokio::time::timeout(Duration::from_secs(2), peer.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outbound.is_type(kind));
+        // The mutation's acknowledgment is lost. Only a read-only proof wrapper
+        // may follow, never a second enrollment finish or disable command.
+        let query = tokio::time::timeout(Duration::from_secs(2), peer.receive())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(query.is_type(CommunicationType::PasswordEnrollmentStatus));
+        assert_eq!(
+            query
+                .get_data(DataType::SecurePayload)
+                .unwrap()
+                .as_bytes()
+                .unwrap(),
+            original.clone().without_id().to_bytes().unwrap()
+        );
+        let response = if index == 0 {
+            build(
+                CommunicationType::PasswordEnrollmentStatus,
+                &node,
+                &account,
+                42,
+                7,
+                PASSWORD_RESPONSE_SIGNATURE,
+                PASSWORD_RESPONSE_ENCRYPTION,
+                100,
+            )
+        } else {
+            CommunicationValue::new(CommunicationType::ErrorInternal)
+        }
+        .with_id(query.id().unwrap());
+        assert!(iota.waiting_tasks.complete(query.id().unwrap(), response));
+        let result = task.await.unwrap();
+        if index == 0 {
+            assert_eq!(result.unwrap().id(), Some(99));
+        } else {
+            assert!(result.is_err());
+        }
+    }
+    let journal = crate::omega::MutationJournal::open(&iota.mutation_journal_path).unwrap();
+    assert_eq!(journal.unresolved().unwrap(), 1);
+    assert_eq!(journal.password_pending("iota:42").unwrap().len(), 1);
+    state.rho.bind_user_to_iota(99, 42).await.unwrap();
+    assert_ne!(
+        state.rho.user_route_generation(7, &rho).unwrap(),
+        original_generation
+    );
+    let (new_host, new_peer, transport) = test_support::authenticated_with_key("iota", &node).await;
+    let general = GeneralConnection::admit(transport, state.clone(), &admission_engine()).unwrap();
+    let replacement = super::IotaConnection::from_general(general, 42).await;
+    // The transport registry retains a Weak, so get_mut cannot adjust this fixture.
+    let mut replacement = Arc::try_unwrap(replacement)
+        .unwrap_or_else(|_| panic!("replacement already has another strong owner"));
+    replacement.mutation_journal_path = iota.mutation_journal_path.clone();
+    let replacement = Arc::new(replacement);
+    state.rho.register_revocation_transport(&replacement);
+    let replacement_rho = Arc::new(
+        crate::rho::rho_connection::RhoConnection::new(replacement.clone(), vec![7, 99]).await,
+    );
+    state.rho.add(replacement_rho.clone()).await;
+    assert_ne!(
+        state
+            .rho
+            .user_route_generation(7, &replacement_rho)
+            .unwrap(),
+        original_generation
+    );
+    assert_eq!(replacement.node_id, iota.node_id);
+    let recovery = tokio::spawn({
+        let replacement = replacement.clone();
+        async move { replacement.reconcile_password_mutations().await }
+    });
+    let query = tokio::time::timeout(Duration::from_secs(2), new_peer.receive())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(query.is_type(CommunicationType::PasswordEnrollmentStatus));
+    let response = build(
+        CommunicationType::PasswordEnrollmentStatus,
+        &node,
+        &account,
+        42,
+        7,
+        PASSWORD_RESPONSE_SIGNATURE,
+        PASSWORD_RESPONSE_ENCRYPTION,
+        101,
+    )
+    .with_id(query.id().unwrap());
+    assert!(
+        replacement
+            .waiting_tasks
+            .complete(query.id().unwrap(), response)
+    );
+    recovery.await.unwrap().unwrap();
+    assert_eq!(journal.unresolved().unwrap(), 0);
+    assert!(journal.password_pending("iota:42").unwrap().is_empty());
+    drop(journal);
+    let _ = std::fs::remove_file(&iota.mutation_journal_path);
+    peer.sender.close().await;
+    new_peer.sender.close().await;
+    host.shutdown().await;
+    new_host.shutdown().await;
+}
+
+#[tokio::test]
 async fn password_forwards_accept_only_their_exact_success_contract() {
     use crate::rho::{
         connection::{GeneralConnection, admission_engine},
@@ -117,8 +313,6 @@ async fn password_forwards_accept_only_their_exact_success_contract() {
     let iota = super::IotaConnection::from_general(general, 2).await;
     for (request, success) in [
         (PasswordEnrollmentStart, PasswordEnrollmentResponse),
-        (PasswordEnrollmentFinish, PasswordEnrollmentStatus),
-        (PasswordEnrollmentDisable, PasswordEnrollmentStatus),
         (PasswordEnrollmentStatus, PasswordEnrollmentStatus),
         (PasswordProvisioningStart, PasswordProvisioningResponse),
         (PasswordProvisioningFinish, ProvisioningCredential),

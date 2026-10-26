@@ -1,5 +1,37 @@
 {
   "nodes": {
+    "iota-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793033129,
+        "narHash": "sha256-6POmYI/sKEIAd74caxV6SZFw+kLt/Hvqz8lOWyNy97o=",
+        "ref": "refs/heads/main",
+        "rev": "4612c4c26d2a5b36976b6490f982e5bd3c2ee848",
+        "revCount": 345,
+        "type": "git",
+        "url": "file:../iota"
+      },
+      "original": {
+        "type": "git",
+        "url": "file:../iota"
+      }
+    },
+    "mtp-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792785559,
+        "narHash": "sha256-A2aF11NmA5OjWBBTqnb/0Rj6DzQbCxg3PhCypkTOMDk=",
+        "ref": "refs/heads/master",
+        "rev": "194159064924cb9f7351ed692456cced19cecdfb",
+        "revCount": 223,
+        "type": "git",
+        "url": "file:../mtp"
+      },
+      "original": {
+        "type": "git",
+        "url": "file:../mtp"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1791366222,
@@ -18,8 +50,11 @@
     },
     "root": {
       "inputs": {
+        "iota-src": "iota-src",
+        "mtp-src": "mtp-src",
         "nixpkgs": "nixpkgs",
         "rust-overlay": "rust-overlay",
+        "tau-src": "tau-src",
         "type-maps": "type-maps"
       }
     },
@@ -43,22 +78,36 @@
         "type": "github"
       }
     },
+    "tau-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1793033124,
+        "narHash": "sha256-cYusnSsBGjIHe4aOmw7ZeQTJl8i8lS2FaIP2sjWoqko=",
+        "ref": "refs/heads/main",
+        "rev": "8d317df0441de79f068bb897dbae824383882764",
+        "revCount": 8,
+        "type": "git",
+        "url": "file:../tau"
+      },
+      "original": {
+        "type": "git",
+        "url": "file:../tau"
+      }
+    },
     "type-maps": {
       "flake": false,
       "locked": {
-        "lastModified": 1792833625,
-        "narHash": "sha256-Ndd7moZJU3Uo48WmIcH6mK23DBqCWLUzvE0hsiO/E+s=",
-        "ref": "main",
-        "rev": "f0f856ca1d5fc3ca2b05a71f287c226ea58a6c60",
-        "revCount": 32,
+        "lastModified": 1793033021,
+        "narHash": "sha256-9qh02sjUfIln/UV6AUdwtp99RlPUT+ncqXwyaM1FAWY=",
+        "ref": "de4f6e4631e04f0d6e75bb5cb087e9e49ce03eb2",
+        "rev": "de4f6e4631e04f0d6e75bb5cb087e9e49ce03eb2",
+        "revCount": 33,
         "type": "git",
-        "url": "https://github.com/tensamin/MTP-Type-Maps.git"
+        "url": "file:mtp-type-maps"
       },
       "original": {
-        "ref": "main",
-        "rev": "f0f856ca1d5fc3ca2b05a71f287c226ea58a6c60",
         "type": "git",
-        "url": "https://github.com/tensamin/MTP-Type-Maps.git"
+        "url": "file:mtp-type-maps"
       }
     }
   },

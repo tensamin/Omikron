@@ -50,10 +50,17 @@ impl MutationJournal {
                  operation_id TEXT PRIMARY KEY,
                  stage TEXT NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS omega_mutation_observations (
+              CREATE TABLE IF NOT EXISTS omega_mutation_observations (
                  operation_id TEXT PRIMARY KEY,
                  response BLOB NOT NULL
-             );",
+              );
+              CREATE TABLE IF NOT EXISTS omega_password_mutations (
+                  operation_id TEXT PRIMARY KEY,
+                  service TEXT NOT NULL,
+                  type_map_version TEXT NOT NULL,
+                  attempted_at INTEGER NOT NULL DEFAULT 0,
+                  protected_request BLOB NOT NULL CHECK(length(protected_request) <= 524288)
+              );",
             )
             .map_err(|e| e.to_string())?;
         Ok(Self(connection))
@@ -71,6 +78,29 @@ impl MutationJournal {
             .unchecked_transaction()
             .map_err(|error| error.to_string())?;
         let id = self.begin_record(&evidence)?;
+        if matches!(
+            request.get_comm_type_enum(),
+            Some(
+                CommunicationType::PasswordEnrollmentFinish
+                    | CommunicationType::PasswordEnrollmentDisable
+            )
+        ) {
+            if request.payload().as_encrypted().is_none() {
+                return Err("password mutation must be account-protected".into());
+            }
+            let map = request.type_map().ok_or("missing password type map")?;
+            // Retain only the account-protected ciphertext as status-query proof.
+            // Never replay it as a mutation and never retain plaintext OPAQUE state.
+            let bytes = request
+                .clone()
+                .without_id()
+                .to_bytes()
+                .map_err(|error| error.to_string())?;
+            self.0.execute(
+                "INSERT INTO omega_password_mutations(operation_id, service, type_map_version, protected_request) VALUES (?1, ?2, ?3, ?4)",
+                params![id, service, map.version.to_string(), bytes],
+            ).map_err(|error| error.to_string())?;
+        }
         self.0.execute(
             "INSERT INTO omega_mutation_context(operation_id, routing_generation) VALUES (?1, ?2)",
             params![id, generation],
@@ -128,6 +158,54 @@ impl MutationJournal {
         Ok(())
     }
 
+    pub(crate) fn password_pending(
+        &self,
+        service: &str,
+    ) -> Result<Vec<(String, CommunicationValue, Option<u64>)>, String> {
+        let mut statement = self.0.prepare(
+            "SELECT p.operation_id, p.protected_request, p.type_map_version, c.routing_generation
+             FROM omega_password_mutations p JOIN omega_mutations m ON m.operation_id = p.operation_id
+             LEFT JOIN omega_mutation_context c ON c.operation_id = p.operation_id
+             WHERE p.service = ?1 AND m.response IS NULL ORDER BY p.attempted_at, m.rowid LIMIT 32",
+        ).map_err(|error| error.to_string())?;
+        let rows = statement
+            .query_map([service], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<u64>>(3)?,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+        rows.map(|row| {
+            let (id, bytes, version, generation) = row.map_err(|error| error.to_string())?;
+            let version =
+                mtp::type_map::Version::parse(&version).ok_or("invalid password proof type map")?;
+            let frame =
+                CommunicationValue::try_from_bytes_with(&bytes, &mtp::codec::TypeMap::new(version))
+                    .map_err(|error| error.to_string())?;
+            Ok((id, frame, generation))
+        })
+        .collect()
+    }
+
+    pub(crate) fn password_attempted(&self, id: &str) -> Result<(), String> {
+        self.0
+            .execute(
+                "UPDATE omega_password_mutations SET attempted_at = ?2 WHERE operation_id = ?1",
+                params![
+                    id,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|error| error.to_string())?
+                        .as_millis() as i64
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     pub(crate) fn begin_record(&self, bytes: &[u8]) -> Result<String, String> {
         let existing: Option<String> = self
             .0
@@ -176,6 +254,12 @@ impl MutationJournal {
             return transaction.commit().map_err(|error| error.to_string());
         }
         self.resolve_record(id, &bytes)?;
+        self.0
+            .execute(
+                "DELETE FROM omega_password_mutations WHERE operation_id = ?1",
+                [id],
+            )
+            .map_err(|error| error.to_string())?;
         self.0
             .execute(
                 "UPDATE omega_local_publications SET stage = ?2 WHERE operation_id = ?1",
@@ -422,8 +506,18 @@ mod tests {
     fn private_frames_are_fingerprinted_and_generation_does_not_change_identity() {
         let path = std::env::temp_dir().join(format!("omega-journal-{}.sqlite3", Uuid::new_v4()));
         let journal = MutationJournal::open(&path).unwrap();
+        assert!(
+            journal
+                .begin(
+                    &CommunicationValue::new(CommunicationType::PasswordEnrollmentFinish),
+                    "iota:2",
+                    Some(3)
+                )
+                .is_err()
+        );
+        assert_eq!(journal.unresolved().unwrap(), 0);
         let application_id = Uuid::new_v4().to_string();
-        let request = CommunicationValue::new(CommunicationType::PasswordEnrollmentFinish)
+        let request = CommunicationValue::new(CommunicationType::SyncedSettingSet)
             .with_sender(7)
             .add_typed_default(DataType::Uuid, DataValue::Str(application_id.clone()))
             .add_typed_default(

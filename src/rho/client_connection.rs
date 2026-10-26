@@ -101,6 +101,44 @@ fn authenticated_peer_control_request(cv: &CommunicationValue, user_id: u64) -> 
     cv.clone().with_sender(user_id)
 }
 
+fn authenticated_native_relay_request(
+    cv: &CommunicationValue,
+    actor: u64,
+    session: u64,
+    generation: u64,
+) -> Result<CommunicationValue, &'static str> {
+    if actor == 0
+        || session == 0
+        || generation == 0
+        || !cv.is_type(CommunicationType::Relay)
+        || cv.payload().as_encrypted().is_none()
+    {
+        return Err("invalid native relay forwarding context");
+    }
+    let map = cv.type_map().ok_or("missing native relay dictionary")?;
+    let bytes = cv.to_bytes().map_err(|_| "invalid native relay frame")?;
+    Ok(
+        CommunicationValue::new_with_type_map(CommunicationType::Relay, map)
+            .with_id(cv.id().ok_or("missing native relay correlation")?)
+            .with_sender(actor)
+            .add_typed_default(
+                DataType::Status,
+                DataValue::Str("tensamin-hosted-native-v1".into()),
+            )
+            .add_typed_default(
+                DataType::SessionId,
+                DataValue::UnsignedNumber(session.into()),
+            )
+            .add_typed_default(
+                DataType::VersionNumber,
+                DataValue::UnsignedNumber(generation.into()),
+            )
+            .add_typed_default(DataType::Uuid, DataValue::Str(Uuid::new_v4().to_string()))
+            .add_typed_default(DataType::Version, DataValue::Str(map.version.to_string()))
+            .add_typed_default(DataType::SecurePayload, DataValue::Bytes(bytes)),
+    )
+}
+
 fn is_client_omega_operation(value: &CommunicationValue) -> bool {
     matches!(
         value.get_comm_type_enum(),
@@ -126,6 +164,7 @@ pub struct ClientConnection {
     pub_key: Arc<RwLock<Option<Vec<u8>>>>,
     pub rho_connection: Arc<RwLock<Option<Arc<RhoConnection>>>>,
     pub(super) is_open: Arc<RwLock<bool>>,
+    pub(super) native_forwarding: Arc<super::native_forwarding::NativeForwarding>,
     message_slots: Arc<tokio::sync::Semaphore>,
     tasks: Arc<super::tasks::MessageTasks>,
     client_state_sync: Arc<Mutex<ClientStateSyncState>>,
@@ -142,6 +181,7 @@ impl ClientConnection {
             pub_key: Arc::new(RwLock::new(None)),
             rho_connection: general.rho_connection.clone(),
             is_open: Arc::new(RwLock::new(true)),
+            native_forwarding: Arc::new(super::native_forwarding::NativeForwarding::default()),
             sender: general.sender.clone(),
             receiver: general.receiver.clone(),
             user_id,
@@ -358,9 +398,88 @@ impl ClientConnection {
             }
 
             if cv.is_type(CommunicationType::Relay) {
-                // Client authentication does not establish a canonical Iota source.
-                self.send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
-                    .await;
+                let mutation = self.state.rho.mutation_guard().await;
+                // Hold this client's route read guard through Iota's commit reply.
+                // The opaque native frame is never rewritten with a claimed actor.
+                let route = self.rho_connection.read().await;
+                let Some(rho) = route.as_ref() else {
+                    drop(route);
+                    drop(mutation);
+                    self.clone()
+                        .send_error_response(message_id, CommunicationType::ErrorNoIota)
+                        .await;
+                    return;
+                };
+                let Some(generation) = self
+                    .state
+                    .rho
+                    .user_route_generation(self.user_id as i64, rho)
+                else {
+                    return;
+                };
+                if !rho.owns_client(&self) || cv.payload().as_encrypted().is_none() {
+                    drop(route);
+                    drop(mutation);
+                    self.clone()
+                        .send_error_response(message_id, CommunicationType::ErrorNotAuthenticated)
+                        .await;
+                    return;
+                }
+                let Ok(request) = authenticated_native_relay_request(
+                    &cv,
+                    self.user_id,
+                    self.session_id,
+                    generation,
+                ) else {
+                    return;
+                };
+                let open = self.is_open.read().await;
+                if !*open {
+                    return;
+                }
+                let nonce = request
+                    .get_data(DataType::Uuid)
+                    .as_str()
+                    .and_then(|nonce| Uuid::parse_str(nonce).ok())
+                    .expect("server-generated forwarding nonce");
+                let Some(mut forwarding) = self.native_forwarding.begin(nonce) else {
+                    drop(open);
+                    drop(route);
+                    drop(mutation);
+                    self.sender
+                        .send(
+                            &CommunicationValue::new(CommunicationType::ErrorInternal)
+                                .with_id(message_id),
+                        )
+                        .await
+                        .ok();
+                    return;
+                };
+                drop(mutation);
+                match rho
+                    .await_hosted_native_relay(&request, &mut forwarding.cancellation)
+                    .await
+                {
+                    Ok(response)
+                        if self
+                            .state
+                            .rho
+                            .user_route_generation(self.user_id as i64, rho)
+                            == Some(generation)
+                            && rho.owns_client(&self) =>
+                    {
+                        self.sender.send(&response).await.ok();
+                    }
+                    _ => {
+                        self.sender
+                            .send(
+                                &CommunicationValue::new(CommunicationType::ErrorInternal)
+                                    .with_id(message_id),
+                            )
+                            .await
+                            .ok();
+                    }
+                }
                 return;
             }
 
@@ -603,7 +722,10 @@ impl ClientConnection {
                 match rho
                     .get_iota_connection()
                     .clone()
-                    .await_response(&cv, Some(self.state.config.password_upstream_timeout))
+                    .await_response(
+                        &cv.with_sender(self.user_id),
+                        Some(self.state.config.password_upstream_timeout),
+                    )
                     .await
                 {
                     Ok(response) => self.send_message(&response.with_id(message_id)).await,
@@ -1026,6 +1148,8 @@ impl ClientConnection {
 
     /// Close the connection
     pub async fn close(&self) {
+        let pause = self.native_forwarding.pause();
+        pause.wait().await;
         let mut is_open_guard = self.is_open.write().await;
         let mut requests = self.foreground_requests.lock().await;
         if !*is_open_guard {
@@ -1096,6 +1220,7 @@ impl Clone for ClientConnection {
             pub_key: Arc::clone(&self.pub_key),
             rho_connection: Arc::clone(&self.rho_connection),
             is_open: Arc::clone(&self.is_open),
+            native_forwarding: self.native_forwarding.clone(),
             message_slots: Arc::clone(&self.message_slots),
             tasks: Arc::clone(&self.tasks),
             client_state_sync: Arc::clone(&self.client_state_sync),
