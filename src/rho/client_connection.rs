@@ -1,14 +1,11 @@
 mod calls;
 use calls::call_error_type;
-mod state_sync;
-#[cfg(test)]
-use state_sync::merge_initial_presence_snapshot;
 mod omega_forward;
 use crate::anonymous_clients::anonymous_manager;
 use crate::app_state::AppState;
 use crate::calls::{call_group::call_invite_secret_from_cv, call_manager::CallServiceError};
 use crate::data::user::UserStatus;
-use crate::omega::omega_connection::{AuthIdentity, AuthIdentityKind, InitialPresenceError};
+use crate::omega::omega_connection::{AuthIdentity, AuthIdentityKind};
 use crate::rho::connection::{
     GeneralConnection, MtpReceiver, MtpSender, OptionalDataValueExt, RequiredCommunicationFields,
     positive_data_i64,
@@ -20,52 +17,14 @@ use crate::{log_cv_in, log_cv_out, log_err, log_out};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataTypeId, DataValue};
 use mtp::crypto::PublicKeyBundle;
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
-use std::{collections::VecDeque, str::FromStr};
 use tokio::sync::{Mutex, RwLock, oneshot};
 use uuid::Uuid;
 
 static NEXT_POLICY_REQUEST_ID: AtomicU32 = AtomicU32::new(1);
-const MAX_CLIENT_STATE_SYNC_BUFFERED_EVENTS: usize = 1_024;
-
-#[derive(Clone, Debug, Default)]
-enum ClientStateSyncPhase {
-    #[default]
-    Idle,
-    Requesting {
-        #[expect(
-            dead_code,
-            reason = "retain requesting device context until sync acknowledgement"
-        )]
-        device_id: String,
-    },
-    AwaitingAck {
-        device_id: String,
-        version: i64,
-    },
-    /// Iota's acknowledgement is in flight. Post-initial-state messages must
-    /// remain queued until its durable commit succeeds.
-    Committing {
-        device_id: String,
-        version: i64,
-    },
-    Draining,
-}
-
-#[derive(Default)]
-struct ClientStateSyncState {
-    phase: ClientStateSyncPhase,
-    buffered_events: VecDeque<CommunicationValue>,
-    overflowed: bool,
-}
-
-enum AckCommitStart {
-    Started,
-    Invalid,
-    Overflowed,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceClass {
@@ -167,7 +126,6 @@ pub struct ClientConnection {
     pub(super) native_forwarding: Arc<super::native_forwarding::NativeForwarding>,
     message_slots: Arc<tokio::sync::Semaphore>,
     tasks: Arc<super::tasks::MessageTasks>,
-    client_state_sync: Arc<Mutex<ClientStateSyncState>>,
     session_activity: Arc<RwLock<SessionActivity>>,
     pub(super) foreground_requests: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
     managed_calls: Arc<AtomicBool>,
@@ -192,7 +150,6 @@ impl ClientConnection {
                 general.shutdown.subscribe(),
                 general.state.config.message_drain,
             )),
-            client_state_sync: Arc::new(Mutex::new(ClientStateSyncState::default())),
             session_activity: Arc::new(RwLock::new(SessionActivity::default())),
             foreground_requests: Arc::new(Mutex::new(HashMap::new())),
             managed_calls: Arc::new(AtomicBool::new(false)),
@@ -280,7 +237,6 @@ impl ClientConnection {
         }
         self.tasks.drain().await;
         self.close().await;
-        self.reset_client_state_sync().await;
         self.clone().handle_close().await;
     }
 
@@ -806,223 +762,76 @@ impl ClientConnection {
             }
 
             if cv.is_type(CommunicationType::AccountStateRequest) {
-                let device_class = match cv.get_data(DataType::DeviceClass).as_str() {
-                    Some("desktop") => Some(DeviceClass::Desktop),
-                    Some("mobile") => Some(DeviceClass::Mobile),
-                    Some("web") => Some(DeviceClass::Web),
-                    _ => None,
-                };
-                let notification_capable = cv.get_data(DataType::NotificationCapable).as_bool();
-                let can_request = {
-                    let mut state = self.client_state_sync.lock().await;
-                    if matches!(state.phase, ClientStateSyncPhase::Idle) {
-                        state.phase = ClientStateSyncPhase::Requesting {
-                            device_id: String::new(),
-                        };
-                        state.buffered_events.clear();
-                        state.overflowed = false;
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if !can_request {
-                    self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
-                        .await;
-                    return;
-                }
-                if let (Some(device_class), Some(notification_capable)) =
-                    (device_class, notification_capable)
-                {
-                    *self.session_activity.write().await = SessionActivity {
-                        reported: true,
-                        device_class,
-                        notification_capable,
-                    };
-                }
-                let Some(rho) = self.get_rho_connection().await else {
-                    self.reset_client_state_sync().await;
-                    self.send_error_response(message_id, CommunicationType::ErrorNoIota)
-                        .await;
-                    return;
-                };
-                let generation = self
-                    .state
-                    .rho
-                    .user_route_generation(self.user_id as i64, &rho);
-                if generation.is_none() || !rho.owns_client(&self) {
-                    self.reset_client_state_sync().await;
-                    return;
-                }
-                let mut request = cv.clone();
-                request.remove_data(DataType::SessionId);
-                request.remove_data(DataType::DeviceClass);
-                request.remove_data(DataType::NotificationCapable);
-                let request = request.with_sender(self.user_id).add_typed_default(
-                    DataType::SessionId,
-                    DataValue::UnsignedNumber(self.session_id.into()),
-                );
-                match rho
-                    .get_iota_connection()
-                    .clone()
-                    .await_response(&request, Some(Duration::from_secs(20)))
-                    .await
-                {
-                    Ok(response)
-                        if response.is_type(CommunicationType::AccountStateSnapshot)
-                            && response.receiver() == Some(self.user_id) =>
-                    {
-                        let response = match self
-                            .compose_initial_client_state(
-                                rho.get_iota_connection().clone(),
-                                response,
-                            )
-                            .await
-                        {
-                            Ok(response) => response,
-                            Err(_) => {
-                                self.reset_client_state_sync().await;
-                                self.send_error_response(
-                                    message_id,
-                                    CommunicationType::ErrorInternal,
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                        let _route = self.rho_connection.read().await;
-                        if self
-                            .state
-                            .rho
-                            .user_route_generation(self.user_id as i64, &rho)
-                            != generation
-                            || !rho.owns_client(&self)
-                        {
-                            self.reset_client_state_sync().await;
-                            return;
-                        }
-                        self.client_state_sync.lock().await.phase =
-                            ClientStateSyncPhase::AwaitingAck {
-                                device_id: String::new(),
-                                version: 0,
-                            };
-                        self.clone().send_message(&response).await;
-                    }
-                    Ok(_) => {
-                        self.reset_client_state_sync().await;
+                if cv.get_data(DataType::Json).is_some() {
+                    // Scoped pages and acknowledgements are Iota-owned. Do not
+                    // add legacy SessionId fields or compose presence into their JSON.
+                    if tau::sync::decode_request(&cv).is_err() {
                         self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
                             .await;
+                        return;
                     }
-                    Err(_) => {
-                        self.reset_client_state_sync().await;
-                        self.send_error_response(message_id, CommunicationType::ErrorInternal)
-                            .await;
+                    let Some(rho) = self.get_rho_connection().await else {
+                        if let Ok(response) = tau::sync::encode_response(
+                            &cv,
+                            &tau::sync::Response::Unavailable {
+                                error: tau::sync::SyncError::Retryable,
+                            },
+                        ) {
+                            self.send_message(&response).await;
+                        }
+                        return;
+                    };
+                    let generation = self
+                        .state
+                        .rho
+                        .user_route_generation(self.user_id as i64, &rho);
+                    if generation.is_none() || !rho.owns_client(&self) {
+                        return;
                     }
+                    let request = cv.clone().with_sender(self.user_id);
+                    let response = match rho
+                        .get_iota_connection()
+                        .clone()
+                        .await_response(&request, Some(Duration::from_secs(20)))
+                        .await
+                    {
+                        Ok(response)
+                            if response.receiver() == Some(self.user_id)
+                                && tau::sync::decode_response(&response, &request).is_ok() =>
+                        {
+                            response
+                        }
+                        _ => match tau::sync::encode_response(
+                            &cv,
+                            &tau::sync::Response::Unavailable {
+                                error: tau::sync::SyncError::Retryable,
+                            },
+                        ) {
+                            Ok(response) => response,
+                            Err(_) => return,
+                        },
+                    };
+                    let _route = self.rho_connection.read().await;
+                    if self
+                        .state
+                        .rho
+                        .user_route_generation(self.user_id as i64, &rho)
+                        != generation
+                        || !rho.owns_client(&self)
+                    {
+                        return;
+                    }
+                    self.clone().send_message(&response).await;
+                    return;
                 }
+                self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                    .await;
                 return;
             }
 
             if cv.is_type(CommunicationType::AccountStateApplied) {
-                let begin_commit = {
-                    let mut state = self.client_state_sync.lock().await;
-                    match &state.phase {
-                        ClientStateSyncPhase::AwaitingAck { device_id, version } => {
-                            if state.overflowed {
-                                AckCommitStart::Overflowed
-                            } else {
-                                state.phase = ClientStateSyncPhase::Committing {
-                                    device_id: device_id.clone(),
-                                    version: *version,
-                                };
-                                AckCommitStart::Started
-                            }
-                        }
-                        _ => AckCommitStart::Invalid,
-                    }
-                };
-                match begin_commit {
-                    AckCommitStart::Started => {}
-                    AckCommitStart::Invalid => {
-                        self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
-                            .await;
-                        return;
-                    }
-                    AckCommitStart::Overflowed => {
-                        self.state.omega.abort_initial_presence_sync(
-                            self.user_id as i64,
-                            self.session_id as i64,
-                        );
-                        self.reset_client_state_sync().await;
-                        self.send_error_response(message_id, CommunicationType::ErrorInternal)
-                            .await;
-                        return;
-                    }
-                }
-                let Some(rho) = self.get_rho_connection().await else {
-                    self.restore_client_state_ack().await;
-                    self.send_error_response(message_id, CommunicationType::ErrorNoIota)
-                        .await;
-                    return;
-                };
-                let mut request = cv.clone();
-                request.remove_data(DataType::SessionId);
-                let request = request.with_sender(self.user_id).add_typed_default(
-                    DataType::SessionId,
-                    DataValue::UnsignedNumber(self.session_id.into()),
-                );
-                if self.client_state_sync.lock().await.overflowed {
-                    self.state
-                        .omega
-                        .abort_initial_presence_sync(self.user_id as i64, self.session_id as i64);
-                    self.reset_client_state_sync().await;
-                    self.send_error_response(message_id, CommunicationType::ErrorInternal)
-                        .await;
-                    return;
-                }
-                if self
-                    .state
-                    .omega
-                    .finish_initial_presence_sync(self.user_id as i64, self.session_id as i64)
-                    .await
-                    .is_err()
-                    || self.client_state_sync.lock().await.overflowed
-                {
-                    self.reset_client_state_sync().await;
-                    self.send_error_response(message_id, CommunicationType::ErrorInternal)
-                        .await;
-                    return;
-                }
-                match rho
-                    .get_iota_connection()
-                    .clone()
-                    .await_response(&request, Some(Duration::from_secs(20)))
-                    .await
-                {
-                    Ok(response) => {
-                        if response.is_type(CommunicationType::Success) {
-                            if self.client_state_sync.lock().await.overflowed {
-                                // Iota has committed its ACK, so a retry on
-                                // this transport could incorrectly resume
-                                // delivery. Reconnect to establish a fresh
-                                // synchronization transaction.
-                                self.close().await;
-                                return;
-                            }
-                            self.client_state_sync.lock().await.phase =
-                                ClientStateSyncPhase::Draining;
-                            self.clone().send_message(&response).await;
-                            self.clone().drain_buffered_live_events().await;
-                        } else {
-                            self.restore_client_state_ack().await;
-                            self.send_message(&response).await;
-                        }
-                    }
-                    Err(_) => {
-                        self.restore_client_state_ack().await;
-                        self.send_error_response(message_id, CommunicationType::ErrorInternal)
-                            .await;
-                    }
-                }
+                self.send_error_response(message_id, CommunicationType::ErrorInvalidData)
+                    .await;
                 return;
             }
 
@@ -1223,7 +1032,6 @@ impl Clone for ClientConnection {
             native_forwarding: self.native_forwarding.clone(),
             message_slots: Arc::clone(&self.message_slots),
             tasks: Arc::clone(&self.tasks),
-            client_state_sync: Arc::clone(&self.client_state_sync),
             session_activity: Arc::clone(&self.session_activity),
             foreground_requests: Arc::clone(&self.foreground_requests),
             managed_calls: Arc::clone(&self.managed_calls),

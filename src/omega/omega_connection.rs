@@ -30,7 +30,6 @@ use mtp::{
 use mtp_native::ConnectionHandle;
 use rand::RngExt;
 use std::{
-    collections::VecDeque,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -49,7 +48,6 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const CAPABILITY_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const TASK_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
-const MAX_INITIAL_PRESENCE_BUFFERED_EVENTS: usize = 1_024;
 const TASK_MAX_AGE: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_REQUESTS: usize = 128;
 const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u32 = 3;
@@ -204,7 +202,6 @@ pub struct OmegaConnection {
     waiting_tasks: tau::ResponseCorrelator,
     session_presence: DashMap<(i64, i64), SessionPresenceState>,
     presence_delivery_locks: DashMap<(i64, i64), Arc<Mutex<()>>>,
-    initial_presence_barriers: DashMap<(i64, i64), Arc<Mutex<InitialPresenceBarrier>>>,
     peer_capabilities: Arc<RwLock<PeerCapabilities>>,
     #[cfg(test)]
     test_requests: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<TestRequest>>>,
@@ -225,17 +222,6 @@ pub enum InitialPresenceError {
     SubscriptionRejected(String),
     #[error("invalid GetStates snapshot: {0}")]
     InvalidSnapshot(String),
-    #[error("initial presence synchronization is already in progress")]
-    AlreadyInProgress,
-    #[error("initial presence event ordering was lost")]
-    OrderingLost,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PresenceBufferResult {
-    NotBuffered,
-    Buffered,
-    OrderingLost,
 }
 
 fn omega_transport_policy(config: &TransportConfig) -> Policy {
@@ -253,13 +239,6 @@ fn omega_transport_policy(config: &TransportConfig) -> Policy {
         .with_receiver_queue_capacity(1000)
         .with_max_concurrent_stream_tasks(64)
         .with_persistent_stream_retries(5, Duration::from_secs(5))
-}
-
-#[derive(Default)]
-struct InitialPresenceBarrier {
-    queued: VecDeque<CommunicationValue>,
-    live: bool,
-    overflowed: bool,
 }
 
 impl OmegaConnection {
@@ -308,7 +287,6 @@ impl OmegaConnection {
             waiting_tasks: tau::ResponseCorrelator::new(),
             session_presence: DashMap::new(),
             presence_delivery_locks: DashMap::new(),
-            initial_presence_barriers: DashMap::new(),
             peer_capabilities: Arc::new(RwLock::new(PeerCapabilities::default())),
             #[cfg(test)]
             test_requests: std::sync::Mutex::new(None),

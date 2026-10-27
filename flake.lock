@@ -3,33 +3,35 @@
     "iota-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1793033129,
-        "narHash": "sha256-6POmYI/sKEIAd74caxV6SZFw+kLt/Hvqz8lOWyNy97o=",
-        "ref": "refs/heads/main",
-        "rev": "4612c4c26d2a5b36976b6490f982e5bd3c2ee848",
-        "revCount": 345,
-        "type": "git",
-        "url": "file:../iota"
+        "lastModified": 1793117201,
+        "narHash": "sha256-T5PQPvpUneu4RfBZu3oZFp2K6SS8CN8zAxjTItsDNVg=",
+        "owner": "TensaminDev",
+        "repo": "Iota",
+        "rev": "47b3f26e1774996a73b50125bf8069efc3d8fbc1",
+        "type": "github"
       },
       "original": {
-        "type": "git",
-        "url": "file:../iota"
+        "owner": "TensaminDev",
+        "repo": "Iota",
+        "rev": "47b3f26e1774996a73b50125bf8069efc3d8fbc1",
+        "type": "github"
       }
     },
     "mtp-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1792785559,
-        "narHash": "sha256-A2aF11NmA5OjWBBTqnb/0Rj6DzQbCxg3PhCypkTOMDk=",
-        "ref": "refs/heads/master",
-        "rev": "194159064924cb9f7351ed692456cced19cecdfb",
-        "revCount": 223,
-        "type": "git",
-        "url": "file:../mtp"
+        "lastModified": 1793115950,
+        "narHash": "sha256-AJ9XorXQkzIjcrad8PajWaL/dQZ3QEQ8mitwiIbmNPk=",
+        "owner": "Nonanium",
+        "repo": "MTP",
+        "rev": "db3125809293e462ec1593704e9c4d2172437533",
+        "type": "github"
       },
       "original": {
-        "type": "git",
-        "url": "file:../mtp"
+        "owner": "Nonanium",
+        "repo": "MTP",
+        "rev": "db3125809293e462ec1593704e9c4d2172437533",
+        "type": "github"
       }
     },
     "nixpkgs": {
@@ -81,33 +83,35 @@
     "tau-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1793033124,
-        "narHash": "sha256-cYusnSsBGjIHe4aOmw7ZeQTJl8i8lS2FaIP2sjWoqko=",
-        "ref": "refs/heads/main",
-        "rev": "8d317df0441de79f068bb897dbae824383882764",
-        "revCount": 8,
-        "type": "git",
-        "url": "file:../tau"
+        "lastModified": 1793116202,
+        "narHash": "sha256-6ah5yU2rfrZOX5m3l4+zpAcd6CXJ6h7JLtK+vLK/goo=",
+        "owner": "TensaminDev",
+        "repo": "Tau",
+        "rev": "57096c5341f5196ea953788ab8fd3c60ca920817",
+        "type": "github"
       },
       "original": {
-        "type": "git",
-        "url": "file:../tau"
+        "owner": "TensaminDev",
+        "repo": "Tau",
+        "rev": "57096c5341f5196ea953788ab8fd3c60ca920817",
+        "type": "github"
       }
     },
     "type-maps": {
       "flake": false,
       "locked": {
-        "lastModified": 1793033021,
-        "narHash": "sha256-9qh02sjUfIln/UV6AUdwtp99RlPUT+ncqXwyaM1FAWY=",
-        "ref": "de4f6e4631e04f0d6e75bb5cb087e9e49ce03eb2",
-        "rev": "de4f6e4631e04f0d6e75bb5cb087e9e49ce03eb2",
-        "revCount": 33,
-        "type": "git",
-        "url": "file:mtp-type-maps"
+        "lastModified": 1793115588,
+        "narHash": "sha256-mvj+EqA6vB3kOD6u/NMzYmBvKUs063/YJYgVOQJ6J8Q=",
+        "owner": "TensaminDev",
+        "repo": "Mtp-Type-Maps",
+        "rev": "6d0f1dee1391417b7f364189e03a39b17b01ce36",
+        "type": "github"
       },
       "original": {
-        "type": "git",
-        "url": "file:mtp-type-maps"
+        "owner": "TensaminDev",
+        "repo": "Mtp-Type-Maps",
+        "rev": "6d0f1dee1391417b7f364189e03a39b17b01ce36",
+        "type": "github"
       }
     }
   },

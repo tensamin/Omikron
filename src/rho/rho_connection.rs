@@ -28,28 +28,6 @@ fn message_targets_client(cv: &CommunicationValue, user_id: u64, session_id: u64
     target_session_id == i128::from(session_id)
 }
 
-fn must_follow_initial_state(cv: &CommunicationValue) -> bool {
-    matches!(
-        cv.get_comm_type_enum(),
-        Some(
-            CommunicationType::MessageLive
-                | CommunicationType::MessageState
-                | CommunicationType::MessageEditLive
-                | CommunicationType::MessageReactionLive
-                | CommunicationType::MessageDeleteLive
-                | CommunicationType::ClientChanged
-                | CommunicationType::SyncedSettingChanged
-                | CommunicationType::UserBlobChanged
-                | CommunicationType::UserAssetChanged
-                | CommunicationType::BlockedUsersChanged
-                | CommunicationType::ReceiptPolicyChanged
-                | CommunicationType::MessageStoragePolicyChanged
-                | CommunicationType::PushNotification
-                | CommunicationType::ChatSecretForward
-        )
-    )
-}
-
 fn local_delivery_result(attempted: usize, sent: usize) -> Result<usize, String> {
     if attempted == 0 {
         Err("client offline".to_string())
@@ -447,14 +425,9 @@ impl RhoConnection {
             } else {
                 cv.clone()
             };
-            if must_follow_initial_state(&client_cv) {
-                let _ = connection
-                    .clone()
-                    .send_or_buffer_post_initial_state(client_cv)
-                    .await;
-            } else {
-                connection.clone().send_message(&client_cv).await;
-            }
+            // Durable account delivery is gated by Iota's scoped page ack.
+            // Presence and other hints do not establish account acceptance.
+            connection.clone().send_message(&client_cv).await;
         }
     }
 
@@ -675,7 +648,7 @@ impl RhoConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{local_delivery_result, message_targets_client, must_follow_initial_state};
+    use super::{local_delivery_result, message_targets_client};
     use mtp::codec::{CommunicationType, CommunicationValue, DataType};
 
     #[tokio::test]
@@ -878,12 +851,5 @@ mod tests {
         assert_eq!(local_delivery_result(2, 1), Ok(1));
         assert!(local_delivery_result(2, 0).is_err());
         assert!(local_delivery_result(0, 0).is_err());
-    }
-
-    #[test]
-    fn message_state_is_buffered_with_other_message_mutations() {
-        assert!(must_follow_initial_state(&CommunicationValue::new(
-            CommunicationType::MessageState
-        )));
     }
 }

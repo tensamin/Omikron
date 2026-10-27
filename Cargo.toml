@@ -4,17 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tau = { path = "../tau" }
-iota-opaque = { path = "../iota/iota-opaque" }
+tau = { git = "https://github.com/TensaminDev/Tau.git", rev = "57096c5341f5196ea953788ab8fd3c60ca920817" }
+iota-opaque = { git = "https://github.com/TensaminDev/Iota.git", rev = "47b3f26e1774996a73b50125bf8069efc3d8fbc1" }
 libc = "0.2"
-mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584", features = [
+mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "db3125809293e462ec1593704e9c4d2172437533", features = [
     "web-server",
     "client",
     "crypto",
     "files",
     "raw",
 ] }
-mtp-native = { git = "https://github.com/Nonanium/MTP.git", rev = "9f7f94e4cbd227610784ae47a1e7a1acf66f8584" }
+mtp-native = { git = "https://github.com/Nonanium/MTP.git", rev = "db3125809293e462ec1593704e9c4d2172437533" }
 
 ansi_term = "0.12.1"
 uuid = { version = "1.24.0", features = ["v4"] }
@@ -46,9 +46,3 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 
 [dev-dependencies]
 rcgen = "0.14"
-
-[patch."https://github.com/Nonanium/MTP.git"]
-mtp = { path = "../mtp" }
-mtp-native = { path = "../mtp/bindings/native" }
-mtp-type-map = { path = "../mtp/type-map" }
-mtp-crypto = { path = "../mtp/crypto" }

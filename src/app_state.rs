@@ -7,7 +7,6 @@ use tokio::sync::Semaphore;
 use crate::{
     calls::call_manager::CallManager, config::Config, omega::omega_connection::OmegaConnection,
     provisioning::ProvisioningManager, rho::rho_manager::RhoManager,
-    services::call_state::CallStateAggregator,
 };
 
 pub struct RhoConnectionLimits {
@@ -67,7 +66,6 @@ pub struct AppState {
     pub omega: Arc<OmegaConnection>,
     pub rho: Arc<RhoManager>,
     pub call_manager: Arc<CallManager>,
-    pub call_state_aggregator: Arc<CallStateAggregator>,
     pub rho_connection_limits: Arc<RhoConnectionLimits>,
     pub provisioning: Arc<ProvisioningManager>,
 }
@@ -94,9 +92,6 @@ impl AppState {
             keyring,
             omega,
             rho: rho.clone(),
-            call_state_aggregator: Arc::new(
-                CallStateAggregator::new(call_manager.clone()).with_rho(rho.clone()),
-            ),
             call_manager,
             rho_connection_limits,
         })

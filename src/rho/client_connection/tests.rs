@@ -1,6 +1,4 @@
-use super::{
-    authenticated_peer_control_request, is_client_omega_operation, merge_initial_presence_snapshot,
-};
+use super::{authenticated_peer_control_request, is_client_omega_operation};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 
 #[test]
@@ -111,10 +109,7 @@ async fn managed_commands_cross_authenticated_mtp_dispatch_with_the_session_acto
         ),
     );
     let owned = Arc::get_mut(&mut state).unwrap();
-    owned.call_manager = manager.clone();
-    owned.call_state_aggregator = Arc::new(crate::services::call_state::CallStateAggregator::new(
-        manager,
-    ));
+    owned.call_manager = manager;
     let (host, peer, transport) = test_support::authenticated("client").await;
     let general = GeneralConnection::admit(transport, state, &admission_engine()).unwrap();
     let client = super::ClientConnection::from_general(general.clone(), 42).await;
@@ -737,37 +732,4 @@ async fn native_revocation_uses_authenticated_replacement_before_route_publicati
     old_host.shutdown().await;
     new_host.shutdown().await;
     client_host.shutdown().await;
-}
-
-#[test]
-fn initial_state_composition_preserves_iota_state_and_marks_missing_presence_incomplete() {
-    let iota_state = CommunicationValue::new(CommunicationType::AccountStateSnapshot)
-        .add_typed_default(DataType::VersionNumber, DataValue::SignedNumber(12));
-    let presence = CommunicationValue::new(CommunicationType::GetStates)
-        .add_typed_default(
-            DataType::UserStates,
-            DataValue::Array(vec![DataValue::Str("online".into())]),
-        )
-        .add_typed_default(
-            DataType::MissingUserIds,
-            DataValue::Array(vec![DataValue::SignedNumber(44)]),
-        );
-
-    let result = merge_initial_presence_snapshot(iota_state, presence);
-
-    assert!(result.is_type(CommunicationType::AccountStateSnapshot));
-    assert_eq!(
-        result
-            .get_data(DataType::VersionNumber)
-            .and_then(DataValue::as_number),
-        Some(12)
-    );
-    assert!(matches!(
-        result.get_data(DataType::UserStates),
-        Some(DataValue::Array(states)) if states.len() == 1
-    ));
-    assert_eq!(
-        result.get_data(DataType::PresenceSnapshotComplete),
-        Some(&DataValue::Bool(false))
-    );
 }

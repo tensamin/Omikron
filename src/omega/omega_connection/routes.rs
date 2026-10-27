@@ -130,8 +130,6 @@ impl OmegaConnection {
     pub(crate) fn invalidate_client_presence(&self, user_id: i64, session_id: i64) {
         self.session_presence.remove(&(user_id, session_id));
         self.presence_delivery_locks.remove(&(user_id, session_id));
-        self.initial_presence_barriers
-            .remove(&(user_id, session_id));
     }
 
     pub async fn client_disconnected(&self, user_id: i64, session_id: i64) -> Result<(), String> {

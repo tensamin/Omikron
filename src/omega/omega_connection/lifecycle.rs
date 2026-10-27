@@ -498,16 +498,7 @@ impl OmegaConnection {
                                 else {
                                     continue;
                                 };
-                                match self
-                                    .buffer_initial_presence_event((receiver, session_id), cv.clone())
-                                    .await
-                                {
-                                    PresenceBufferResult::NotBuffered => {
-                                        self.forward_client_changed(receiver, session_id, &cv).await;
-                                    }
-                                    PresenceBufferResult::Buffered
-                                    | PresenceBufferResult::OrderingLost => {}
-                                }
+                                self.forward_client_changed(receiver, session_id, &cv).await;
                                 continue;
                             }
                         }
