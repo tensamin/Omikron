@@ -3,17 +3,17 @@
     "iota-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1793117201,
-        "narHash": "sha256-T5PQPvpUneu4RfBZu3oZFp2K6SS8CN8zAxjTItsDNVg=",
+        "lastModified": 1793140447,
+        "narHash": "sha256-QFkKIvKb1iaakuB6eQgzBTLPlz8jZa2hA1iIRlzvoZU=",
         "owner": "TensaminDev",
         "repo": "Iota",
-        "rev": "47b3f26e1774996a73b50125bf8069efc3d8fbc1",
+        "rev": "d2ec4f21049a8fd8819c3acc448ee207b0e20fe8",
         "type": "github"
       },
       "original": {
         "owner": "TensaminDev",
         "repo": "Iota",
-        "rev": "47b3f26e1774996a73b50125bf8069efc3d8fbc1",
+        "rev": "d2ec4f21049a8fd8819c3acc448ee207b0e20fe8",
         "type": "github"
       }
     },
@@ -83,17 +83,17 @@
     "tau-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1793116202,
-        "narHash": "sha256-6ah5yU2rfrZOX5m3l4+zpAcd6CXJ6h7JLtK+vLK/goo=",
+        "lastModified": 1793139251,
+        "narHash": "sha256-qn8X9hX9/fv7AEbl0cbtrpisdvam6h1fzEEbIObrDhU=",
         "owner": "TensaminDev",
         "repo": "Tau",
-        "rev": "57096c5341f5196ea953788ab8fd3c60ca920817",
+        "rev": "714968acb05a2e877f03690028ae604afcbbc701",
         "type": "github"
       },
       "original": {
         "owner": "TensaminDev",
         "repo": "Tau",
-        "rev": "57096c5341f5196ea953788ab8fd3c60ca920817",
+        "rev": "714968acb05a2e877f03690028ae604afcbbc701",
         "type": "github"
       }
     },

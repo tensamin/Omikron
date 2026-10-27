@@ -64,6 +64,19 @@ impl ProvisioningConnection {
                 return Err(error);
             }
         };
+        if let Ok(failure) = tau::password::Failure::from_frame(&response) {
+            let delivered = self.password_delivery(&response, "failure delivery").await;
+            self.terminate_forward(
+                id,
+                if failure.retryable() {
+                    ProvisioningFailure::UpstreamUnavailable
+                } else {
+                    ProvisioningFailure::UpstreamRejected
+                },
+            )
+            .await;
+            return delivered;
+        }
         if !response.is_type(CommunicationType::PasswordProvisioningResponse)
             || response
                 .get_data(DataType::Uuid)
@@ -126,6 +139,19 @@ impl ProvisioningConnection {
                 return Err(error);
             }
         };
+        if let Ok(failure) = tau::password::Failure::from_frame(&response) {
+            let delivered = self.password_delivery(&response, "failure delivery").await;
+            self.terminate_forward(
+                id,
+                if failure.retryable() {
+                    ProvisioningFailure::UpstreamUnavailable
+                } else {
+                    ProvisioningFailure::UpstreamRejected
+                },
+            )
+            .await;
+            return delivered;
+        }
         if !response.is_type(CommunicationType::ProvisioningCredential)
             || response.receiver() != Some(self.general.id())
             || response.payload().as_encrypted().is_none()

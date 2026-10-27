@@ -11,7 +11,7 @@
       flake = false;
     };
     tau-src = {
-      url = "github:TensaminDev/Tau/57096c5341f5196ea953788ab8fd3c60ca920817";
+      url = "github:TensaminDev/Tau/714968acb05a2e877f03690028ae604afcbbc701";
       flake = false;
     };
     mtp-src = {
@@ -19,7 +19,7 @@
       flake = false;
     };
     iota-src = {
-      url = "github:TensaminDev/Iota/47b3f26e1774996a73b50125bf8069efc3d8fbc1";
+      url = "github:TensaminDev/Iota/d2ec4f21049a8fd8819c3acc448ee207b0e20fe8";
       flake = false;
     };
   };
@@ -132,7 +132,7 @@
               pname = "omikron";
               version = "0.1.0";
               src = source;
-              hash = "sha256-BW0hea2G/AUy5pOQJB5Fcn09btsIthyTWnm7BBzPckY=";
+              hash = "sha256-OSdwx8s5zb3Dd7pylxPf5Y1n7w99qegopHgkXtUxdCc=";
             };
           };
           container = self.lib.mkContainer {
