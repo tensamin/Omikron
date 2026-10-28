@@ -7,11 +7,11 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     type-maps = {
-      url = "github:TensaminDev/Mtp-Type-Maps/6d0f1dee1391417b7f364189e03a39b17b01ce36";
+      url = "github:TensaminDev/Mtp-Type-Maps/bcaf5a2f1a43f1945fa531ecd688b31ae648919e";
       flake = false;
     };
     tau-src = {
-      url = "github:TensaminDev/Tau/cb1f5953c0f9e71c4a01688abaf8432fda3c90da";
+      url = "github:TensaminDev/Tau/e140d4ac71fb83d4de32a108f65355cc9d52afea";
       flake = false;
     };
     mtp-src = {
@@ -19,7 +19,7 @@
       flake = false;
     };
     iota-src = {
-      url = "github:TensaminDev/Iota/fe645d74a6356d21cf4705d3c8a8d4ee82bbb8aa";
+      url = "github:TensaminDev/Iota/060387affdef2c683aa1e87f31fbfc1e3ff7ccf4";
       flake = false;
     };
   };
@@ -132,7 +132,7 @@
               pname = "omikron";
               version = "0.1.0";
               src = source;
-              hash = "sha256-FOpxddbBfQzfoPqL1qk1vZTHIuWpXTLDjoAr+V1qZA4=";
+              hash = "sha256-1G4SfjzMdrMYYx6pxfDA3S+l00+8f4/VwJ2yo+UyM4w=";
             };
           };
           container = self.lib.mkContainer {

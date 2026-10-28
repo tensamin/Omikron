@@ -1469,7 +1469,7 @@ dependencies = [
 [[package]]
 name = "iota-opaque"
 version = "0.1.0"
-source = "git+https://github.com/TensaminDev/Iota.git?rev=fe645d74a6356d21cf4705d3c8a8d4ee82bbb8aa#fe645d74a6356d21cf4705d3c8a8d4ee82bbb8aa"
+source = "git+https://github.com/TensaminDev/Iota.git?rev=060387affdef2c683aa1e87f31fbfc1e3ff7ccf4#060387affdef2c683aa1e87f31fbfc1e3ff7ccf4"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -3483,7 +3483,7 @@ dependencies = [
 [[package]]
 name = "tau"
 version = "0.1.0"
-source = "git+https://github.com/TensaminDev/Tau.git?rev=cb1f5953c0f9e71c4a01688abaf8432fda3c90da#cb1f5953c0f9e71c4a01688abaf8432fda3c90da"
+source = "git+https://github.com/TensaminDev/Tau.git?rev=e140d4ac71fb83d4de32a108f65355cc9d52afea#e140d4ac71fb83d4de32a108f65355cc9d52afea"
 dependencies = [
  "dashmap",
  "libc",
@@ -3500,7 +3500,7 @@ dependencies = [
 [[package]]
 name = "tau-relay-protocol"
 version = "0.1.0"
-source = "git+https://github.com/TensaminDev/Tau.git?rev=cb1f5953c0f9e71c4a01688abaf8432fda3c90da#cb1f5953c0f9e71c4a01688abaf8432fda3c90da"
+source = "git+https://github.com/TensaminDev/Tau.git?rev=e140d4ac71fb83d4de32a108f65355cc9d52afea#e140d4ac71fb83d4de32a108f65355cc9d52afea"
 dependencies = [
  "base64 0.22.1",
  "mtp",

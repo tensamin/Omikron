@@ -29,6 +29,10 @@ impl IotaConnection {
                     | CommunicationType::UserAssetUploadStatus
                     | CommunicationType::UserAssetGetChunk
                     | CommunicationType::UserAssetList
+                    | CommunicationType::FileListPage
+                    | CommunicationType::FileGetManifest
+                    | CommunicationType::FileChangesGet
+                    | CommunicationType::FileReplicaStatus
                     | CommunicationType::BlockedUsersGet
                     | CommunicationType::ReceiptPolicyGet
                     | CommunicationType::MessageStoragePolicyGet
@@ -69,8 +73,24 @@ impl IotaConnection {
                     | CommunicationType::PasswordEnrollmentDisable
             )
         );
+        let replayable_file = matches!(
+            expected,
+            Some(
+                CommunicationType::FileFolderPut
+                    | CommunicationType::FileFolderDelete
+                    | CommunicationType::FilePlacementPut
+                    | CommunicationType::FilePlacementDelete
+                    | CommunicationType::FileVersionPublish
+                    | CommunicationType::FileKeyEnvelopePut
+                    | CommunicationType::FileMetadataPut
+                    | CommunicationType::FileUploadStart
+                    | CommunicationType::FileDelete
+                    | CommunicationType::FileReplicaAccept
+                    | CommunicationType::FileReplicaCancel
+            )
+        );
         let mut reconcile_only = false;
-        let journal = if read_only || replayable_call || ephemeral_password {
+        let journal = if read_only || replayable_call || replayable_file || ephemeral_password {
             None
         } else {
             let journal = crate::omega::MutationJournal::open(&self.mutation_journal_path)?;
