@@ -26,8 +26,38 @@ fn with_cors(response: HttpResponse) -> HttpResponse {
         .header("access-control-allow-private-network", "true")
 }
 
+struct TransportMetrics;
+
+impl mtp::webserver::WebServerMetrics for TransportMetrics {
+    fn error_occurred(&self, error: &mtp::webserver::WebServerError) {
+        crate::log_event!(
+            0,
+            PrintType::General,
+            crate::util::logger::LogLevel::Error,
+            "transport.error",
+            "error={}",
+            error
+        );
+    }
+
+    fn request_completed(&self, _path: &str, status: u16, duration: Duration) {
+        if status >= 400 {
+            crate::log_event!(
+                0,
+                PrintType::General,
+                crate::util::logger::LogLevel::Warn,
+                "transport.request_failed",
+                "status={} elapsed_ms={}",
+                status,
+                duration.as_millis()
+            );
+        }
+    }
+}
+
 fn web_config(max_connections: usize) -> Result<WebServerConfig, mtp::webserver::RouterError> {
     WebServerConfig::new()
+        .with_metrics(Arc::new(TransportMetrics))
         .max_connections(max_connections)
         .route("/", |request, response| async move {
             let response = if request.method == Method::OPTIONS {
@@ -109,10 +139,51 @@ pub async fn get_by_connector_id(
         return None;
     }
 
-    let bytes = BASE64_STD
-        .decode(authenticated_key_response(&response, identity)?)
-        .ok()?;
-    let public_key = PublicKeyBundle::from_bytes(&bytes).ok()?;
+    let encoded = match authenticated_key_response(&response, identity) {
+        Some(encoded) => encoded,
+        None => {
+            crate::log_event!(
+                client_id as i64,
+                PrintType::General,
+                crate::util::logger::LogLevel::Error,
+                "auth.key_validation_failed",
+                "identity_kind={:?} message_id={:?} error_class=invalid_lookup_response",
+                identity.kind,
+                request.id()
+            );
+            return None;
+        }
+    };
+    let bytes = match BASE64_STD.decode(encoded) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            crate::log_event!(
+                client_id as i64,
+                PrintType::General,
+                crate::util::logger::LogLevel::Error,
+                "auth.key_validation_failed",
+                "identity_kind={:?} message_id={:?} error_class=invalid_base64",
+                identity.kind,
+                request.id()
+            );
+            return None;
+        }
+    };
+    let public_key = match PublicKeyBundle::from_bytes(&bytes) {
+        Ok(key) => key,
+        Err(_) => {
+            crate::log_event!(
+                client_id as i64,
+                PrintType::General,
+                crate::util::logger::LogLevel::Error,
+                "auth.key_validation_failed",
+                "identity_kind={:?} message_id={:?} error_class=invalid_key_bundle",
+                identity.kind,
+                request.id()
+            );
+            return None;
+        }
+    };
     omega.cache_authenticated_key(identity, public_key.clone());
     Some(public_key)
 }

@@ -29,6 +29,7 @@ use mtp::{
 };
 use mtp_native::ConnectionHandle;
 use rand::RngExt;
+pub use requests::OmegaRequestError;
 use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},

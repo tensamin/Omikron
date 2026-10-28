@@ -20,20 +20,55 @@ fn legacy_call_result(
 pub(super) fn call_error_type(error: &CallServiceError) -> CommunicationType {
     match error {
         CallServiceError::NotFound => CommunicationType::ErrorNotFound,
-        CallServiceError::NotAuthorized | CallServiceError::TimedOut { .. } => {
-            CommunicationType::ErrorNotAuthenticated
-        }
+        CallServiceError::NotAuthorized => CommunicationType::ErrorNotAuthenticated,
         CallServiceError::InvalidUser => CommunicationType::ErrorInvalidUserId,
         CallServiceError::InvalidRequest
         | CallServiceError::InvalidMigration { .. }
         | CallServiceError::AuthorityMappingChanged { .. } => CommunicationType::ErrorInvalidData,
         CallServiceError::ResourceLimit => CommunicationType::ErrorInternal,
-        CallServiceError::DeliveryFailed => CommunicationType::ErrorNotFound,
+        CallServiceError::TimedOut { .. } | CallServiceError::DeliveryFailed => {
+            CommunicationType::ErrorInternal
+        }
         CallServiceError::LiveKit(_) => CommunicationType::ErrorInternal,
     }
 }
 
+fn call_error_response(message_id: u32, error: &CallServiceError) -> CommunicationValue {
+    let reason = match error {
+        CallServiceError::TimedOut { .. } => "call_participant_timed_out",
+        CallServiceError::DeliveryFailed => "call_delivery_failed",
+        CallServiceError::ResourceLimit => "capacity_exhausted",
+        CallServiceError::LiveKit(_) => "call_service_unavailable",
+        CallServiceError::NotFound => "call_not_found",
+        CallServiceError::NotAuthorized => "call_not_authorized",
+        CallServiceError::InvalidUser => "invalid_user",
+        CallServiceError::InvalidRequest => "invalid_request",
+        CallServiceError::InvalidMigration { .. } => "invalid_migration",
+        CallServiceError::AuthorityMappingChanged { .. } => "authority_mapping_changed",
+    };
+    let response = CommunicationValue::new(call_error_type(error))
+        .with_id(message_id)
+        .add_typed_default(DataType::ErrorType, DataValue::Str(reason.into()));
+    if let CallServiceError::TimedOut { until_ms } = error {
+        response.add_typed_default(
+            DataType::Timeout,
+            DataValue::SignedNumber((*until_ms).into()),
+        )
+    } else {
+        response
+    }
+}
+
 impl ClientConnection {
+    pub(super) async fn send_call_error(
+        self: Arc<Self>,
+        message_id: u32,
+        error: &CallServiceError,
+    ) {
+        self.send_message(&call_error_response(message_id, error))
+            .await;
+    }
+
     pub(super) async fn handle_call_epoch(self: Arc<Self>, cv: CommunicationValue) {
         use tau::calls::*;
         let Ok(message_id) = cv.require_id() else {
@@ -332,8 +367,7 @@ impl ClientConnection {
         {
             Ok(created_at) => created_at,
             Err(error) => {
-                self.send_error_response(message_id, call_error_type(&error))
-                    .await;
+                self.send_call_error(message_id, &error).await;
                 return;
             }
         };
@@ -388,10 +422,7 @@ impl ClientConnection {
                     .expect("CallEndpoint is defined in the type map");
                 self.send_message(&response).await;
             }
-            Err(error) => {
-                self.send_error_response(message_id, call_error_type(&error))
-                    .await
-            }
+            Err(error) => self.send_call_error(message_id, &error).await,
         }
     }
 
@@ -636,8 +667,7 @@ impl ClientConnection {
         {
             Ok((_, relation)) => relation,
             Err(error) => {
-                self.send_error_response(message_id, call_error_type(&error))
-                    .await;
+                self.send_call_error(message_id, &error).await;
                 return;
             }
         };
@@ -664,8 +694,7 @@ impl ClientConnection {
                     .add_invite(call_id, self.user_id, receiver_id.unsigned_abs())
                     .await
                 {
-                    self.send_error_response(message_id, call_error_type(&error))
-                        .await;
+                    self.send_call_error(message_id, &error).await;
                     return;
                 }
                 let manager = &self.state.call_manager;
@@ -699,8 +728,7 @@ impl ClientConnection {
                         .add_invite(call_id, self.user_id, receiver_id.unsigned_abs())
                         .await
                     {
-                        self.send_error_response(message_id, call_error_type(&error))
-                            .await;
+                        self.send_call_error(message_id, &error).await;
                         return;
                     }
                 }
@@ -933,15 +961,8 @@ impl ClientConnection {
                     user_id,
                     error
                 );
-                let mut error_cv = CommunicationValue::new(call_error_type(&error))
-                    .with_id(message_id)
+                let error_cv = call_error_response(message_id, &error)
                     .add_typed_default(DataType::CallId, DataValue::Str(call_id.to_string()));
-                if let CallServiceError::TimedOut { until_ms } = error {
-                    error_cv = error_cv.add_typed_default(
-                        DataType::Timeout,
-                        DataValue::SignedNumber(until_ms.into()),
-                    );
-                }
                 self.send_message(&error_cv).await;
             }
         }
@@ -994,8 +1015,7 @@ impl ClientConnection {
                 self.send_message(&response).await;
             }
             Err(error) => {
-                self.send_error_response(message_id, call_error_type(&error))
-                    .await;
+                self.send_call_error(message_id, &error).await;
             }
         }
     }
@@ -1028,10 +1048,7 @@ impl ClientConnection {
                 self.send_message(&legacy_call_result(message_id, &result))
                     .await
             }
-            Err(error) => {
-                self.send_error_response(message_id, call_error_type(&error))
-                    .await
-            }
+            Err(error) => self.send_call_error(message_id, &error).await,
         }
     }
     pub(super) async fn handle_call_disconnect_user(self: Arc<Self>, cv: CommunicationValue) {
@@ -1059,10 +1076,7 @@ impl ClientConnection {
                 self.send_message(&legacy_call_result(message_id, &result))
                     .await
             }
-            Err(error) => {
-                self.send_error_response(message_id, call_error_type(&error))
-                    .await
-            }
+            Err(error) => self.send_call_error(message_id, &error).await,
         }
     }
     pub(super) async fn handle_call_set_anonymous_joining(self: Arc<Self>, cv: CommunicationValue) {
@@ -1094,10 +1108,7 @@ impl ClientConnection {
                 }
                 self.send_message(&response).await;
             }
-            Err(error) => {
-                self.send_error_response(message_id, call_error_type(&error))
-                    .await
-            }
+            Err(error) => self.send_call_error(message_id, &error).await,
         }
     }
 
@@ -1128,10 +1139,7 @@ impl ClientConnection {
                 self.send_message(&legacy_call_result(message_id, &result))
                     .await
             }
-            Err(error) => {
-                self.send_error_response(message_id, call_error_type(&error))
-                    .await
-            }
+            Err(error) => self.send_call_error(message_id, &error).await,
         }
     }
 }

@@ -1,17 +1,65 @@
 use super::*;
 
+#[derive(Debug, thiserror::Error)]
+pub enum OmegaRequestError {
+    #[error("Omega total request budget exceeded; mutation outcome may be uncertain")]
+    BudgetExceeded,
+    #[error("Omega request timed out; mutation outcome may be uncertain")]
+    Timeout,
+    #[error("Omega unavailable: {0}")]
+    Unavailable(String),
+    #[error("Omega send failed: {0}; mutation outcome may be uncertain")]
+    Send(String),
+    #[error("Omega response channel closed; mutation outcome may be uncertain")]
+    ConnectionClosed,
+    #[error("{0}")]
+    Internal(String),
+}
+
+impl OmegaRequestError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Timeout | Self::BudgetExceeded => "upstream_timeout",
+            Self::Unavailable(_) => "upstream_unavailable",
+            Self::Send(_) => "upstream_send_failed",
+            Self::ConnectionClosed => "upstream_connection_closed",
+            Self::Internal(_) => "upstream_request_failed",
+        }
+    }
+}
+
+impl From<String> for OmegaRequestError {
+    fn from(error: String) -> Self {
+        Self::Internal(error)
+    }
+}
+
+impl From<&str> for OmegaRequestError {
+    fn from(error: &str) -> Self {
+        Self::Internal(error.into())
+    }
+}
+
 impl OmegaConnection {
     pub async fn await_response(
         &self,
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
     ) -> Result<CommunicationValue, String> {
+        self.await_response_diagnostic(cv, timeout_duration)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub async fn await_response_diagnostic(
+        &self,
+        cv: &CommunicationValue,
+        timeout_duration: Option<Duration>,
+    ) -> Result<CommunicationValue, OmegaRequestError> {
         let budget = timeout_duration.unwrap_or(Duration::from_secs(10));
         tokio::time::timeout(budget, self.await_response_bounded(cv, budget))
             .await
-            .map_err(|_| {
-                "Omega total request budget exceeded; mutation outcome may be uncertain".to_string()
-            })?
+            .map_err(|_| OmegaRequestError::BudgetExceeded)?
     }
 
     pub(crate) fn redemption_publication(
@@ -115,15 +163,17 @@ impl OmegaConnection {
         &self,
         cv: &CommunicationValue,
         budget: Duration,
-    ) -> Result<CommunicationValue, String> {
+    ) -> Result<CommunicationValue, OmegaRequestError> {
         let _permit = self
             .request_slots
             .acquire()
             .await
-            .map_err(|_| "Omega request queue is unavailable".to_string())?;
+            .map_err(|_| OmegaRequestError::Unavailable("request queue closed".into()))?;
 
         if !self.circuit_breaker.lock().await.allow_request() {
-            return Err("Omega circuit breaker is open".to_string());
+            return Err(OmegaRequestError::Unavailable(
+                "circuit breaker open".into(),
+            ));
         }
 
         let result = self.await_response_inner(cv, Some(budget)).await;
@@ -140,7 +190,7 @@ impl OmegaConnection {
         &self,
         cv: &CommunicationValue,
         timeout_duration: Option<Duration>,
-    ) -> Result<CommunicationValue, String> {
+    ) -> Result<CommunicationValue, OmegaRequestError> {
         let original_id = cv
             .require_id()
             .map_err(|error| format!("request is missing correlation id: {error}"))?;
@@ -151,7 +201,9 @@ impl OmegaConnection {
         #[cfg(not(test))]
         let wait_for_connection = true;
         if wait_for_connection {
-            self.await_connection(timeout_duration).await?;
+            self.await_connection(timeout_duration)
+                .await
+                .map_err(OmegaRequestError::Unavailable)?;
         }
 
         // Omega uses the request type for data responses, and explicit Success
@@ -203,10 +255,7 @@ impl OmegaConnection {
         let pending = self
             .waiting_tasks
             .reserve_checked(
-                move |response| {
-                    let _ = tx.send(response.with_id(original_id));
-                    true
-                },
+                move |response| tx.send(response.with_id(original_id)).is_ok(),
                 tau::ResponseExpectation {
                     allowed_success,
                     allowed_errors: tau::PROTOCOL_ERROR_TYPES.to_vec(),
@@ -246,7 +295,7 @@ impl OmegaConnection {
                 Some(id) => {
                     return Err(format!(
                         "Remote operation {id} remains uncertain; authoritative reconciliation required"
-                    ));
+                    ).into());
                 }
                 None => journal.begin(cv, "omega", None)?,
             };
@@ -270,9 +319,9 @@ impl OmegaConnection {
         }
         if let Err(error) = tokio::time::timeout_at(deadline, self.try_send_message(&outbound))
             .await
-            .map_err(|_| "Request timed out".to_string())?
+            .map_err(|_| OmegaRequestError::Timeout)?
         {
-            return Err(format!("failed to send request: {error}"));
+            return Err(OmegaRequestError::Send(error.to_string()));
         }
         log_out!(
             0,
@@ -288,8 +337,8 @@ impl OmegaConnection {
 
         let result = match tokio::time::timeout_at(deadline, rx).await {
             Ok(Ok(response_cv)) => Ok(response_cv),
-            Ok(Err(_)) => Err("Channel closed".to_string()),
-            Err(_) => Err("Request timed out".to_string()),
+            Ok(Err(_)) => Err(OmegaRequestError::ConnectionClosed),
+            Err(_) => Err(OmegaRequestError::Timeout),
         };
         if let (Some((journal, id)), Ok(response)) = (&journal, &result) {
             journal.resolve(id, response)?;

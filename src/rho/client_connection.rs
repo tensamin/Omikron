@@ -1,5 +1,4 @@
 mod calls;
-use calls::call_error_type;
 mod omega_forward;
 use crate::anonymous_clients::anonymous_manager;
 use crate::app_state::AppState;
@@ -534,7 +533,17 @@ impl ClientConnection {
                             self.clone().send_message(&response).await;
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        crate::log_event!(
+                            self.user_id as i64,
+                            PrintType::Client,
+                            crate::util::logger::LogLevel::Error,
+                            "iota.peer_control_failed",
+                            "operation={:?} message_id={} outcome=unknown error={}",
+                            request.get_comm_type_enum(),
+                            message_id,
+                            error
+                        );
                         self.send_error_response(message_id, CommunicationType::ErrorInternal)
                             .await;
                     }
@@ -609,10 +618,7 @@ impl ClientConnection {
                             )
                             .await
                     }
-                    Err(error) => {
-                        self.send_error_response(message_id, call_error_type(&error))
-                            .await
-                    }
+                    Err(error) => self.send_call_error(message_id, &error).await,
                 }
                 return;
             }
@@ -789,12 +795,37 @@ impl ClientConnection {
                         return;
                     }
                     let request = cv.clone().with_sender(self.user_id);
-                    let response = match rho
+                    let upstream = rho
                         .get_iota_connection()
                         .clone()
                         .await_response(&request, Some(Duration::from_secs(20)))
-                        .await
-                    {
+                        .await;
+                    match &upstream {
+                        Err(error) => crate::log_event!(
+                            self.user_id as i64,
+                            PrintType::Client,
+                            crate::util::logger::LogLevel::Error,
+                            "state_sync.request_failed",
+                            "message_id={} error={}",
+                            message_id,
+                            error
+                        ),
+                        Ok(response)
+                            if response.receiver() != Some(self.user_id)
+                                || tau::sync::decode_response(response, &request).is_err() =>
+                        {
+                            crate::log_event!(
+                                self.user_id as i64,
+                                PrintType::Client,
+                                crate::util::logger::LogLevel::Error,
+                                "state_sync.response_rejected",
+                                "message_id={} error_class=invalid_upstream_response",
+                                message_id
+                            );
+                        }
+                        _ => {}
+                    }
+                    let response = match upstream {
                         Ok(response)
                             if response.receiver() == Some(self.user_id)
                                 && tau::sync::decode_response(&response, &request).is_ok() =>

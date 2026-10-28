@@ -4,17 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tau = { git = "https://github.com/TensaminDev/Tau.git", rev = "714968acb05a2e877f03690028ae604afcbbc701" }
-iota-opaque = { git = "https://github.com/TensaminDev/Iota.git", rev = "d2ec4f21049a8fd8819c3acc448ee207b0e20fe8" }
+tau = { git = "https://github.com/TensaminDev/Tau.git", rev = "cb1f5953c0f9e71c4a01688abaf8432fda3c90da" }
+iota-opaque = { git = "https://github.com/TensaminDev/Iota.git", rev = "fe645d74a6356d21cf4705d3c8a8d4ee82bbb8aa" }
 libc = "0.2"
-mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "db3125809293e462ec1593704e9c4d2172437533", features = [
+mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "87c535650a3a33b166139b02cdd7327d412d3bca", features = [
     "web-server",
     "client",
     "crypto",
     "files",
     "raw",
 ] }
-mtp-native = { git = "https://github.com/Nonanium/MTP.git", rev = "db3125809293e462ec1593704e9c4d2172437533" }
+mtp-native = { git = "https://github.com/Nonanium/MTP.git", rev = "87c535650a3a33b166139b02cdd7327d412d3bca" }
 
 ansi_term = "0.12.1"
 uuid = { version = "1.24.0", features = ["v4"] }

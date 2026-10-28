@@ -155,7 +155,21 @@ impl IotaConnection {
                     },
                 )
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    let error_class = match &error {
+                        tau::RequestError::Registration(_) => "registration_failed",
+                        tau::RequestError::Send(_) => "send_failed",
+                        tau::RequestError::Timeout => "timeout",
+                        tau::RequestError::ConnectionClosed => "connection_closed",
+                        tau::RequestError::Cancelled => "cancelled",
+                        tau::RequestError::ResponseChannelClosed => "response_channel_closed",
+                        tau::RequestError::UnexpectedResponse => "unexpected_response",
+                    };
+                    crate::log_event!(self.iota_id as i64, PrintType::Iota, crate::util::logger::LogLevel::Error,
+                        "iota.request_failed", "operation={:?} message_id={:?} sender={:?} error_class={} outcome=unknown error={}",
+                        expected, cv.id(), cv.sender(), error_class, error);
+                    error.to_string()
+                })
         };
         if password_mutation
             && !reconcile_only

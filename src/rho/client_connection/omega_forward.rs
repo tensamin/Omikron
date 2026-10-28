@@ -6,6 +6,8 @@ impl ClientConnection {
             return;
         };
         let delete_user = cv.is_type(CommunicationType::DeleteUser);
+        let operation = cv.get_comm_type_enum();
+        let started = std::time::Instant::now();
         let updated_key = if cv.is_type(CommunicationType::ChangeUserData) {
             match cv.get_data(DataType::PublicKey) {
                 Some(DataValue::Str(key)) => PublicKeyBundle::from_base64(key).ok(),
@@ -31,9 +33,28 @@ impl ClientConnection {
                     self.close().await;
                 }
             }
-            Err(_) => {
-                self.send_error_response(request_id, CommunicationType::ErrorInternal)
-                    .await;
+            Err(error) => {
+                crate::log_event!(
+                    self.user_id as i64,
+                    PrintType::Client,
+                    crate::util::logger::LogLevel::Error,
+                    "omega.forward_failed",
+                    "operation={:?} message_id={} upstream=omega error_class={} elapsed_ms={} outcome=unknown error={}",
+                    operation,
+                    request_id,
+                    error.code(),
+                    started.elapsed().as_millis(),
+                    error
+                );
+                self.send_message(
+                    &CommunicationValue::new(CommunicationType::ErrorInternal)
+                        .with_id(request_id)
+                        .add_typed_default(
+                            DataType::ErrorType,
+                            DataValue::Str(error.code().into()),
+                        ),
+                )
+                .await;
             }
         }
     }
@@ -41,13 +62,12 @@ impl ClientConnection {
     pub(super) async fn await_omega_response(
         &self,
         cv: CommunicationValue,
-    ) -> Result<CommunicationValue, ()> {
+    ) -> Result<CommunicationValue, crate::omega::omega_connection::OmegaRequestError> {
         self.state
             .omega
             .clone()
-            .await_response(&cv.with_sender(self.user_id), Some(Duration::from_secs(20)))
+            .await_response_diagnostic(&cv.with_sender(self.user_id), Some(Duration::from_secs(20)))
             .await
-            .map_err(|_| ())
     }
 
     pub(super) async fn request_set_user_state(
@@ -77,9 +97,21 @@ impl ClientConnection {
         let response = self
             .state
             .omega
-            .await_response(&request, Some(Duration::from_secs(20)))
+            .await_response_diagnostic(&request, Some(Duration::from_secs(20)))
             .await
-            .map_err(|_| CommunicationType::ErrorInternal)?;
+            .map_err(|error| {
+                crate::log_event!(
+                    self.user_id as i64,
+                    PrintType::Client,
+                    crate::util::logger::LogLevel::Error,
+                    "omega.forward_failed",
+                    "operation=SetUserState message_id={} error_class={} outcome=unknown error={}",
+                    message_id,
+                    error.code(),
+                    error
+                );
+                CommunicationType::ErrorInternal
+            })?;
         if response.is_type(CommunicationType::Success) {
             return Ok(
                 response.add_typed_default(DataType::UserState, DataValue::Str(state.to_string()))
