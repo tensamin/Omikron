@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tau = { git = "https://github.com/TensaminDev/Tau.git", rev = "e140d4ac71fb83d4de32a108f65355cc9d52afea" }
+tau = { git = "https://github.com/TensaminDev/Tau.git", rev = "ccbdcb81df00d626da16071c4c8b0b1ec803f87c" }
 iota-opaque = { git = "https://github.com/TensaminDev/Iota.git", rev = "060387affdef2c683aa1e87f31fbfc1e3ff7ccf4" }
 libc = "0.2"
 mtp = { git = "https://github.com/Nonanium/MTP.git", rev = "87c535650a3a33b166139b02cdd7327d412d3bca", features = [
