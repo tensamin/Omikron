@@ -51,6 +51,8 @@ pub fn message_security_class(frame: &CommunicationValue) -> MessageSecurityClas
         return MessageSecurityClass::AuthenticatedPeerControl;
     }
     const PEER_CONTROL_TYPES: &[CommunicationType] = &[
+        CommunicationType::UserResolve,
+        CommunicationType::GetChats,
         CommunicationType::GetChatSecret,
         CommunicationType::MessageGet,
         CommunicationType::MessagesGet,
@@ -141,7 +143,6 @@ pub fn message_security_class(frame: &CommunicationValue) -> MessageSecurityClas
         CommunicationType::PushNotification,
         CommunicationType::AccountStateSnapshot,
         CommunicationType::StateSubscribe,
-        CommunicationType::GetChats,
         CommunicationType::CompleteRegisterUser,
         CommunicationType::DeleteIota,
         CommunicationType::AttachUserBegin,

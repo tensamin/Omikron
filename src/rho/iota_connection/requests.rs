@@ -18,6 +18,8 @@ impl IotaConnection {
             expected,
             Some(
                 CommunicationType::RelayReceiptPage
+                    | CommunicationType::UserResolve
+                    | CommunicationType::GetChats
                     | CommunicationType::AccountStateRequest
                     | CommunicationType::GetChatSecret
                     | CommunicationType::MessageGet
@@ -158,6 +160,9 @@ impl IotaConnection {
                                     Some(CommunicationType::AccountStateRequest),
                                     Some(CommunicationType::AccountStateSnapshot)
                                 ) | (
+                                    Some(CommunicationType::UserResolve),
+                                    Some(CommunicationType::UserResolved)
+                                ) | (
                                     Some(CommunicationType::GetChatSecret),
                                     Some(CommunicationType::ChatSecretResponse)
                                 ) | (
@@ -191,6 +196,9 @@ impl IotaConnection {
                     error.to_string()
                 })
         };
+        if let Ok(response) = &result {
+            validate_chat_read_response(cv, response)?;
+        }
         if password_mutation
             && !reconcile_only
             && (result.is_err()
@@ -287,4 +295,130 @@ impl IotaConnection {
         }
         Ok(())
     }
+}
+
+fn validate_chat_read_response(
+    request: &CommunicationValue,
+    response: &CommunicationValue,
+) -> Result<(), String> {
+    if !matches!(
+        request.get_comm_type_enum(),
+        Some(
+            CommunicationType::UserResolve
+                | CommunicationType::GetChats
+                | CommunicationType::GetChatSecret
+        )
+    ) {
+        return Ok(());
+    }
+    let invalid = || "invalid Iota chat read response".to_string();
+    if response
+        .get_comm_type_enum()
+        .is_some_and(tau::is_protocol_error)
+    {
+        if response.receiver().is_some() && response.receiver() != request.sender()
+            || response.iter_typed_data().any(|(kind, _)| {
+                !matches!(
+                    kind,
+                    Some(
+                        DataType::ErrorType
+                            | DataType::Message
+                            | DataType::Json
+                            | DataType::Timestamp
+                    )
+                )
+            })
+        {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
+    match request.get_comm_type_enum() {
+        Some(CommunicationType::GetChatSecret) => {
+            tau::chat_secret::ReadResponse::from_frame(response, request).map_err(|_| invalid())?;
+        }
+        Some(CommunicationType::GetChats) => {
+            if response.receiver() != request.sender() {
+                return Err(invalid());
+            }
+            let Some(DataValue::Array(contacts)) = response.get_data(DataType::UserIds) else {
+                return Err(invalid());
+            };
+            for contact in contacts {
+                let DataValue::Container(fields) = contact else {
+                    return Err(invalid());
+                };
+                let map = response.type_map().ok_or_else(invalid)?;
+                let principal = DataType::Principal.try_to_id(map).ok_or_else(invalid)?;
+                let user_id = DataType::UserId.try_to_id(map).ok_or_else(invalid)?;
+                if fields.iter().filter(|(kind, _)| *kind == principal).count() != 1
+                    || fields.iter().filter(|(kind, _)| *kind == user_id).count() != 1
+                    || !fields
+                        .iter()
+                        .find_map(|(kind, value)| (*kind == user_id).then_some(value))
+                        .as_number()
+                        .is_some_and(|id| id > 0 && id <= i64::MAX.into())
+                {
+                    return Err(invalid());
+                }
+                let Some(DataValue::Str(value)) = fields
+                    .iter()
+                    .find_map(|(kind, value)| (*kind == principal).then_some(value))
+                else {
+                    return Err(invalid());
+                };
+                let principal: tau::relay_protocol::Principal =
+                    serde_json::from_str(value).map_err(|_| invalid())?;
+                if serde_json::to_string(&principal).map_err(|_| invalid())? != *value {
+                    return Err(invalid());
+                }
+            }
+        }
+        Some(CommunicationType::UserResolve) => {
+            if !response.is_type(CommunicationType::UserResolved) {
+                return Err(invalid());
+            }
+            let canonical = response
+                .get_data(DataType::Principal)
+                .as_str()
+                .ok_or_else(invalid)?;
+            let principal: tau::relay_protocol::Principal =
+                serde_json::from_str(canonical).map_err(|_| invalid())?;
+            if serde_json::to_string(&principal).map_err(|_| invalid())? != canonical
+                || response.get_data(DataType::UserAddress).as_str() != Some(canonical)
+                || response.get_data(DataType::AuthorityId).as_str()
+                    != Some(principal.authority.as_str())
+                || response.get_data(DataType::UserId).as_number() != Some(principal.user_id.into())
+                || request
+                    .get_data(DataType::UserAddress)
+                    .as_str()
+                    .is_some_and(|address| address.starts_with('{') && address != canonical)
+            {
+                return Err(invalid());
+            }
+            let node = response
+                .get_data(DataType::NodeId)
+                .as_str()
+                .ok_or_else(invalid)?;
+            let public_key = response
+                .get_data(DataType::PublicKey)
+                .as_str()
+                .ok_or_else(invalid)?;
+            let key =
+                mtp::crypto::PublicKeyBundle::from_base64(public_key).map_err(|_| invalid())?;
+            if relay_router::IotaNodeId::new(node).map_err(|_| invalid())?
+                != relay_router::IotaNodeId::from_public_keys(&key).map_err(|_| invalid())?
+            {
+                return Err(invalid());
+            }
+            let Some(DataValue::Array(keys)) = response.get_data(DataType::SigningKeys) else {
+                return Err(invalid());
+            };
+            if keys.is_empty() || keys.iter().any(|key| !matches!(key, DataValue::Str(value) if mtp::crypto::PublicKeyBundle::from_base64(value).is_ok())) {
+                return Err(invalid());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }

@@ -1,6 +1,8 @@
 use super::{authenticated_peer_control_request, is_client_omega_operation};
 use mtp::codec::{CommunicationType, CommunicationValue, DataType, DataValue};
 
+mod chat_reads;
+
 #[test]
 fn managed_call_allowlist_is_local_and_excludes_results_and_direct_revocation() {
     use crate::rho::relay_router::{MessageSecurityClass, message_security_class};
